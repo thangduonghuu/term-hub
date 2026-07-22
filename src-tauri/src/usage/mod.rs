@@ -7,7 +7,7 @@ mod tracker;
 pub use tracker::spawn_tracker;
 
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct UsageEvent {
@@ -67,7 +67,7 @@ pub trait UsageAdapter: Send + Sync {
     /// new byte offset to resume from on the next poll.
     fn parse_new_events(
         &self,
-        path: &PathBuf,
+        path: &Path,
         since_offset: u64,
     ) -> Result<(Vec<UsageEvent>, u64), String>;
 }

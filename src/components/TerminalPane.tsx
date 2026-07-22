@@ -1,6 +1,6 @@
-import { forwardRef } from "react";
+import { forwardRef, useState } from "react";
 import { ExternalLink, X } from "lucide-react";
-import { TerminalView, type TerminalHandle } from "./TerminalView";
+import { TerminalView, type TerminalHandle, type ActivityPhase } from "./TerminalView";
 import type { SessionInfo } from "../lib/api";
 import type { SessionStatus } from "../lib/status";
 
@@ -14,10 +14,18 @@ interface Props {
   canOpenExternal: boolean;
 }
 
+const ACTIVITY_TITLE: Record<ActivityPhase, string> = {
+  idle: "No activity yet",
+  working: "Working…",
+  done: "Finished — waiting for you",
+};
+
 export const TerminalPane = forwardRef<TerminalHandle, Props>(function TerminalPane(
   { session, active, status, onFocus, onClose, onOpenExternal, canOpenExternal },
   ref,
 ) {
+  const [activity, setActivity] = useState<ActivityPhase>("idle");
+
   return (
     <div
       id={`pane-${session.id}`}
@@ -30,6 +38,7 @@ export const TerminalPane = forwardRef<TerminalHandle, Props>(function TerminalP
           <span className="dot yellow" />
           <span className="dot green" />
         </span>
+        <span className={`activity-dot ${activity}`} title={ACTIVITY_TITLE[activity]} />
         <span className="pane-title" title={session.cwd}>
           {session.name}
           {status === "exited" && " (exited)"}
@@ -58,7 +67,7 @@ export const TerminalPane = forwardRef<TerminalHandle, Props>(function TerminalP
         </button>
       </div>
       <div className="pane-body">
-        <TerminalView ref={ref} sessionId={session.id} />
+        <TerminalView ref={ref} sessionId={session.id} onActivityChange={setActivity} />
       </div>
     </div>
   );

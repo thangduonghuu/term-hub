@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{home_dir, parse_rfc3339_to_unix, UsageAdapter, UsageEvent};
 
@@ -43,7 +43,7 @@ impl UsageAdapter for ClaudeCodeAdapter {
 
     fn parse_new_events(
         &self,
-        path: &PathBuf,
+        path: &Path,
         since_offset: u64,
     ) -> Result<(Vec<UsageEvent>, u64), String> {
         let mut file = File::open(path).map_err(|e| e.to_string())?;

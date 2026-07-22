@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "termhub",
+  "productName": "TermHub",
   "version": "0.1.0",
   "identifier": "com.termhub.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "termhub",
+        "title": "TermHub",
         "width": 800,
         "height": 600
       }

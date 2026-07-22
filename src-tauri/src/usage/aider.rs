@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{parse_compact_token_count, parse_local_datetime_to_unix, UsageAdapter, UsageEvent};
 
@@ -27,7 +27,7 @@ impl UsageAdapter for AiderAdapter {
 
     fn parse_new_events(
         &self,
-        path: &PathBuf,
+        path: &Path,
         since_offset: u64,
     ) -> Result<(Vec<UsageEvent>, u64), String> {
         let cwd = path

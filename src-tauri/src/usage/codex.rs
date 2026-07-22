@@ -26,7 +26,7 @@ impl UsageAdapter for CodexAdapter {
 
     fn parse_new_events(
         &self,
-        path: &PathBuf,
+        path: &Path,
         since_offset: u64,
     ) -> Result<(Vec<UsageEvent>, u64), String> {
         let mut file = File::open(path).map_err(|e| e.to_string())?;
@@ -101,7 +101,7 @@ impl UsageAdapter for CodexAdapter {
     }
 }
 
-fn read_cwd_from_start(path: &PathBuf) -> Option<String> {
+fn read_cwd_from_start(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let first_line = reader.lines().next()?.ok()?;

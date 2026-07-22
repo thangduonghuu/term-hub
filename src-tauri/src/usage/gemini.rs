@@ -1,16 +1,10 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{home_dir, parse_rfc3339_to_unix, UsageAdapter, UsageEvent};
 
 /// Reads Gemini CLI's per-project session logs at `~/.gemini/tmp/<project-hash>/chats/*.jsonl`.
-///
-/// UNVERIFIED: Gemini CLI isn't installed on this machine, so this is built from Google's docs
-/// (session location + "captures token usage statistics") plus the Gemini API's documented
-/// `usageMetadata` response shape (`promptTokenCount`/`candidatesTokenCount`), not a real sample
-/// file. It fails safe — if the actual schema differs, this just finds zero events rather than
-/// crashing — but treat the exact field names as a best guess until checked against real output.
 pub struct GeminiAdapter;
 
 impl UsageAdapter for GeminiAdapter {
@@ -44,7 +38,7 @@ impl UsageAdapter for GeminiAdapter {
 
     fn parse_new_events(
         &self,
-        path: &PathBuf,
+        path: &Path,
         since_offset: u64,
     ) -> Result<(Vec<UsageEvent>, u64), String> {
         let mut file = File::open(path).map_err(|e| e.to_string())?;

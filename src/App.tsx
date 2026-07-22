@@ -43,8 +43,12 @@ function App() {
         setOpenPaneIds(new Set([created.id]));
         setActiveId(created.id);
       } else {
-        setSessions(list);
-        setActiveId(list[0].id);
+        // Restore every saved session as an open pane on launch, like a browser
+        // restoring tabs — don't leave the user staring at an empty grid.
+        const reopened = await Promise.all(list.map((s) => api.reopenSession(s.id)));
+        setSessions(reopened);
+        setOpenPaneIds(new Set(reopened.map((s) => s.id)));
+        setActiveId(reopened[0].id);
       }
     })();
   }, []);

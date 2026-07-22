@@ -61,11 +61,35 @@ npm install
 npm run tauri dev
 ```
 
-## Build
+## Building & releasing
 
 ```sh
 npm run tauri build
 ```
+
+This produces a release build and platform installers under `src-tauri/target/release/bundle/`.
+
+**macOS**
+
+- The app bundle lands at `src-tauri/target/release/bundle/macos/TermHub.app` — drag it into
+  `/Applications` (or `cp -R` it there) to install it like any other Mac app.
+- Tauri also tries to wrap that into a `.dmg` under `bundle/dmg/`. This step shells out to
+  `hdiutil`/Finder scripting and can fail in sandboxed or headless environments (e.g. CI, some
+  automation shells) with `error running bundle_dmg.sh` — that's just the installer-image step;
+  `TermHub.app` itself still builds successfully and works fine used directly, no `.dmg` needed
+  for personal use.
+- The app isn't code-signed (no Apple Developer certificate configured), so macOS Gatekeeper will
+  refuse to open it normally on first launch. Right-click the app → **Open** (instead of
+  double-clicking) and confirm, or allow it via **System Settings → Privacy & Security**.
+
+**Windows**
+
+- Build on a Windows machine (Tauri doesn't cross-compile a Windows installer from macOS/Linux)
+  — same `npm run tauri build` command, with an MSVC toolchain and the Tauri Windows
+  prerequisites installed (see the link above).
+- Produces an `.msi` and/or `.exe` (NSIS) installer under `bundle/msi/` and `bundle/nsis/`.
+- Unsigned installers will similarly trip Windows SmartScreen on first run ("Windows protected
+  your PC") — click **More info → Run anyway**.
 
 ## Project layout
 
