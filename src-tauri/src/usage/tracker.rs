@@ -13,16 +13,20 @@ pub fn spawn_tracker(db: Arc<Db>) {
     std::thread::spawn(move || {
         let adapters = all_adapters();
         loop {
+            let known_cwds: Vec<String> = db
+                .list_sessions()
+                .map(|sessions| sessions.into_iter().map(|s| s.cwd).collect())
+                .unwrap_or_default();
             for adapter in &adapters {
-                poll_adapter(adapter.as_ref(), &db);
+                poll_adapter(adapter.as_ref(), &db, &known_cwds);
             }
             std::thread::sleep(POLL_INTERVAL);
         }
     });
 }
 
-fn poll_adapter(adapter: &dyn UsageAdapter, db: &Db) {
-    for path in adapter.discover_files() {
+fn poll_adapter(adapter: &dyn UsageAdapter, db: &Db, known_cwds: &[String]) {
+    for path in adapter.discover_files(known_cwds) {
         let path_str = path.to_string_lossy().to_string();
         let offset = db.get_file_offset(&path_str).unwrap_or(0);
         let Ok((events, new_offset)) = adapter.parse_new_events(&path, offset) else {

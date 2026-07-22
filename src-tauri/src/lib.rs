@@ -37,6 +37,10 @@ pub fn run() {
             commands::rename_session,
             commands::close_session,
             commands::get_usage_summary,
+            commands::has_anthropic_api_key,
+            commands::set_anthropic_api_key,
+            commands::clear_anthropic_api_key,
+            commands::check_claude_limits,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

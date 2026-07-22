@@ -123,6 +123,81 @@ pub fn get_usage_summary(db: State<Arc<Db>>) -> Result<UsageSummary, String> {
     })
 }
 
+const ANTHROPIC_API_KEY_SETTING: &str = "anthropic_api_key";
+
+#[tauri::command]
+pub fn has_anthropic_api_key(db: State<Arc<Db>>) -> Result<bool, String> {
+    Ok(db
+        .get_setting(ANTHROPIC_API_KEY_SETTING)
+        .map_err(|e| e.to_string())?
+        .is_some())
+}
+
+#[tauri::command]
+pub fn set_anthropic_api_key(db: State<Arc<Db>>, key: String) -> Result<(), String> {
+    db.set_setting(ANTHROPIC_API_KEY_SETTING, &key)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_anthropic_api_key(db: State<Arc<Db>>) -> Result<(), String> {
+    db.delete_setting(ANTHROPIC_API_KEY_SETTING)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct ClaudeLimits {
+    /// (header name with the "anthropic-ratelimit-" prefix stripped, value) pairs, in
+    /// whatever set Anthropic actually returns — kept as raw pairs rather than a fixed
+    /// struct since the exact header set isn't publicly guaranteed to be stable.
+    pub limits: Vec<(String, String)>,
+}
+
+/// Makes one minimal (~1 output token) real request to Anthropic's Messages API purely to
+/// read back its `anthropic-ratelimit-*` response headers. This is the org/API-key rate
+/// limit (requests & tokens per minute) — a different quota than Claude Code's Pro/Max
+/// 5-hour session limit, which has no public API and isn't available here.
+#[tauri::command]
+pub async fn check_claude_limits(db: State<'_, Arc<Db>>) -> Result<ClaudeLimits, String> {
+    let key = db
+        .get_setting(ANTHROPIC_API_KEY_SETTING)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No Anthropic API key configured".to_string())?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-3-5-haiku-latest",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut limits = Vec::new();
+    for (name, value) in resp.headers().iter() {
+        let name_str = name.as_str();
+        if let Some(stripped) = name_str.strip_prefix("anthropic-ratelimit-") {
+            if let Ok(v) = value.to_str() {
+                limits.push((stripped.to_string(), v.to_string()));
+            }
+        }
+    }
+
+    if limits.is_empty() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("No rate-limit headers in response (status {status}): {body}"));
+    }
+
+    Ok(ClaudeLimits { limits })
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

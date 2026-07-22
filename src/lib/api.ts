@@ -12,6 +12,7 @@ export interface SessionInfo {
 export interface SessionUsage {
   session_id: string | null;
   session_name: string;
+  agent: string;
   tokens_in: number;
   tokens_out: number;
 }
@@ -24,6 +25,7 @@ export interface AgentUsage {
 
 export interface DayUsage {
   day: string;
+  agent: string;
   tokens_in: number;
   tokens_out: number;
 }
@@ -34,6 +36,10 @@ export interface UsageSummary {
   per_day: DayUsage[];
   total_tokens_in: number;
   total_tokens_out: number;
+}
+
+export interface ClaudeLimits {
+  limits: [string, string][];
 }
 
 export const api = {
@@ -52,4 +58,8 @@ export const api = {
   openExternalTerminal: (app: string, cwd: string) =>
     invoke<void>("open_external_terminal", { app, cwd }),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
+  hasAnthropicApiKey: () => invoke<boolean>("has_anthropic_api_key"),
+  setAnthropicApiKey: (key: string) => invoke<void>("set_anthropic_api_key", { key }),
+  clearAnthropicApiKey: () => invoke<void>("clear_anthropic_api_key"),
+  checkClaudeLimits: () => invoke<ClaudeLimits>("check_claude_limits"),
 };

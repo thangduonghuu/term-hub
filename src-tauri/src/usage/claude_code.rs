@@ -14,7 +14,7 @@ impl UsageAdapter for ClaudeCodeAdapter {
         "claude-code"
     }
 
-    fn discover_files(&self) -> Vec<PathBuf> {
+    fn discover_files(&self, _known_cwds: &[String]) -> Vec<PathBuf> {
         let Some(home) = home_dir() else {
             return vec![];
         };

@@ -29,6 +29,10 @@ impl Db {
             CREATE TABLE IF NOT EXISTS usage_file_offsets (
                 file_path TEXT PRIMARY KEY,
                 byte_offset INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )?;
         Ok(Db(Mutex::new(conn)))
@@ -145,19 +149,20 @@ impl Db {
     pub fn usage_per_session(&self) -> rusqlite::Result<Vec<SessionUsage>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT ue.session_id, COALESCE(s.name, 'Outside TermHub'),
+            "SELECT ue.session_id, COALESCE(s.name, 'Outside TermHub'), ue.agent,
                     SUM(ue.tokens_in), SUM(ue.tokens_out)
              FROM usage_events ue
              LEFT JOIN sessions s ON s.id = ue.session_id
-             GROUP BY COALESCE(ue.session_id, '')
+             GROUP BY COALESCE(ue.session_id, ''), ue.agent
              ORDER BY SUM(ue.tokens_in) + SUM(ue.tokens_out) DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SessionUsage {
                 session_id: row.get(0)?,
                 session_name: row.get(1)?,
-                tokens_in: row.get(2)?,
-                tokens_out: row.get(3)?,
+                agent: row.get(2)?,
+                tokens_in: row.get(3)?,
+                tokens_out: row.get(4)?,
             })
         })?;
         rows.collect()
@@ -182,15 +187,16 @@ impl Db {
     pub fn usage_per_day(&self) -> rusqlite::Result<Vec<DayUsage>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch') as day,
+            "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch') as day, agent,
                     SUM(tokens_in), SUM(tokens_out)
-             FROM usage_events GROUP BY day ORDER BY day DESC",
+             FROM usage_events GROUP BY day, agent ORDER BY day DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(DayUsage {
                 day: row.get(0)?,
-                tokens_in: row.get(1)?,
-                tokens_out: row.get(2)?,
+                agent: row.get(1)?,
+                tokens_in: row.get(2)?,
+                tokens_out: row.get(3)?,
             })
         })?;
         rows.collect()
@@ -203,5 +209,31 @@ impl Db {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
+    }
+
+    pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        Ok(())
     }
 }
