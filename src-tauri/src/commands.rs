@@ -1,47 +1,31 @@
-use std::sync::Arc;
-use tauri::{AppHandle, State};
 use uuid::Uuid;
 
 use crate::db::Db;
 use crate::external_terminal;
-use crate::pty_manager::PtyManager;
 use crate::session::{default_cwd, default_shell, SessionInfo, SessionMeta};
 use crate::usage::UsageSummary;
 
-#[tauri::command]
 pub fn get_default_cwd() -> String {
     default_cwd()
 }
 
 /// Terminal apps installed on this machine (e.g. iTerm2, Warp) that a session's folder
 /// can be opened in as an alternative to the built-in embedded terminal.
-#[tauri::command]
 pub fn list_terminal_apps() -> Vec<String> {
     external_terminal::list_apps()
 }
 
-#[tauri::command]
-pub fn open_external_terminal(app: String, cwd: String) -> Result<(), String> {
-    external_terminal::open_external(&app, &cwd)
+pub fn open_external_terminal(app: &str, cwd: &str) -> Result<(), String> {
+    external_terminal::open_external(app, cwd)
 }
 
-#[tauri::command]
-pub fn list_sessions(db: State<Arc<Db>>, manager: State<PtyManager>) -> Result<Vec<SessionInfo>, String> {
+pub fn list_sessions(db: &Db) -> Result<Vec<SessionInfo>, String> {
     let metas = db.list_sessions().map_err(|e| e.to_string())?;
-    Ok(metas
-        .into_iter()
-        .map(|meta| {
-            let running = manager.is_running(&meta.id);
-            SessionInfo { meta, running }
-        })
-        .collect())
+    Ok(metas.into_iter().map(|meta| SessionInfo { meta }).collect())
 }
 
-#[tauri::command]
 pub fn create_session(
-    app: AppHandle,
-    db: State<Arc<Db>>,
-    manager: State<PtyManager>,
+    db: &Db,
     name: Option<String>,
     cwd: Option<String>,
 ) -> Result<SessionInfo, String> {
@@ -51,98 +35,41 @@ pub fn create_session(
     let name = name.unwrap_or_else(|| "Session".to_string());
     let created_at = unix_now();
 
-    let meta = SessionMeta {
-        id: id.clone(),
-        name,
-        cwd: cwd.clone(),
-        shell: shell.clone(),
-        created_at,
-    };
-
-    manager.spawn(&app, id.clone(), &cwd, &shell)?;
+    let meta = SessionMeta { id, name, cwd, shell, created_at };
     db.insert_session(&meta).map_err(|e| e.to_string())?;
 
-    Ok(SessionInfo {
-        meta,
-        running: true,
-    })
+    Ok(SessionInfo { meta })
 }
 
-#[tauri::command]
-pub fn reopen_session(
-    app: AppHandle,
-    db: State<Arc<Db>>,
-    manager: State<PtyManager>,
-    id: String,
-) -> Result<SessionInfo, String> {
-    let meta = db.get_session(&id).map_err(|e| e.to_string())?;
-    if !manager.is_running(&id) {
-        manager.spawn(&app, id.clone(), &meta.cwd, &meta.shell)?;
-    }
-    Ok(SessionInfo {
-        meta,
-        running: true,
-    })
+pub fn rename_session(db: &Db, id: &str, name: &str) -> Result<(), String> {
+    db.rename_session(id, name).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn write_pty(manager: State<PtyManager>, id: String, data: String) -> Result<(), String> {
-    manager.write(&id, &data)
+/// Removes the session from the saved list.
+pub fn close_session(db: &Db, id: &str) -> Result<(), String> {
+    db.delete_session(id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn resize_pty(manager: State<PtyManager>, id: String, rows: u16, cols: u16) -> Result<(), String> {
-    manager.resize(&id, rows, cols)
-}
-
-#[tauri::command]
-pub fn rename_session(db: State<Arc<Db>>, id: String, name: String) -> Result<(), String> {
-    db.rename_session(&id, &name).map_err(|e| e.to_string())
-}
-
-/// Ends the pty process and permanently forgets the session. Distinct from quitting the app,
-/// which leaves saved sessions in the DB so they can be reopened next launch.
-#[tauri::command]
-pub fn close_session(db: State<Arc<Db>>, manager: State<PtyManager>, id: String) -> Result<(), String> {
-    manager.kill(&id);
-    db.delete_session(&id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_usage_summary(db: State<Arc<Db>>) -> Result<UsageSummary, String> {
+pub fn get_usage_summary(db: &Db) -> Result<UsageSummary, String> {
     let per_session = db.usage_per_session().map_err(|e| e.to_string())?;
     let per_agent = db.usage_per_agent().map_err(|e| e.to_string())?;
     let per_day = db.usage_per_day().map_err(|e| e.to_string())?;
     let (total_tokens_in, total_tokens_out) = db.usage_grand_total().map_err(|e| e.to_string())?;
-    Ok(UsageSummary {
-        per_session,
-        per_agent,
-        per_day,
-        total_tokens_in,
-        total_tokens_out,
-    })
+    Ok(UsageSummary { per_session, per_agent, per_day, total_tokens_in, total_tokens_out })
 }
 
 const ANTHROPIC_API_KEY_SETTING: &str = "anthropic_api_key";
 
-#[tauri::command]
-pub fn has_anthropic_api_key(db: State<Arc<Db>>) -> Result<bool, String> {
-    Ok(db
-        .get_setting(ANTHROPIC_API_KEY_SETTING)
-        .map_err(|e| e.to_string())?
-        .is_some())
+pub fn has_anthropic_api_key(db: &Db) -> Result<bool, String> {
+    Ok(db.get_setting(ANTHROPIC_API_KEY_SETTING).map_err(|e| e.to_string())?.is_some())
 }
 
-#[tauri::command]
-pub fn set_anthropic_api_key(db: State<Arc<Db>>, key: String) -> Result<(), String> {
-    db.set_setting(ANTHROPIC_API_KEY_SETTING, &key)
-        .map_err(|e| e.to_string())
+pub fn set_anthropic_api_key(db: &Db, key: &str) -> Result<(), String> {
+    db.set_setting(ANTHROPIC_API_KEY_SETTING, key).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn clear_anthropic_api_key(db: State<Arc<Db>>) -> Result<(), String> {
-    db.delete_setting(ANTHROPIC_API_KEY_SETTING)
-        .map_err(|e| e.to_string())
+pub fn clear_anthropic_api_key(db: &Db) -> Result<(), String> {
+    db.delete_setting(ANTHROPIC_API_KEY_SETTING).map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -157,14 +84,16 @@ pub struct ClaudeLimits {
 /// read back its `anthropic-ratelimit-*` response headers. This is the org/API-key rate
 /// limit (requests & tokens per minute) — a different quota than Claude Code's Pro/Max
 /// 5-hour session limit, which has no public API and isn't available here.
-#[tauri::command]
-pub async fn check_claude_limits(db: State<'_, Arc<Db>>) -> Result<ClaudeLimits, String> {
+///
+/// Blocking (not async): the IPC layer already runs every command on its own background
+/// thread (see ipc.rs), so there's no event loop to avoid blocking here.
+pub fn check_claude_limits(db: &Db) -> Result<ClaudeLimits, String> {
     let key = db
         .get_setting(ANTHROPIC_API_KEY_SETTING)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No Anthropic API key configured".to_string())?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::blocking::Client::new();
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", key)
@@ -176,7 +105,6 @@ pub async fn check_claude_limits(db: State<'_, Arc<Db>>) -> Result<ClaudeLimits,
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .send()
-        .await
         .map_err(|e| e.to_string())?;
 
     let mut limits = Vec::new();
@@ -191,7 +119,7 @@ pub async fn check_claude_limits(db: State<'_, Arc<Db>>) -> Result<ClaudeLimits,
 
     if limits.is_empty() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().unwrap_or_default();
         return Err(format!("No rate-limit headers in response (status {status}): {body}"));
     }
 

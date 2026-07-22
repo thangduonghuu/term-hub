@@ -1,0 +1,93 @@
+//! Minimal replacement for Tauri's `invoke`/`#[tauri::command]` machinery.
+//!
+//! Dropping to raw `wry` (so the sidebar webview can be embedded as a *child* of our own
+//! native window — see `lib.rs`) forfeits Tauri's built-in IPC. This is the hand-rolled
+//! stand-in: the frontend's `window.ipc.postMessage(json)` delivers a `{id, cmd, args}`
+//! request here (via `WebViewBuilder::with_ipc_handler`), each request runs on its own
+//! background thread (so a slow command, e.g. `check_claude_limits`'s network call, never
+//! blocks the window's event loop), and the result is marshaled back to the main thread via
+//! `winit`'s `EventLoopProxy` to call `webview.evaluate_script(...)` — `WebView` methods
+//! aren't safe to call off the main thread.
+//!
+//! Frontend counterpart: `src/lib/ipc.ts`.
+
+use std::sync::Arc;
+
+use serde::Deserialize;
+use serde_json::Value;
+use winit::event_loop::EventLoopProxy;
+
+use crate::commands;
+use crate::db::Db;
+use crate::AppEvent;
+
+#[derive(Deserialize)]
+struct IpcRequest {
+    id: u64,
+    cmd: String,
+    args: Value,
+}
+
+/// Called synchronously from `with_ipc_handler` (main thread). Spawns the actual work on a
+/// background thread and returns immediately.
+pub fn spawn_dispatch(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, raw: &str) {
+    let Ok(req) = serde_json::from_str::<IpcRequest>(raw) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let result = handle(&db, &req.cmd, req.args);
+        let payload = match result {
+            Ok(data) => serde_json::json!({"ok": true, "data": data}),
+            Err(error) => serde_json::json!({"ok": false, "error": error}),
+        };
+        let script = format!(
+            "window.__ipcResolve({}, {})",
+            req.id,
+            serde_json::to_string(&payload).unwrap_or_else(|_| "null".into())
+        );
+        let _ = proxy.send_event(AppEvent::IpcResponse(script));
+    });
+}
+
+fn handle(db: &Db, cmd: &str, args: Value) -> Result<Value, String> {
+    fn to_value<T: serde::Serialize>(v: T) -> Result<Value, String> {
+        serde_json::to_value(v).map_err(|e| e.to_string())
+    }
+    fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Option<T> {
+        args.get(key).cloned().and_then(|v| serde_json::from_value(v).ok())
+    }
+
+    match cmd {
+        "get_default_cwd" => to_value(commands::get_default_cwd()),
+        "list_terminal_apps" => to_value(commands::list_terminal_apps()),
+        "open_external_terminal" => {
+            let app: String = arg(&args, "app").ok_or("missing app")?;
+            let cwd: String = arg(&args, "cwd").ok_or("missing cwd")?;
+            commands::open_external_terminal(&app, &cwd).and_then(to_value)
+        }
+        "list_sessions" => commands::list_sessions(db).and_then(to_value),
+        "create_session" => {
+            let name: Option<String> = arg(&args, "name");
+            let cwd: Option<String> = arg(&args, "cwd");
+            commands::create_session(db, name, cwd).and_then(to_value)
+        }
+        "rename_session" => {
+            let id: String = arg(&args, "id").ok_or("missing id")?;
+            let name: String = arg(&args, "name").ok_or("missing name")?;
+            commands::rename_session(db, &id, &name).and_then(to_value)
+        }
+        "close_session" => {
+            let id: String = arg(&args, "id").ok_or("missing id")?;
+            commands::close_session(db, &id).and_then(to_value)
+        }
+        "get_usage_summary" => commands::get_usage_summary(db).and_then(to_value),
+        "has_anthropic_api_key" => commands::has_anthropic_api_key(db).and_then(to_value),
+        "set_anthropic_api_key" => {
+            let key: String = arg(&args, "key").ok_or("missing key")?;
+            commands::set_anthropic_api_key(db, &key).and_then(to_value)
+        }
+        "clear_anthropic_api_key" => commands::clear_anthropic_api_key(db).and_then(to_value),
+        "check_claude_limits" => commands::check_claude_limits(db).and_then(to_value),
+        _ => Err(format!("unknown command: {cmd}")),
+    }
+}

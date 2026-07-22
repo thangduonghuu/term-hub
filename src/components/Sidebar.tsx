@@ -1,50 +1,32 @@
 import { useEffect, useMemo, useState } from "react";
 import { BarChart3, Copy, FolderPlus, Plus, X } from "lucide-react";
 import type { SessionInfo } from "../lib/api";
-import type { SessionStatus } from "../lib/status";
 import { folderName } from "../lib/path";
 
 interface Props {
   sessions: SessionInfo[];
-  statuses: Record<string, SessionStatus>;
   activeId: string | null;
-  onSelect: (id: string) => void;
   onNew: () => void;
   onClose: (id: string) => void;
   onRename: (id: string, name: string) => void;
-  onReopen: (id: string) => void;
+  onSelect: (id: string) => void;
   onDuplicate: (session: SessionInfo) => void;
   onNewInFolder: (cwd: string) => void;
   onOpenUsage: () => void;
-  terminalApps: string[];
-  externalApp: string;
-  onExternalAppChange: (app: string) => void;
   pendingRenameId: string | null;
   onPendingRenameHandled: () => void;
 }
 
-const STATUS_LABEL: Record<SessionStatus, string> = {
-  running: "running",
-  idle: "idle (no output recently)",
-  exited: "exited — click to reopen",
-  closed: "closed — click to reopen",
-};
-
 export function Sidebar({
   sessions,
-  statuses,
   activeId,
-  onSelect,
   onNew,
   onClose,
   onRename,
-  onReopen,
+  onSelect,
   onDuplicate,
   onNewInFolder,
   onOpenUsage,
-  terminalApps,
-  externalApp,
-  onExternalAppChange,
   pendingRenameId,
   onPendingRenameHandled,
 }: Props) {
@@ -129,18 +111,12 @@ export function Sidebar({
             </div>
             <ul className="session-list">
               {group.map((session) => {
-                const status = statuses[session.id] ?? "closed";
                 return (
                   <li
                     key={session.id}
                     className={`session-item ${session.id === activeId ? "active" : ""}`}
-                    onClick={() =>
-                      status === "running" || status === "idle"
-                        ? onSelect(session.id)
-                        : onReopen(session.id)
-                    }
+                    onClick={() => onSelect(session.id)}
                   >
-                    <span className={`status-dot ${status}`} title={STATUS_LABEL[status]} />
                     {editingId === session.id ? (
                       <input
                         autoFocus
@@ -193,24 +169,10 @@ export function Sidebar({
             </ul>
           </div>
         ))}
-        {groups.length === 0 && <div className="no-results">No matching sessions.</div>}
+        {groups.length === 0 && query.trim() && (
+          <div className="no-results">No matching sessions.</div>
+        )}
       </div>
-      {terminalApps.length > 0 && (
-        <div className="sidebar-settings">
-          <label htmlFor="external-app-select">Open externally with</label>
-          <select
-            id="external-app-select"
-            value={externalApp}
-            onChange={(e) => onExternalAppChange(e.currentTarget.value)}
-          >
-            {terminalApps.map((app) => (
-              <option key={app} value={app}>
-                {app}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
     </aside>
   );
 }
