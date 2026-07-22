@@ -1,4 +1,18 @@
+<div align="center">
+
+<img src="docs/logo.png" width="96" height="96" alt="TermHub logo" />
+
 # TermHub
+
+Tile every terminal session in one window — built for running multiple AI coding agents in parallel.
+
+![license](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square) ![node](https://img.shields.io/badge/node-18%2B-lightgrey?style=flat-square) ![rust](https://img.shields.io/badge/rust-stable-lightgrey?style=flat-square)
+
+[See the roadmap →](../terminal-manager-prompt.md)
+
+</div>
+
+---
 
 If you run more than a couple of terminal windows at once — especially juggling several AI
 coding agents (Claude Code, Codex, etc.) in parallel, one per project — you end up with a mess
@@ -12,9 +26,6 @@ It's a cross-platform desktop app (macOS + Windows) built with [Tauri](https://t
 (zsh/bash/PowerShell/cmd) rendered in-app via [`xterm.js`](https://xtermjs.org), backed by a
 real PTY via [`portable-pty`](https://docs.rs/portable-pty) — not a scripted/embedded copy of
 iTerm2 or Windows Terminal, which can't be embedded.
-
-Future phases add per-session/per-agent token usage tracking — see
-[`terminal-manager-prompt.md`](../terminal-manager-prompt.md) for the full roadmap.
 
 ![TermHub showing four sessions tiled in a 2x2 grid, one focused with a green border](docs/screenshot.png)
 
@@ -36,8 +47,6 @@ Future phases add per-session/per-agent token usage tracking — see
   Windows — auto-detected from what's actually installed) from the sidebar settings dropdown,
   then hit the `⤢` button on any pane to pop that session's folder open in it. This runs
   alongside the built-in terminal, it doesn't replace it.
-
-## Status: Phase 1 (MVP)
 
 ## Prerequisites
 
