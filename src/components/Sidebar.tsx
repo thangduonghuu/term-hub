@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { BarChart3, Copy, FolderPlus, Plus, X } from "lucide-react";
 import type { SessionInfo } from "../lib/api";
 import type { SessionStatus } from "../lib/status";
 import { folderName } from "../lib/path";
@@ -14,6 +15,7 @@ interface Props {
   onReopen: (id: string) => void;
   onDuplicate: (session: SessionInfo) => void;
   onNewInFolder: (cwd: string) => void;
+  onOpenUsage: () => void;
   terminalApps: string[];
   externalApp: string;
   onExternalAppChange: (app: string) => void;
@@ -39,6 +41,7 @@ export function Sidebar({
   onReopen,
   onDuplicate,
   onNewInFolder,
+  onOpenUsage,
   terminalApps,
   externalApp,
   onExternalAppChange,
@@ -92,9 +95,14 @@ export function Sidebar({
     <aside className="sidebar">
       <div className="sidebar-header">
         <span>Sessions</span>
-        <button className="new-session-btn" onClick={onNew} title="New session">
-          +
-        </button>
+        <div className="sidebar-header-actions">
+          <button className="usage-toggle-btn" onClick={onOpenUsage} title="Token usage">
+            <BarChart3 size={15} />
+          </button>
+          <button className="new-session-btn" onClick={onNew} title="New session">
+            <Plus size={16} />
+          </button>
+        </div>
       </div>
       <div className="sidebar-search">
         <input
@@ -116,7 +124,7 @@ export function Sidebar({
                 title="New session in this folder"
                 onClick={() => onNewInFolder(cwd)}
               >
-                +
+                <FolderPlus size={13} />
               </button>
             </div>
             <ul className="session-list">
@@ -167,7 +175,7 @@ export function Sidebar({
                         onDuplicate(session);
                       }}
                     >
-                      ⧉
+                      <Copy size={13} />
                     </button>
                     <button
                       className="close-btn"
@@ -177,7 +185,7 @@ export function Sidebar({
                         onClose(session.id);
                       }}
                     >
-                      ×
+                      <X size={14} />
                     </button>
                   </li>
                 );

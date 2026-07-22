@@ -1,4 +1,5 @@
 import { forwardRef } from "react";
+import { ExternalLink, X } from "lucide-react";
 import { TerminalView, type TerminalHandle } from "./TerminalView";
 import type { SessionInfo } from "../lib/api";
 import type { SessionStatus } from "../lib/status";
@@ -42,7 +43,7 @@ export const TerminalPane = forwardRef<TerminalHandle, Props>(function TerminalP
               onOpenExternal(session.cwd);
             }}
           >
-            ⤢
+            <ExternalLink size={13} />
           </button>
         )}
         <button
@@ -53,7 +54,7 @@ export const TerminalPane = forwardRef<TerminalHandle, Props>(function TerminalP
             onClose(session.id);
           }}
         >
-          ×
+          <X size={14} />
         </button>
       </div>
       <div className="pane-body">

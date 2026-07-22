@@ -9,6 +9,33 @@ export interface SessionInfo {
   running: boolean;
 }
 
+export interface SessionUsage {
+  session_id: string | null;
+  session_name: string;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+export interface AgentUsage {
+  agent: string;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+export interface DayUsage {
+  day: string;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+export interface UsageSummary {
+  per_session: SessionUsage[];
+  per_agent: AgentUsage[];
+  per_day: DayUsage[];
+  total_tokens_in: number;
+  total_tokens_out: number;
+}
+
 export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   createSession: (name?: string, cwd?: string) =>
@@ -24,4 +51,5 @@ export const api = {
   listTerminalApps: () => invoke<string[]>("list_terminal_apps"),
   openExternalTerminal: (app: string, cwd: string) =>
     invoke<void>("open_external_terminal", { app, cwd }),
+  getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
 };

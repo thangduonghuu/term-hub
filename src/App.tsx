@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api, type SessionInfo } from "./lib/api";
 import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
+import { UsageDashboard } from "./components/UsageDashboard";
 import type { TerminalHandle } from "./components/TerminalView";
 import { computeStatus, type SessionStatus } from "./lib/status";
 import "./App.css";
@@ -25,6 +26,7 @@ function App() {
     () => localStorage.getItem(EXTERNAL_APP_STORAGE_KEY) ?? "",
   );
   const [pendingRenameId, setPendingRenameId] = useState<string | null>(null);
+  const [showUsage, setShowUsage] = useState(false);
   // Panes that should render in the grid this app run — separate from `running` so an
   // exited shell's pane stays put (with its scrollback) instead of disappearing.
   const [openPaneIds, setOpenPaneIds] = useState<Set<string>>(new Set());
@@ -186,6 +188,7 @@ function App() {
         onReopen={handleReopen}
         onDuplicate={handleDuplicate}
         onNewInFolder={handleNewInFolder}
+        onOpenUsage={() => setShowUsage(true)}
         terminalApps={terminalApps}
         externalApp={externalApp}
         onExternalAppChange={handleExternalAppChange}
@@ -218,6 +221,7 @@ function App() {
           <div className="empty-state">No sessions. Click + to start one.</div>
         )}
       </main>
+      {showUsage && <UsageDashboard onClose={() => setShowUsage(false)} />}
     </div>
   );
 }
