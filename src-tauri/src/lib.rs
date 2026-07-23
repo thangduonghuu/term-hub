@@ -127,6 +127,10 @@ pub enum AppEvent {
     ImePreedit(String),
     ImeCommit(String),
     KeyControl(&'static str),
+    // Ctrl+letter (Ctrl+C to interrupt, Ctrl+D for EOF, Ctrl+Z to suspend, shell readline
+    // shortcuts, etc.) — see `macos_input_view::control_byte`'s doc comment for why these need
+    // their own path instead of going through `KeyControl`/AppKit's key-binding table.
+    KeyByte(u8),
     // Sent by `TerminalInputView::doCommandBySelector`/`keyDown:` when it sees Cmd+C/Cmd+V —
     // actual clipboard I/O happens here in `user_event` since the view doesn't have access to
     // `TerminalSession`.
@@ -410,6 +414,17 @@ impl ApplicationHandler<AppEvent> for App {
                 self.reset_blink();
                 if let Some(term) = self.active_term() {
                     term.write(seq);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            AppEvent::KeyByte(byte) => {
+                self.reset_blink();
+                if let Some(term) = self.active_term() {
+                    // `byte` is always < 0x80 (a C0 control code), so it's trivially valid
+                    // single-byte UTF-8 on its own.
+                    term.write(&(byte as char).to_string());
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();

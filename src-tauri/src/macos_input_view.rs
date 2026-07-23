@@ -72,6 +72,27 @@ declare_class!(
                             _ => {}
                         }
                     }
+                } else if flags.contains(NSEventModifierFlags::NSEventModifierFlagControl) {
+                    // Ctrl+letter (Ctrl+C to interrupt, Ctrl+D for EOF, Ctrl+Z to suspend,
+                    // Ctrl+L to clear, Ctrl+U/R/A/E for shell readline editing, etc.) must
+                    // reach the pty as the raw C0 control byte the shell expects —
+                    // `interpretKeyEvents:` below is the wrong path for these even though it
+                    // *does* process Ctrl-combos (unlike Cmd-combos above): AppKit's default
+                    // key-binding table maps several Ctrl+letter combos to macOS-native text
+                    // *editing* actions (e.g. Ctrl+A → `moveToBeginningOfLine:`, an emacs-
+                    // style binding meant for text fields), which would silently eat them
+                    // instead of ever reaching `insertText:`/`doCommandBySelector:` with
+                    // something we'd forward — breaking the shell's own (also emacs-style)
+                    // readline shortcuts. Bypass that table entirely and send the byte
+                    // ourselves.
+                    if let Some(chars) = event.charactersIgnoringModifiers() {
+                        if let Some(c) = chars.to_string().chars().next() {
+                            if let Some(byte) = control_byte(c) {
+                                let _ = self.ivars().proxy.send_event(AppEvent::KeyByte(byte));
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             let array = NSArray::from_slice(&[event]);
@@ -186,6 +207,23 @@ declare_class!(
         }
     }
 );
+
+/// Maps a plain (unmodified-by-Control) character to the C0 control byte a terminal expects
+/// for Ctrl+that-character, e.g. `b` (Ctrl+B) → 0x02. Matches the standard VT100-derived
+/// convention every terminal follows (`byte = uppercase(c) - 'A' + 1` for letters, plus a
+/// handful of punctuation keys), not something specific to this app.
+fn control_byte(c: char) -> Option<u8> {
+    match c.to_ascii_uppercase() {
+        'A'..='Z' => Some(c.to_ascii_uppercase() as u8 - b'A' + 1),
+        '[' => Some(0x1B), // same byte as plain Escape
+        '\\' => Some(0x1C),
+        ']' => Some(0x1D),
+        '^' => Some(0x1E),
+        '_' => Some(0x1F),
+        '?' => Some(0x7F), // same byte as Backspace/DEL
+        _ => None,
+    }
+}
 
 /// `setMarkedText:`/`insertText:` can hand us either a plain `NSString` or an
 /// `NSAttributedString` (marked text sometimes carries underline-style attributes) — Apple's
