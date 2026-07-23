@@ -13,7 +13,6 @@ pub struct SessionMeta {
 pub struct SessionInfo {
     #[serde(flatten)]
     pub meta: SessionMeta,
-    pub running: bool,
 }
 
 pub fn default_shell() -> String {
