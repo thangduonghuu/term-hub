@@ -34,8 +34,9 @@ pub fn spawn_dispatch(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, raw: &str) {
     let Ok(req) = serde_json::from_str::<IpcRequest>(raw) else {
         return;
     };
+    let proxy_for_handle = proxy.clone();
     std::thread::spawn(move || {
-        let result = handle(&db, &req.cmd, req.args);
+        let result = handle(&db, &proxy_for_handle, &req.cmd, req.args);
         let payload = match result {
             Ok(data) => serde_json::json!({"ok": true, "data": data}),
             Err(error) => serde_json::json!({"ok": false, "error": error}),
@@ -49,7 +50,11 @@ pub fn spawn_dispatch(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, raw: &str) {
     });
 }
 
-fn handle(db: &Db, cmd: &str, args: Value) -> Result<Value, String> {
+/// `db` mutations here (create/close/focus) also need to spawn/kill/focus the actual live
+/// pty-backed session (Phase 3: multi-session tiling) — that state lives in `App`, on the
+/// main thread, unreachable from this background dispatch thread, so those commands notify
+/// it via `proxy` after the db write succeeds.
+fn handle(db: &Db, proxy: &EventLoopProxy<AppEvent>, cmd: &str, args: Value) -> Result<Value, String> {
     fn to_value<T: serde::Serialize>(v: T) -> Result<Value, String> {
         serde_json::to_value(v).map_err(|e| e.to_string())
     }
@@ -59,17 +64,16 @@ fn handle(db: &Db, cmd: &str, args: Value) -> Result<Value, String> {
 
     match cmd {
         "get_default_cwd" => to_value(commands::get_default_cwd()),
-        "list_terminal_apps" => to_value(commands::list_terminal_apps()),
-        "open_external_terminal" => {
-            let app: String = arg(&args, "app").ok_or("missing app")?;
-            let cwd: String = arg(&args, "cwd").ok_or("missing cwd")?;
-            commands::open_external_terminal(&app, &cwd).and_then(to_value)
-        }
         "list_sessions" => commands::list_sessions(db).and_then(to_value),
         "create_session" => {
             let name: Option<String> = arg(&args, "name");
             let cwd: Option<String> = arg(&args, "cwd");
-            commands::create_session(db, name, cwd).and_then(to_value)
+            let info = commands::create_session(db, name, cwd)?;
+            let _ = proxy.send_event(AppEvent::SpawnSession {
+                id: info.meta.id.clone(),
+                cwd: info.meta.cwd.clone(),
+            });
+            to_value(info)
         }
         "rename_session" => {
             let id: String = arg(&args, "id").ok_or("missing id")?;
@@ -78,7 +82,14 @@ fn handle(db: &Db, cmd: &str, args: Value) -> Result<Value, String> {
         }
         "close_session" => {
             let id: String = arg(&args, "id").ok_or("missing id")?;
-            commands::close_session(db, &id).and_then(to_value)
+            commands::close_session(db, &id)?;
+            let _ = proxy.send_event(AppEvent::CloseSession { id });
+            to_value(())
+        }
+        "focus_session" => {
+            let id: String = arg(&args, "id").ok_or("missing id")?;
+            let _ = proxy.send_event(AppEvent::FocusSession(id));
+            to_value(())
         }
         "get_usage_summary" => commands::get_usage_summary(db).and_then(to_value),
         "has_anthropic_api_key" => commands::has_anthropic_api_key(db).and_then(to_value),

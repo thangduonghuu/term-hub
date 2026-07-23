@@ -48,6 +48,7 @@ export const api = {
   renameSession: (id: string, name: string) =>
     invoke<void>("rename_session", { id, name }),
   closeSession: (id: string) => invoke<void>("close_session", { id }),
+  focusSession: (id: string) => invoke<void>("focus_session", { id }),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
   hasAnthropicApiKey: () => invoke<boolean>("has_anthropic_api_key"),

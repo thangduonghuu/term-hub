@@ -1,6 +1,5 @@
 mod commands;
 mod db;
-mod external_terminal;
 mod ipc;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -25,52 +24,94 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
-// Fallback grid size before the window (and its real pixel dimensions) exists —
-// `compute_grid_size` replaces this with the actual fit as soon as `resumed()` runs.
-const COLS: usize = 120;
-const ROWS: usize = 40;
 // Standard-ish terminal cursor blink rate (iTerm2/Terminal.app are both in this ballpark).
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
-// Must match the `left`/`top` origin used in `RedrawRequested`'s call to `gpu.text.render` —
-// duplicated here (rather than computed once and stored) because it's cheap and keeps the
-// margin tweakable in one place without a stale-cache field to remember to update.
+// Gap between reconnecting saved sessions on startup (see `pending_reconnects`'s doc comment)
+// — heavy shell configs (Powerlevel10k's instant-prompt, rbenv/nvm init, etc.) can race with
+// themselves when several copies start at the exact same instant; spreading the spawns out
+// avoids that without meaningfully slowing down how fast the app feels ready to use.
+const RECONNECT_STAGGER: Duration = Duration::from_millis(700);
+// Must match the `left`/`top` origin used in `RedrawRequested`'s call to `gpu.text.render` for
+// each tile — duplicated here (rather than computed once and stored) because it's cheap and
+// keeps the margin tweakable in one place without a stale-cache field to remember to update.
 const TEXT_LEFT_MARGIN: f64 = 8.0;
 const TEXT_TOP_MARGIN: f64 = 4.0;
 
-/// Maps a window-relative physical-pixel point to a display-space terminal cell
-/// (column, row), using the same fixed cell-size assumption `TerminalSession::spawn` gives
-/// the pty (`terminal::CELL_W`/`CELL_H`, scaled by the window's HiDPI factor) — used for
-/// mouse selection and for fitting the grid to the window on resize.
-fn point_to_cell(window: &Window, physical_x: f64, physical_y: f64) -> (usize, i32) {
+/// Logical-space (x, y, width, height) rectangles — one per currently-open session, in the
+/// same order as `App.terms` — tiling them across the window's terminal area (everything
+/// right of the sidebar) in a roughly-square grid (`ceil(sqrt(n))` columns), the classic
+/// tiling-window-manager layout the plan doc's Phase 3 calls for. Recomputed on demand rather
+/// than cached, since it only depends on cheap inputs (window size, session count).
+fn tile_rects(window: &Window, n: usize) -> Vec<(f64, f64, f64, f64)> {
+    if n == 0 {
+        return Vec::new();
+    }
     let scale = window.scale_factor();
-    let left = SIDEBAR_WIDTH * scale + TEXT_LEFT_MARGIN * scale;
+    let size = window.inner_size();
+    let area_w = (size.width as f64 / scale - SIDEBAR_WIDTH).max(1.0);
+    let area_h = (size.height as f64 / scale).max(1.0);
+    let cols = (n as f64).sqrt().ceil() as usize;
+    let rows = (n + cols - 1) / cols;
+    let tile_w = area_w / cols as f64;
+    let tile_h = area_h / rows as f64;
+    (0..n)
+        .map(|i| {
+            let col = (i % cols) as f64;
+            let row = (i / cols) as f64;
+            (SIDEBAR_WIDTH + col * tile_w, row * tile_h, tile_w, tile_h)
+        })
+        .collect()
+}
+
+/// Index into `tile_rects`' output of the tile containing a logical-space point, if any
+/// (`None` means the point is over the sidebar or outside every tile, e.g. a partial last row).
+fn tile_at(rects: &[(f64, f64, f64, f64)], logical_x: f64, logical_y: f64) -> Option<usize> {
+    rects.iter().position(|&(x, y, w, h)| {
+        logical_x >= x && logical_x < x + w && logical_y >= y && logical_y < y + h
+    })
+}
+
+/// How many columns/rows of terminal grid fit in a `width_px` x `height_px` (physical pixels)
+/// area, given the render margins — used both for the initial per-tile terminal spawn and to
+/// keep each session's grid (and its pty's own idea of its size, via `TerminalSession::
+/// resize`) in sync with its tile on every resize/session-count change.
+///
+/// `cell_w` is the *measured* glyph advance width (see `TextPipeline::measure_cell_width` —
+/// logical px, same units as `terminal::CELL_H`), not a guessed constant: a guess even
+/// slightly smaller than the font's true width overestimates how many columns fit, which
+/// showed up as shell prompts rendering past their tile's true edge and getting clipped away.
+fn grid_size_for_area(scale: f64, width_px: f64, height_px: f64, cell_w: f64) -> (usize, usize) {
+    let left = TEXT_LEFT_MARGIN * scale;
     let top = TEXT_TOP_MARGIN * scale;
-    let cell_w = terminal::CELL_W as f64 * scale;
+    let cell_w = cell_w * scale;
+    let cell_h = terminal::CELL_H as f64 * scale;
+    let cols = ((width_px - left) / cell_w).floor().max(1.0) as usize;
+    let rows = ((height_px - top) / cell_h).floor().max(1.0) as usize;
+    (cols, rows)
+}
+
+/// Maps a window-relative physical-pixel point to a display-space terminal cell (column, row)
+/// *within a specific tile* (`tile_x`/`tile_y` are that tile's logical-space origin from
+/// `tile_rects`) — used for mouse selection. `cell_w` — see `grid_size_for_area`'s doc comment.
+fn point_to_cell_in_tile(
+    scale: f64,
+    tile_x: f64,
+    tile_y: f64,
+    physical_x: f64,
+    physical_y: f64,
+    cell_w: f64,
+) -> (usize, i32) {
+    let left = tile_x * scale + TEXT_LEFT_MARGIN * scale;
+    let top = tile_y * scale + TEXT_TOP_MARGIN * scale;
+    let cell_w = cell_w * scale;
     let cell_h = terminal::CELL_H as f64 * scale;
     let col = ((physical_x - left) / cell_w).floor().max(0.0) as usize;
     let row = ((physical_y - top) / cell_h).floor().max(0.0) as i32;
     (col, row)
 }
 
-/// How many columns/rows of terminal grid fit in the window at its current size, given the
-/// sidebar strip and render margins — used both for the initial terminal spawn and to keep
-/// the grid (and the pty's own idea of its size, via `TerminalSession::resize`) in sync with
-/// the window on every resize, which the original Phase 1 implementation never did (the grid
-/// was hardcoded to 120x40 regardless of the actual window size).
-fn compute_grid_size(window: &Window) -> (usize, usize) {
-    let scale = window.scale_factor();
-    let size = window.inner_size();
-    let left = SIDEBAR_WIDTH * scale + TEXT_LEFT_MARGIN * scale;
-    let top = TEXT_TOP_MARGIN * scale;
-    let cell_w = terminal::CELL_W as f64 * scale;
-    let cell_h = terminal::CELL_H as f64 * scale;
-    let cols = (((size.width as f64) - left) / cell_w).floor().max(1.0) as usize;
-    let rows = (((size.height as f64) - top) / cell_h).floor().max(1.0) as usize;
-    (cols, rows)
-}
-
 /// Custom winit user event, delivered on the main thread from background threads —
-/// `IpcResponse` from the IPC dispatch threads (ipc.rs), `PtyOutput` from the terminal's pty
+/// `IpcResponse` from the IPC dispatch threads (ipc.rs), `PtyOutput` from a terminal's pty
 /// reader thread (terminal.rs) so redraws are driven by actual new output instead of a
 /// blind timer (which was re-shaping the whole grid ~60x/sec regardless of whether anything
 /// had changed, pegging the CPU and starving the sidebar webview's own rendering).
@@ -81,15 +122,23 @@ pub enum AppEvent {
     // winit's own `WindowEvent::Ime`/`KeyboardInput`, which had a confirmed macOS-only bug:
     // its internal IME state machine could silently drop the keystroke immediately following
     // a composition commit (e.g. the space after a Vietnamese Telex word). The custom view
-    // owns keyboard input entirely on macOS now, so these carry what it decided instead.
+    // owns keyboard input entirely on macOS now, so these carry what it decided instead, and
+    // always target whichever session is currently `active_id` (the tile last clicked into).
     ImePreedit(String),
     ImeCommit(String),
     KeyControl(&'static str),
-    // Sent by `TerminalInputView::doCommandBySelector` when it sees the standard Cmd+C/Cmd+V
-    // key-binding selectors (`copy:`/`paste:`) — actual clipboard I/O happens here in
-    // `user_event` since the view doesn't have access to `TerminalSession`.
+    // Sent by `TerminalInputView::doCommandBySelector`/`keyDown:` when it sees Cmd+C/Cmd+V —
+    // actual clipboard I/O happens here in `user_event` since the view doesn't have access to
+    // `TerminalSession`.
     Copy,
     Paste,
+    // Sent by `ipc.rs` after the sidebar's `create_session`/`close_session`/session-click
+    // commands successfully touch the database — the *live* pty-backed session (Phase 3:
+    // multi-session tiling) is owned entirely here in `App`, not reachable from the IPC
+    // dispatch background threads, so it's created/destroyed/focused in response to these.
+    SpawnSession { id: String, cwd: String },
+    CloseSession { id: String },
+    FocusSession(String),
 }
 
 struct GpuState<'a> {
@@ -110,37 +159,56 @@ struct App {
     // in right after `build_as_child` returns. Everything here runs on the main thread, so
     // Rc<RefCell<_>> (not Arc<Mutex<_>>) is enough.
     webview: Rc<RefCell<Option<WebView>>>,
-    term: Option<TerminalSession>,
-    // What was actually drawn last frame — `RedrawRequested` skips re-shaping/re-rendering
-    // when neither has changed, since that was pegging the CPU (see the plan doc's Phase 1b
-    // findings). Selection is tracked separately from the text content because dragging a
-    // selection changes what should be on screen (the highlight) without changing the text
-    // itself, so checking content alone would incorrectly skip those frames.
-    last_content: String,
-    last_selection: Vec<(usize, usize)>,
+    // Every currently-open session's live pty-backed terminal, in tile order (see
+    // `tile_rects`). A `Vec` (not a map) because tile layout is order-sensitive and the
+    // session count is always small — linear lookup by id is fine at this scale.
+    terms: Vec<(String, TerminalSession)>,
+    // Which session's tile currently has keyboard focus — `TerminalInputView`'s events (see
+    // `AppEvent`) always target this one, and only this tile shows a live cursor/preedit.
+    active_id: Option<String>,
+    // What was actually drawn last frame, one entry per tile in `terms` order —
+    // `RedrawRequested` skips re-shaping/re-rendering a tile whose content and selection
+    // haven't changed, since redrawing unconditionally was pegging the CPU (see the plan
+    // doc's Phase 1b findings).
+    last_frames: Vec<(String, String, Vec<(usize, usize)>)>,
     cursor_pos: (f64, f64),
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
-    // it's committed) — not sent to the pty, just overlaid at the cursor when rendering so
-    // it's visible as you type instead of only appearing once composition ends.
+    // it's committed) for `active_id`'s session — not sent to the pty, just overlaid at the
+    // cursor when rendering so it's visible as you type instead of only appearing once
+    // composition ends.
     preedit: String,
     // The custom NSTextInputClient view (Phase 1d) that owns all terminal keyboard/IME input
     // on macOS, replacing winit's own (confirmed buggy) handling entirely. Kept alive here —
     // dropping it would tear down the AppKit view it wraps.
     #[cfg(target_os = "macos")]
     input_view: Option<objc2::rc::Retained<macos_input_view::TerminalInputView>>,
-    // Current grid size, kept in sync with the window via `compute_grid_size` — see that
-    // function's doc comment for why this can't just stay at the `COLS`/`ROWS` constants.
-    cols: usize,
-    rows: usize,
-    // Mouse-drag text selection (Phase 2). `mouse_selecting` is true between a `MouseInput`
-    // press and release in the terminal area (not the sidebar), during which `CursorMoved`
-    // extends the selection.
-    mouse_selecting: bool,
+    // Mouse-drag text selection (Phase 2). `selecting_tile` holds the id of the session whose
+    // selection is being extended — fixed at mouse-down, not re-resolved as the cursor moves,
+    // so dragging past a tile's edge keeps extending that tile's selection rather than
+    // switching tiles mid-drag.
+    selecting_tile: Option<String>,
     // Cursor blink phase, toggled on a timer in `about_to_wait` — see `TerminalSession::
     // snapshot`'s doc comment for why a small periodic wakeup here is fine even though this
     // app is otherwise fully event-driven.
     cursor_visible: bool,
     next_blink: Instant,
+    // Measured once in `resumed()` via `TextPipeline::measure_cell_width` — see
+    // `grid_size_for_area`'s doc comment for why this can't just be a guessed constant.
+    // Defaults to `terminal::CELL_W` only as a placeholder before the window (and the
+    // `TextPipeline`/font system needed to actually measure it) exists.
+    cell_w: f64,
+    // Saved sessions still waiting to be reconnected at startup, spawned one at a time on a
+    // timer in `about_to_wait` (`RECONNECT_STAGGER` apart) instead of all at once in
+    // `resumed()`. Spawning N heavy shells in the exact same instant is a real problem with a
+    // heavy `.zshrc` (Powerlevel10k's instant-prompt feature in particular has a known failure
+    // mode where concurrent shell startups race on its cache file and produce corrupted
+    // prompt output — confirmed via this app's own reproduction: content that should have
+    // been a normal `~ ... ok HH:MM:SS PM` prompt line came out as garbled/partial text, and
+    // heavy simultaneous startups were consistent with the app eventually becoming
+    // unresponsive) — staggering the spawns removes the "several copies starting at the exact
+    // same nanosecond" trigger for that race entirely.
+    pending_reconnects: std::collections::VecDeque<session::SessionMeta>,
+    next_reconnect: Instant,
 }
 
 impl App {
@@ -151,18 +219,19 @@ impl App {
             window: None,
             gpu: None,
             webview: Rc::new(RefCell::new(None)),
-            term: None,
-            last_content: String::new(),
-            last_selection: Vec::new(),
+            terms: Vec::new(),
+            active_id: None,
+            last_frames: Vec::new(),
             cursor_pos: (0.0, 0.0),
             preedit: String::new(),
             #[cfg(target_os = "macos")]
             input_view: None,
-            cols: COLS,
-            rows: ROWS,
-            mouse_selecting: false,
+            selecting_tile: None,
             cursor_visible: true,
             next_blink: Instant::now() + BLINK_INTERVAL,
+            cell_w: terminal::CELL_W as f64,
+            pending_reconnects: std::collections::VecDeque::new(),
+            next_reconnect: Instant::now(),
         }
     }
 
@@ -172,6 +241,42 @@ impl App {
     fn reset_blink(&mut self) {
         self.cursor_visible = true;
         self.next_blink = Instant::now() + BLINK_INTERVAL;
+    }
+
+    fn active_term(&mut self) -> Option<&mut TerminalSession> {
+        let id = self.active_id.clone()?;
+        self.terms.iter_mut().find(|(tid, _)| *tid == id).map(|(_, t)| t)
+    }
+
+    /// Refits every open session's grid (and its pty's `winsize`) to its current tile — called
+    /// after the window resizes or the number of open sessions changes, either of which
+    /// changes every tile's size via `tile_rects`.
+    fn refit_all_tiles(&mut self, window: &Window) {
+        let scale = window.scale_factor();
+        let rects = tile_rects(window, self.terms.len());
+        for ((_, term), &(_, _, w, h)) in self.terms.iter_mut().zip(rects.iter()) {
+            let (cols, rows) = grid_size_for_area(scale, w * scale, h * scale, self.cell_w);
+            term.resize(cols, rows);
+        }
+    }
+
+    /// Spawns one new session sized for the tile it will end up in (once it's added to the
+    /// grid), then resizes every other already-open tile to fit the new total — shared by
+    /// live session creation (`AppEvent::SpawnSession`) and the staggered startup reconnect
+    /// (`pending_reconnects`). Returns whether the spawn succeeded.
+    fn spawn_session(&mut self, window: &Window, id: String, cwd: &str) -> bool {
+        let scale = window.scale_factor();
+        let rects = tile_rects(window, self.terms.len() + 1);
+        let &(_, _, w, h) = rects.last().unwrap_or(&(0.0, 0.0, 0.0, 0.0));
+        let (cols, rows) = grid_size_for_area(scale, w * scale, h * scale, self.cell_w);
+        match TerminalSession::spawn(cwd, cols, rows, self.proxy.clone()) {
+            Ok(term) => {
+                self.terms.push((id, term));
+                self.refit_all_tiles(window);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -216,7 +321,8 @@ impl ApplicationHandler<AppEvent> for App {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        let text = TextPipeline::new(&device, &queue, format, config.width, config.height);
+        let mut text = TextPipeline::new(&device, &queue, format, config.width, config.height);
+        self.cell_w = text.measure_cell_width() as f64;
 
         // --- sidebar webview docked to the left strip, replacing the old Tauri-owned window ---
         let rect = Rect {
@@ -235,15 +341,29 @@ impl ApplicationHandler<AppEvent> for App {
             .expect("failed to build sidebar webview");
         *self.webview.borrow_mut() = Some(webview);
 
-        // --- one hardcoded terminal session (Phase 1b scope — multi-session tiling is Phase 3) ---
-        let (cols, rows) = compute_grid_size(&window);
-        self.cols = cols;
-        self.rows = rows;
-        let cwd = session::default_cwd();
-        self.term = Some(
-            TerminalSession::spawn(&cwd, cols, rows, self.proxy.clone())
-                .expect("failed to spawn terminal"),
-        );
+        // --- reconnect a live pty-backed terminal for every session already saved in the db
+        // (Phase 3: multi-session tiling — previously this spawned exactly one hardcoded
+        // session regardless of what was in the sidebar) ---
+        // Drop sessions whose cwd no longer exists (e.g. a folder deleted since it was saved)
+        // *before* computing tile rects, not after trying to spawn them — the rects are sized
+        // for however many sessions will actually end up live, so any spawn failure discovered
+        // mid-loop would otherwise leave every later tile's initial pty size mismatched with
+        // its actual on-screen tile (each session's shell reads its column count once at
+        // startup, so a wrong initial size shows up as a garbled first prompt, not something
+        // that self-corrects on the resize that follows).
+        let mut metas: std::collections::VecDeque<_> = self
+            .db
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| std::path::Path::new(&m.cwd).is_dir())
+            .collect();
+        if let Some(first) = metas.pop_front() {
+            self.spawn_session(&window, first.id, &first.cwd);
+        }
+        self.pending_reconnects = metas;
+        self.next_reconnect = Instant::now() + RECONNECT_STAGGER;
+        self.active_id = self.terms.first().map(|(id, _)| id.clone());
 
         // Install the custom NSTextInputClient view and hand it first responder immediately
         // so terminal keyboard input goes through it (and its correct IME handling) from the
@@ -279,7 +399,7 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::ImeCommit(text) => {
                 self.reset_blink();
                 self.preedit.clear();
-                if let Some(term) = self.term.as_mut() {
+                if let Some(term) = self.active_term() {
                     term.write(&text);
                 }
                 if let Some(w) = &self.window {
@@ -288,7 +408,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::KeyControl(seq) => {
                 self.reset_blink();
-                if let Some(term) = self.term.as_mut() {
+                if let Some(term) = self.active_term() {
                     term.write(seq);
                 }
                 if let Some(w) = &self.window {
@@ -296,7 +416,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::Copy => {
-                let Some(term) = self.term.as_ref() else { return };
+                let Some(term) = self.active_term() else { return };
                 if let Some(text) = term.selection_to_string() {
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(text);
@@ -317,12 +437,55 @@ impl ApplicationHandler<AppEvent> for App {
                     Err(_) => clipboard.get_text().ok(),
                 };
                 if let Some(text) = pasted {
-                    if let Some(term) = self.term.as_mut() {
+                    if let Some(term) = self.active_term() {
                         term.write(&text);
                     }
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();
+                }
+            }
+            AppEvent::SpawnSession { id, cwd } => {
+                let Some(window) = self.window.clone() else { return };
+                self.terms.retain(|(tid, _)| *tid != id);
+                // `spawn_session` sizes the new session for the tile it will actually end up
+                // in *before* spawning it, rather than spawning at the old (pre-insert)
+                // layout's size and correcting afterward — a shell reads its column count once
+                // at startup to lay out its first prompt (right-aligned prompt segments, TUIs
+                // that query size on launch, etc.), so a spawn-then-resize race left that first
+                // prompt rendered for the wrong width, which a later resize doesn't
+                // retroactively fix (confirmed: this was the cause of the garbled/overflowing
+                // first prompt seen when creating a session while others were already open).
+                if !self.spawn_session(&window, id.clone(), &cwd) {
+                    return;
+                }
+                self.active_id = Some(id);
+                #[cfg(target_os = "macos")]
+                if let Some(view) = &self.input_view {
+                    macos::focus_input_view(view);
+                }
+                window.request_redraw();
+            }
+            AppEvent::CloseSession { id } => {
+                self.terms.retain(|(tid, _)| *tid != id);
+                if self.active_id.as_deref() == Some(id.as_str()) {
+                    self.active_id = self.terms.first().map(|(tid, _)| tid.clone());
+                }
+                if let Some(window) = self.window.clone() {
+                    self.refit_all_tiles(&window);
+                    window.request_redraw();
+                }
+            }
+            AppEvent::FocusSession(id) => {
+                if self.terms.iter().any(|(tid, _)| *tid == id) {
+                    self.active_id = Some(id);
+                    #[cfg(target_os = "macos")]
+                    if let Some(view) = &self.input_view {
+                        macos::focus_input_view(view);
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
         }
@@ -333,11 +496,15 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
-                if self.mouse_selecting {
+                if let Some(sel_id) = self.selecting_tile.clone() {
                     if let Some(window) = &self.window {
-                        let (col, row) = point_to_cell(window, position.x, position.y);
-                        if let Some(term) = self.term.as_mut() {
-                            term.update_selection(col.min(self.cols.saturating_sub(1)), row);
+                        let scale = window.scale_factor();
+                        let rects = tile_rects(window, self.terms.len());
+                        if let Some(idx) = self.terms.iter().position(|(tid, _)| *tid == sel_id) {
+                            let (tx, ty, _, _) = rects[idx];
+                            let (col, row) =
+                                point_to_cell_in_tile(scale, tx, ty, position.x, position.y, self.cell_w);
+                            self.terms[idx].1.update_selection(col, row);
                         }
                         window.request_redraw();
                     }
@@ -347,46 +514,63 @@ impl ApplicationHandler<AppEvent> for App {
                 // The webview child view keeps AppKit "first responder" status even once
                 // the window regains key-window focus — those are separate concepts, and
                 // `Window::focus_window()` only affects the latter. Explicitly hand first
-                // responder back to the window's own content view on clicks outside the
+                // responder back to the custom terminal input view on clicks outside the
                 // webview's bounds, or keyboard input stays stuck routing to the webview.
-                let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
+                let Some(window) = self.window.clone() else { return };
+                let scale = window.scale_factor();
                 let logical_x = self.cursor_pos.0 / scale;
-                if logical_x >= SIDEBAR_WIDTH {
-                    #[cfg(target_os = "macos")]
-                    if let Some(view) = &self.input_view {
-                        macos::focus_input_view(view);
-                    }
-                    if let Some(window) = &self.window {
-                        let (col, row) = point_to_cell(window, self.cursor_pos.0, self.cursor_pos.1);
-                        if let Some(term) = self.term.as_mut() {
-                            term.clear_selection();
-                            term.start_selection(col.min(self.cols.saturating_sub(1)), row);
-                        }
-                        self.mouse_selecting = true;
-                        window.request_redraw();
-                    }
+                let logical_y = self.cursor_pos.1 / scale;
+                if logical_x < SIDEBAR_WIDTH {
+                    return;
                 }
+                #[cfg(target_os = "macos")]
+                if let Some(view) = &self.input_view {
+                    macos::focus_input_view(view);
+                }
+                let rects = tile_rects(&window, self.terms.len());
+                if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
+                    let (tx, ty, _, _) = rects[idx];
+                    let (col, row) = point_to_cell_in_tile(
+                        scale,
+                        tx,
+                        ty,
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        self.cell_w,
+                    );
+                    let (id, term) = &mut self.terms[idx];
+                    term.clear_selection();
+                    term.start_selection(col, row);
+                    self.active_id = Some(id.clone());
+                    self.selecting_tile = Some(id.clone());
+                }
+                window.request_redraw();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                self.mouse_selecting = false;
+                self.selecting_tile = None;
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Positive `lines` scrolls further back into scrollback history (matches
                 // `alacritty_terminal::grid::Scroll::Delta`'s convention — see
-                // `TerminalSession::scroll`'s doc comment).
+                // `TerminalSession::scroll`'s doc comment). Scrolling always targets whichever
+                // tile is under the cursor, not necessarily the focused one.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
                     MouseScrollDelta::PixelDelta(pos) => {
                         (pos.y / terminal::CELL_H as f64).round() as i32
                     }
                 };
-                if lines != 0 {
-                    if let Some(term) = self.term.as_mut() {
-                        term.scroll(lines);
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                if lines == 0 {
+                    return;
+                }
+                let Some(window) = self.window.clone() else { return };
+                let scale = window.scale_factor();
+                let logical_x = self.cursor_pos.0 / scale;
+                let logical_y = self.cursor_pos.1 / scale;
+                let rects = tile_rects(&window, self.terms.len());
+                if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
+                    self.terms[idx].1.scroll(lines);
+                    window.request_redraw();
                 }
             }
             WindowEvent::Resized(size) => {
@@ -396,7 +580,7 @@ impl ApplicationHandler<AppEvent> for App {
                     gpu.surface.configure(&gpu.device, &gpu.config);
                     gpu.text.resize(&gpu.queue, gpu.config.width, gpu.config.height);
                 }
-                if let Some(window) = &self.window {
+                if let Some(window) = self.window.clone() {
                     let rect = Rect {
                         position: LogicalPosition::new(0.0, 0.0).into(),
                         size: LogicalSize::new(SIDEBAR_WIDTH, size.height as f64 / window.scale_factor())
@@ -405,17 +589,10 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(wv) = self.webview.borrow().as_ref() {
                         let _ = wv.set_bounds(rect);
                     }
-                    // Keep the grid (and the pty's own `winsize`, so `SIGWINCH`-aware
+                    // Keep every tile's grid (and its pty's own `winsize`, so `SIGWINCH`-aware
                     // programs like `vim`/`htop` redraw correctly) in sync with the window —
                     // previously hardcoded to 120x40 regardless of actual window size.
-                    let (cols, rows) = compute_grid_size(window);
-                    if (cols, rows) != (self.cols, self.rows) {
-                        self.cols = cols;
-                        self.rows = rows;
-                        if let Some(term) = self.term.as_mut() {
-                            term.resize(cols, rows);
-                        }
-                    }
+                    self.refit_all_tiles(&window);
                 }
             }
             // On macOS, terminal keyboard/IME input no longer flows through winit's own
@@ -425,19 +602,40 @@ impl ApplicationHandler<AppEvent> for App {
             // through to the catch-all below, which is currently a no-op (Linux keyboard
             // input for the terminal is still open — see the plan doc).
             WindowEvent::RedrawRequested => {
-                let (Some(gpu), Some(term)) = (self.gpu.as_mut(), self.term.as_ref()) else {
+                let (Some(gpu), Some(window)) = (self.gpu.as_mut(), self.window.as_ref()) else {
                     return;
                 };
-                let tframe = term.snapshot(&self.preedit, self.cursor_visible);
-                // Re-shaping ~4800 cells' worth of text on every redraw — even when nothing
-                // on screen changed — was pegging the CPU and starving the webview's own
-                // rendering on the same OS run loop. Skip the whole frame when idle. Selection
-                // is checked separately from content — see `last_selection`'s doc comment.
-                if tframe.content == self.last_content && tframe.selection_cells == self.last_selection {
+                if self.terms.is_empty() {
                     return;
                 }
-                self.last_content = tframe.content.clone();
-                self.last_selection = tframe.selection_cells.clone();
+                let scale = window.scale_factor();
+                let rects = tile_rects(window, self.terms.len());
+
+                let mut frames = Vec::with_capacity(self.terms.len());
+                for ((id, term), &(_, _, tw, th)) in self.terms.iter().zip(rects.iter()) {
+                    let is_active = self.active_id.as_deref() == Some(id.as_str());
+                    // Only the focused tile (the one that has keyboard input right now) shows
+                    // a cursor and IME preedit — matches the user's own confirmed preference:
+                    // each tile is an independent terminal, and the cursor marks which one
+                    // you're actually typing into, same as normal window-focus behavior.
+                    let preedit = if is_active { self.preedit.as_str() } else { "" };
+                    let cursor_visible = is_active && self.cursor_visible;
+                    let tframe = term.snapshot(preedit, cursor_visible);
+                    frames.push((id.clone(), tframe, (tw, th)));
+                }
+
+                // Re-shaping every tile's text on every redraw — even when nothing on screen
+                // changed anywhere — was pegging the CPU (see the plan doc's Phase 1b
+                // findings). Skip the whole frame only when *no* tile's content or selection
+                // changed since last time.
+                let new_last: Vec<(String, String, Vec<(usize, usize)>)> = frames
+                    .iter()
+                    .map(|(id, f, _)| (id.clone(), f.content.clone(), f.selection_cells.clone()))
+                    .collect();
+                if new_last == self.last_frames {
+                    return;
+                }
+                self.last_frames = new_last;
 
                 let surface_frame = gpu.surface.get_current_texture().unwrap();
                 let view =
@@ -465,24 +663,65 @@ impl ApplicationHandler<AppEvent> for App {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                    // gpu.config.width/height are physical pixels (from the wgpu surface
-                    // config), but SIDEBAR_WIDTH is logical (matching the webview's CSS
-                    // width) — scale it or the sidebar's true physical width (e.g. 440px on
-                    // a 2x display) leaves text rendered underneath the webview, hidden.
-                    let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0) as f32;
-                    let left = SIDEBAR_WIDTH as f32 * scale + TEXT_LEFT_MARGIN as f32 * scale;
-                    gpu.text.render(
+
+                    // Borders don't share glyphon's atlas (separate pipeline, its own vertex
+                    // buffer per call), so drawing them per tile in a loop like this is fine —
+                    // unlike the text below, there's nothing here for a later tile's draw call
+                    // to invalidate out from under an earlier one.
+                    for ((id, _, (tw, th)), &(tx, ty, _, _)) in frames.iter().zip(rects.iter()) {
+                        let sx = (tx * scale).round() as f32;
+                        let sy = (ty * scale).round() as f32;
+                        let sw = (tw * scale).round() as f32;
+                        let sh = (th * scale).round() as f32;
+                        let is_active = self.active_id.as_deref() == Some(id.as_str());
+                        gpu.text.render_tile_border(
+                            &gpu.device,
+                            &mut pass,
+                            sx,
+                            sy,
+                            sw,
+                            sh,
+                            (1.5 * scale as f32).max(1.0),
+                            is_active,
+                            gpu.config.width,
+                            gpu.config.height,
+                        );
+                    }
+
+                    // Every tile's text must be prepared and rendered together in a single
+                    // glyphon `prepare`/`render`/`trim` cycle, not one cycle per tile — see
+                    // `TextPipeline::render_all`'s doc comment for the real bug that caused
+                    // (interleaving `trim()` between tiles evicted glyph data an
+                    // already-recorded-but-not-yet-GPU-executed draw call still needed, so
+                    // only the last tile processed ever actually showed its text).
+                    let cell_w_px = self.cell_w as f32 * scale as f32;
+                    let cell_h_px = terminal::CELL_H * scale as f32;
+                    let tile_renders: Vec<terminal::TileRender> = frames
+                        .iter()
+                        .zip(rects.iter())
+                        .map(|((_, tframe, _), &(tx, ty, tw, th))| {
+                            let sx = (tx * scale).round() as i32;
+                            let sy = (ty * scale).round() as i32;
+                            let sw = (tw * scale).round() as i32;
+                            let sh = (th * scale).round() as i32;
+                            terminal::TileRender {
+                                frame: tframe,
+                                left: sx as f32 + TEXT_LEFT_MARGIN as f32 * scale as f32,
+                                top: sy as f32 + TEXT_TOP_MARGIN as f32 * scale as f32,
+                                clip: (sx, sy, sx + sw, sy + sh),
+                                cell_w: cell_w_px,
+                                cell_h: cell_h_px,
+                            }
+                        })
+                        .collect();
+                    gpu.text.render_all(
                         &gpu.device,
                         &gpu.queue,
                         &mut pass,
-                        &tframe,
-                        left,
-                        TEXT_TOP_MARGIN as f32 * scale,
+                        &tile_renders,
+                        scale as f32,
                         gpu.config.width,
                         gpu.config.height,
-                        scale,
-                        terminal::CELL_W * scale,
-                        terminal::CELL_H * scale,
                     );
                 }
                 gpu.queue.submit(Some(encoder.finish()));
@@ -501,10 +740,24 @@ impl ApplicationHandler<AppEvent> for App {
                 w.request_redraw();
             }
         }
+        if now >= self.next_reconnect {
+            if let Some(meta) = self.pending_reconnects.pop_front() {
+                if let Some(window) = self.window.clone() {
+                    self.spawn_session(&window, meta.id, &meta.cwd);
+                    window.request_redraw();
+                }
+                self.next_reconnect = now + RECONNECT_STAGGER;
+            }
+        }
         // A small periodic wakeup (twice a second) to drive cursor blinking — negligible next
         // to the blind per-frame redraw timer this app deliberately moved away from (see the
-        // plan doc's Phase 1b findings); everything else stays purely event-driven.
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_blink));
+        // plan doc's Phase 1b findings); everything else stays purely event-driven. While
+        // sessions are still staggering in at startup, also wake for `next_reconnect`.
+        let mut deadline = self.next_blink;
+        if !self.pending_reconnects.is_empty() {
+            deadline = deadline.min(self.next_reconnect);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
 

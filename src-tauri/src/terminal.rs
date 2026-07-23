@@ -48,6 +48,9 @@ impl Dimensions for Dims {
     }
 }
 
+// Fallback only — `TextPipeline::measure_cell_width` gives the real value, measured from the
+// actual font, and callers should prefer that. This stays around as what `measure_cell_width`
+// itself falls back to if shaping somehow produces no glyph run at all.
 pub const CELL_W: f32 = 8.0;
 pub const CELL_H: f32 = 16.0;
 
@@ -256,6 +259,23 @@ impl TerminalSession {
     }
 }
 
+/// One tile's worth of input to `TextPipeline::render_all` — see that method's doc comment for
+/// why every tile must be batched into one call instead of one `render` call per tile.
+pub struct TileRender<'a> {
+    pub frame: &'a Frame,
+    /// Top-left origin of this tile's *text* (already offset past the render margin),
+    /// physical pixels.
+    pub left: f32,
+    pub top: f32,
+    /// This tile's own clip rectangle (physical pixels) — glyphon clips glyphs to this per
+    /// `TextArea`, which is what actually keeps one tile's text from bleeding into a
+    /// neighboring tile now (previously done with a wgpu-level `set_scissor_rect` per tile,
+    /// which doesn't fit the same-frame-single-`prepare()` requirement below).
+    pub clip: (i32, i32, i32, i32),
+    pub cell_w: f32,
+    pub cell_h: f32,
+}
+
 pub struct TextPipeline {
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -289,77 +309,142 @@ impl TextPipeline {
         self.viewport.update(queue, Resolution { width, height });
     }
 
-    /// Renders `frame` (left-aligned, top-left origin) into `view` within `pass`, in a flat
-    /// monochrome color (no per-cell ANSI colors — see the plan doc for why: tried and
-    /// explicitly rejected in favor of a flat black & white look matching iTerm2's default
-    /// monochrome profile). Selection highlight rectangles are drawn first so glyphs render on
-    /// top of them, matching how every other terminal composites selection.
-    ///
-    /// `width`/`height`/`left`/`top` are physical pixels (matching the wgpu surface), so
-    /// `scale_factor` (the window's HiDPI scale) must be applied to the font metrics too —
-    /// otherwise a 14pt font renders at roughly half its intended visual size on a 2x
-    /// display, since it'd be laid out as if 14 *physical* px in a canvas that's actually
-    /// twice as many physical pixels per logical point.
+    /// Measures the actual monospace glyph advance width for this app's font (Monaco, 14
+    /// logical px — matching `render`'s `Metrics`), instead of assuming one. `CELL_W` was
+    /// previously just a guessed constant; a guess even slightly *smaller* than the font's
+    /// true advance width systematically overestimates how many columns fit in a given pixel
+    /// width, which was invisible in Phase 1/2 (single terminal filling the whole window, so
+    /// the overflow just ran into unused margin) but became a real, visible bug once Phase 3
+    /// added per-tile wgpu scissor clipping — shell prompts (especially right-aligned
+    /// segments, which land exactly at the overestimated rightmost column) rendered past
+    /// their tile's true edge and were clipped away entirely.
+    pub fn measure_cell_width(&mut self) -> f32 {
+        let metrics = Metrics::new(14.0, CELL_H);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_size(&mut self.font_system, Some(1000.0), Some(100.0));
+        buffer.set_text(
+            &mut self.font_system,
+            "M",
+            &Attrs::new().family(Family::Name("Monaco")),
+            Shaping::Basic,
+        );
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer
+            .layout_runs()
+            .next()
+            .map(|run| run.line_w)
+            .filter(|w| *w > 0.0)
+            .unwrap_or(CELL_W)
+    }
+
+    /// Draws a border around one tile in the multi-session grid (Phase 3) — otherwise every
+    /// session's pane is just an unbroken black rectangle with no visual separation from its
+    /// neighbors. `active` picks a brighter accent color for whichever tile currently has
+    /// keyboard focus. `x`/`y`/`w`/`h`/`thickness` are physical pixels, matching the tile's
+    /// own scissor rect (the caller is expected to have already set that via
+    /// `RenderPass::set_scissor_rect`, so this never draws outside the tile).
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub fn render_tile_border(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        thickness: f32,
+        active: bool,
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        self.selection.render_border(device, pass, x, y, w, h, thickness, active, viewport_w, viewport_h);
+    }
+
+    /// Renders every currently-visible tile's text (left-aligned within its own origin) in one
+    /// pass, in a flat monochrome color (no per-cell ANSI colors — see the plan doc for why:
+    /// tried and explicitly rejected in favor of a flat black & white look matching iTerm2's
+    /// default monochrome profile). Selection highlight rectangles are drawn first so glyphs
+    /// render on top of them, matching how every other terminal composites selection.
+    ///
+    /// All `tiles` **must** be prepared and rendered together in a single `prepare()`/
+    /// `render()`/`trim()` cycle, not one cycle per tile (an earlier version of this code did
+    /// exactly that, once per tile, in a loop) — `trim()` evicts glyph atlas entries it
+    /// considers no longer in use, and calling it after preparing tile 1 but *before* the GPU
+    /// has actually executed tile 1's draw call (which doesn't happen until the whole frame's
+    /// command buffer is submitted, after every tile has been processed) could evict the very
+    /// atlas region tile 1's already-recorded draw call still points to. Confirmed as the
+    /// cause of a real bug: with the old per-tile loop, only the last tile processed ever
+    /// rendered its text correctly — every earlier tile stayed blank, since its glyph data had
+    /// already been trimmed out from under it by the time the GPU actually drew the frame.
+    pub fn render_all(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pass: &mut wgpu::RenderPass,
-        frame: &Frame,
-        left: f32,
-        top: f32,
-        width: u32,
-        height: u32,
+        tiles: &[TileRender],
         scale_factor: f32,
-        cell_w: f32,
-        cell_h: f32,
+        viewport_w: u32,
+        viewport_h: u32,
     ) {
-        if !frame.selection_cells.is_empty() {
-            self.selection.render(
-                device,
-                queue,
-                pass,
-                &frame.selection_cells,
-                left,
-                top,
-                cell_w,
-                cell_h,
-                width,
-                height,
-            );
+        for t in tiles {
+            if !t.frame.selection_cells.is_empty() {
+                self.selection.render(
+                    device,
+                    queue,
+                    pass,
+                    &t.frame.selection_cells,
+                    t.left,
+                    t.top,
+                    t.cell_w,
+                    t.cell_h,
+                    viewport_w,
+                    viewport_h,
+                );
+            }
         }
 
         let metrics = Metrics::new(14.0 * scale_factor, CELL_H * scale_factor);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(&mut self.font_system, Some(width as f32), Some(height as f32));
-        buffer.set_text(
-            &mut self.font_system,
-            &frame.content,
-            // The generic Monospace family resolves to whatever the system default is
-            // (Menlo/SF Mono on macOS), which is missing about half of the Vietnamese
-            // precomposed Latin block (confirmed earlier this session via direct fontconfig
-            // inspection) — e.g. "ắ" (U+1EAF) renders as a tofu box. Monaco, also bundled
-            // with macOS, has full coverage (confirmed 0/90 missing at the time).
-            &Attrs::new().family(Family::Name("Monaco")),
-            // Basic is far cheaper than Advanced (skips full BiDi/complex-script analysis)
-            // and is enough for a terminal grid — precomposed Vietnamese/Latin diacritics
-            // etc. still render correctly, they just don't need script reordering.
-            Shaping::Basic,
-        );
-        buffer.shape_until_scroll(&mut self.font_system, false);
+        let mut buffers = Vec::with_capacity(tiles.len());
+        for t in tiles {
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            buffer.set_size(&mut self.font_system, Some(viewport_w as f32), Some(viewport_h as f32));
+            buffer.set_text(
+                &mut self.font_system,
+                &t.frame.content,
+                // The generic Monospace family resolves to whatever the system default is
+                // (Menlo/SF Mono on macOS), which is missing about half of the Vietnamese
+                // precomposed Latin block (confirmed earlier this session via direct
+                // fontconfig inspection) — e.g. "ắ" (U+1EAF) renders as a tofu box. Monaco,
+                // also bundled with macOS, has full coverage (confirmed 0/90 missing).
+                &Attrs::new().family(Family::Name("Monaco")),
+                // Basic is far cheaper than Advanced (skips full BiDi/complex-script
+                // analysis) and is enough for a terminal grid — precomposed Vietnamese/Latin
+                // diacritics etc. still render correctly, they just don't need script
+                // reordering.
+                Shaping::Basic,
+            );
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            buffers.push(buffer);
+        }
 
-        let text_area = TextArea {
-            buffer: &buffer,
-            left,
-            top,
-            scale: 1.0,
-            bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
-            // iTerm2's default profile: light gray foreground (not pure white — easier on
-            // the eyes against pure black than full-contrast white).
-            default_color: TextColor::rgb(208, 208, 208),
-            custom_glyphs: &[],
-        };
+        let text_areas: Vec<TextArea> = tiles
+            .iter()
+            .zip(buffers.iter())
+            .map(|(t, buffer)| {
+                let (cl, ct, cr, cb) = t.clip;
+                TextArea {
+                    buffer,
+                    left: t.left,
+                    top: t.top,
+                    scale: 1.0,
+                    bounds: TextBounds { left: cl, top: ct, right: cr, bottom: cb },
+                    // iTerm2's default profile: light gray foreground (not pure white —
+                    // easier on the eyes against pure black than full-contrast white).
+                    default_color: TextColor::rgb(208, 208, 208),
+                    custom_glyphs: &[],
+                }
+            })
+            .collect();
 
         self.text_renderer
             .prepare(
@@ -368,7 +453,7 @@ impl TextPipeline {
                 &mut self.font_system,
                 &mut self.atlas,
                 &self.viewport,
-                [text_area],
+                text_areas,
                 &mut self.swash_cache,
             )
             .unwrap();
@@ -487,21 +572,71 @@ impl SelectionPipeline {
         viewport_w: u32,
         viewport_h: u32,
     ) {
+        // Selection tint: light, semi-transparent gray — lets the glyph drawn on top (in
+        // this app's monochrome light-gray-on-black palette) stay legible.
+        let color = [1.0, 1.0, 1.0, 0.28];
+        let rects: Vec<(f32, f32, f32, f32, [f32; 4])> = cells
+            .iter()
+            .map(|&(row, col)| {
+                (left + col as f32 * cell_w, top + row as f32 * cell_h, cell_w, cell_h, color)
+            })
+            .collect();
+        self.draw_rects(device, pass, &rects, viewport_w, viewport_h);
+    }
+
+    /// Draws a hollow rectangle outline (four thin filled quads, one per edge) around a tile —
+    /// used to visually separate sessions in the tiled grid, and to highlight whichever one
+    /// currently has keyboard focus (`active`). All pixel-space, physical pixels.
+    #[allow(clippy::too_many_arguments)]
+    fn render_border(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        thickness: f32,
+        active: bool,
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        let color =
+            if active { [0.35, 0.55, 1.0, 1.0] } else { [1.0, 1.0, 1.0, 0.3] };
+        let rects = [
+            // top
+            (x, y, w, thickness, color),
+            // bottom
+            (x, y + h - thickness, w, thickness, color),
+            // left
+            (x, y, thickness, h, color),
+            // right
+            (x + w - thickness, y, thickness, h, color),
+        ];
+        self.draw_rects(device, pass, &rects, viewport_w, viewport_h);
+    }
+
+    fn draw_rects(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        rects: &[(f32, f32, f32, f32, [f32; 4])],
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        if rects.is_empty() {
+            return;
+        }
         let to_ndc = |x: f32, y: f32| -> [f32; 2] {
             [
                 (x / viewport_w as f32) * 2.0 - 1.0,
                 1.0 - (y / viewport_h as f32) * 2.0,
             ]
         };
-        // Selection tint: light, semi-transparent gray — lets the glyph drawn on top (in
-        // this app's monochrome light-gray-on-black palette) stay legible.
-        let color = [1.0, 1.0, 1.0, 0.28];
-        let mut vertices = Vec::with_capacity(cells.len() * 6);
-        for &(row, col) in cells {
-            let x0 = left + col as f32 * cell_w;
-            let y0 = top + row as f32 * cell_h;
-            let x1 = x0 + cell_w;
-            let y1 = y0 + cell_h;
+        let mut vertices = Vec::with_capacity(rects.len() * 6);
+        for &(x0, y0, w, h, color) in rects {
+            let x1 = x0 + w;
+            let y1 = y0 + h;
             let tl = SelectionVertex { position: to_ndc(x0, y0), color };
             let tr = SelectionVertex { position: to_ndc(x1, y0), color };
             let bl = SelectionVertex { position: to_ndc(x0, y1), color };
@@ -510,7 +645,7 @@ impl SelectionPipeline {
         }
 
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("selection-vertices"),
+            label: Some("quad-vertices"),
             contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });

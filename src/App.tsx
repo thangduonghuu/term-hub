@@ -18,23 +18,28 @@ function App() {
     const created = await api.createSession();
     setSessions((prev) => [...prev, created]);
     setPendingRenameId(created.id);
+    setActiveId(created.id);
   }
 
   async function handleNewInFolder(cwd: string) {
     const created = await api.createSession(undefined, cwd);
     setSessions((prev) => [...prev, created]);
     setPendingRenameId(created.id);
+    setActiveId(created.id);
   }
 
   async function handleDuplicate(session: SessionInfo) {
     const created = await api.createSession(`${session.name} copy`, session.cwd);
     setSessions((prev) => [...prev, created]);
+    setActiveId(created.id);
   }
 
-  // Phase 1b has a single embedded terminal (not yet one per session — that's Phase 3's
-  // multi-session tiling), so selecting a session is just a visual highlight for now.
+  // Phase 3: every session has a live tiled terminal on the Rust side (see lib.rs's
+  // `App.terms`) — clicking it in the sidebar both highlights it here and hands it real
+  // keyboard focus over there.
   function handleSelect(id: string) {
     setActiveId(id);
+    api.focusSession(id);
   }
 
   async function handleClose(id: string) {

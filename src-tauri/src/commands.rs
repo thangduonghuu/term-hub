@@ -1,22 +1,11 @@
 use uuid::Uuid;
 
 use crate::db::Db;
-use crate::external_terminal;
 use crate::session::{default_cwd, default_shell, SessionInfo, SessionMeta};
 use crate::usage::UsageSummary;
 
 pub fn get_default_cwd() -> String {
     default_cwd()
-}
-
-/// Terminal apps installed on this machine (e.g. iTerm2, Warp) that a session's folder
-/// can be opened in as an alternative to the built-in embedded terminal.
-pub fn list_terminal_apps() -> Vec<String> {
-    external_terminal::list_apps()
-}
-
-pub fn open_external_terminal(app: &str, cwd: &str) -> Result<(), String> {
-    external_terminal::open_external(app, cwd)
 }
 
 pub fn list_sessions(db: &Db) -> Result<Vec<SessionInfo>, String> {
