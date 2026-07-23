@@ -122,7 +122,9 @@ impl TerminalSession {
     /// Telex, before it's committed) is overlaid at the cursor position so it's visible
     /// live as you type, matching how a native app would show it — it isn't part of the
     /// real terminal buffer yet (nothing has been sent to the pty for it), just a visual
-    /// preview spliced in at render time.
+    /// preview spliced in at render time. A block cursor is overlaid right after it (or at
+    /// the raw cursor position when there's no active composition) — there's no separate
+    /// cursor-drawing pass, it's just another character substitution like preedit.
     pub fn snapshot_text_with_preedit(&self, preedit: &str) -> String {
         let term = self.term.lock().unwrap();
         let grid = term.grid();
@@ -130,15 +132,19 @@ impl TerminalSession {
         let cursor_line = grid.cursor.point.line.0;
         let cursor_col = grid.cursor.point.column.0;
         let preedit_chars: Vec<char> = preedit.chars().collect();
+        let cursor_display_col = cursor_col + preedit_chars.len();
         let mut s = String::new();
         for (row_idx, row) in grid.display_iter().collect::<Vec<_>>().chunks(cols).enumerate() {
             for (col_idx, cell) in row.iter().enumerate() {
-                if !preedit_chars.is_empty()
+                let in_preedit = !preedit_chars.is_empty()
                     && row_idx as i32 == cursor_line
                     && col_idx >= cursor_col
-                    && col_idx < cursor_col + preedit_chars.len()
-                {
+                    && col_idx < cursor_col + preedit_chars.len();
+                let is_cursor = row_idx as i32 == cursor_line && col_idx == cursor_display_col;
+                if in_preedit {
                     s.push(preedit_chars[col_idx - cursor_col]);
+                } else if is_cursor {
+                    s.push('█');
                 } else {
                     s.push(cell.c);
                 }
@@ -225,7 +231,9 @@ impl TextPipeline {
             top,
             scale: 1.0,
             bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
-            default_color: glyphon::Color::rgb(230, 230, 230),
+            // iTerm2's default profile: light gray foreground (not pure white — easier on
+            // the eyes against pure black than full-contrast white).
+            default_color: glyphon::Color::rgb(208, 208, 208),
             custom_glyphs: &[],
         };
 

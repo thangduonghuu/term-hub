@@ -4,6 +4,8 @@ mod external_terminal;
 mod ipc;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_input_view;
 mod session;
 mod terminal;
 mod usage;
@@ -15,9 +17,8 @@ use std::sync::Arc;
 use db::Db;
 use terminal::{TerminalSession, TextPipeline};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
@@ -34,6 +35,14 @@ const ROWS: usize = 40;
 pub enum AppEvent {
     IpcResponse(String),
     PtyOutput,
+    // Sent by `macos_input_view::TerminalInputView` (Phase 1d — see the plan doc) instead of
+    // winit's own `WindowEvent::Ime`/`KeyboardInput`, which had a confirmed macOS-only bug:
+    // its internal IME state machine could silently drop the keystroke immediately following
+    // a composition commit (e.g. the space after a Vietnamese Telex word). The custom view
+    // owns keyboard input entirely on macOS now, so these carry what it decided instead.
+    ImePreedit(String),
+    ImeCommit(String),
+    KeyControl(&'static str),
 }
 
 struct GpuState<'a> {
@@ -57,20 +66,15 @@ struct App {
     term: Option<TerminalSession>,
     last_logged: String,
     cursor_pos: (f64, f64),
-    // Erase-on-commit safety net: if a plain (non-IME) character was just written and an
-    // IME composition then commits without ever going through `Ime::Preedit` (some input
-    // methods retroactively replace already-committed text via
-    // `insertText:replacementRange:` instead of live-previewing it — winit's macOS backend
-    // ignores that replacementRange, a confirmed upstream bug, rust-windowing/winit#3617),
-    // this lets us erase the stale plain character ourselves before writing the real
-    // composed text. Cleared whenever a `Preedit` session starts, since macOS Vietnamese
-    // Telex (confirmed via testing) normally composes live through `Preedit` — nothing is
-    // written to the pty for the characters it owns, so there's nothing to erase.
-    last_ime_seed: String,
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
     // it's committed) — not sent to the pty, just overlaid at the cursor when rendering so
     // it's visible as you type instead of only appearing once composition ends.
     preedit: String,
+    // The custom NSTextInputClient view (Phase 1d) that owns all terminal keyboard/IME input
+    // on macOS, replacing winit's own (confirmed buggy) handling entirely. Kept alive here —
+    // dropping it would tear down the AppKit view it wraps.
+    #[cfg(target_os = "macos")]
+    input_view: Option<objc2::rc::Retained<macos_input_view::TerminalInputView>>,
 }
 
 impl App {
@@ -84,8 +88,9 @@ impl App {
             term: None,
             last_logged: String::new(),
             cursor_pos: (0.0, 0.0),
-            last_ime_seed: String::new(),
             preedit: String::new(),
+            #[cfg(target_os = "macos")]
+            input_view: None,
         }
     }
 }
@@ -96,6 +101,11 @@ impl ApplicationHandler<AppEvent> for App {
             .with_title("TermHub")
             .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 700.0));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        // On macOS the custom `TerminalInputView` (installed below) owns IME entirely —
+        // winit's own handling is left disabled so its separate, confirmed-buggy IME state
+        // machine never activates in parallel. Non-macOS platforms don't have that view yet
+        // (Phase 1d is macOS-only so far), so they still need winit's own IME support.
+        #[cfg(not(target_os = "macos"))]
         window.set_ime_allowed(true);
 
         let size = window.inner_size();
@@ -152,6 +162,14 @@ impl ApplicationHandler<AppEvent> for App {
                 .expect("failed to spawn terminal"),
         );
 
+        // Install the custom NSTextInputClient view and hand it first responder immediately
+        // so terminal keyboard input goes through it (and its correct IME handling) from the
+        // start, not through winit's own (disabled above) machinery.
+        #[cfg(target_os = "macos")]
+        {
+            self.input_view = macos::install_input_view(&window, self.proxy.clone());
+        }
+
         self.gpu = Some(GpuState { surface, device, queue, config, text });
         self.window = Some(window);
     }
@@ -164,6 +182,29 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::PtyOutput => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            AppEvent::ImePreedit(text) => {
+                self.preedit = text;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            AppEvent::ImeCommit(text) => {
+                self.preedit.clear();
+                if let Some(term) = self.term.as_mut() {
+                    term.write(&text);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            AppEvent::KeyControl(seq) => {
+                if let Some(term) = self.term.as_mut() {
+                    term.write(seq);
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -186,15 +227,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
                 let logical_x = self.cursor_pos.0 / scale;
                 if logical_x >= SIDEBAR_WIDTH {
-                    if let Some(w) = &self.window {
-                        #[cfg(target_os = "macos")]
-                        macos::reclaim_first_responder(w);
-                        // Re-assert IME support after the manual first-responder change
-                        // above — winit's own IME/input-context activation may be tied to
-                        // its own internal focus-change flow, which the raw AppKit call
-                        // bypasses, otherwise Vietnamese/IME composition stops working even
-                        // though plain ASCII keys still come through fine.
-                        w.set_ime_allowed(true);
+                    #[cfg(target_os = "macos")]
+                    if let Some(view) = &self.input_view {
+                        macos::focus_input_view(view);
                     }
                 }
             }
@@ -216,66 +251,12 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed {
-                    return;
-                }
-                let Some(term) = self.term.as_mut() else { return };
-                // Named keys with a specific control sequence the shell expects (e.g.
-                // Backspace as DEL/0x7f, not whatever raw char winit's `text` reports —
-                // that was 0x08/BS, which most shells don't treat as erase) take priority
-                // over `event.text`. Everything else falls through to `event.text`, which
-                // is the IME-composed string for the keystroke — the piece that makes
-                // Vietnamese/any-language input work, since it comes from the OS's real
-                // text-input handling.
-                let named_seq: Option<&str> = match event.logical_key {
-                    Key::Named(NamedKey::Enter) => Some("\r"),
-                    Key::Named(NamedKey::Backspace) => Some("\x7f"),
-                    Key::Named(NamedKey::Tab) => Some("\t"),
-                    Key::Named(NamedKey::ArrowLeft) => Some("\x1b[D"),
-                    Key::Named(NamedKey::ArrowRight) => Some("\x1b[C"),
-                    Key::Named(NamedKey::ArrowUp) => Some("\x1b[A"),
-                    Key::Named(NamedKey::ArrowDown) => Some("\x1b[B"),
-                    _ => None,
-                };
-                if let Some(seq) = named_seq {
-                    term.write(seq);
-                    self.last_ime_seed.clear();
-                } else if let Some(text) = &event.text {
-                    term.write(text.as_str());
-                    self.last_ime_seed = text.to_string();
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
-            WindowEvent::Ime(Ime::Preedit(text, _cursor)) => {
-                self.preedit = text;
-                if !self.preedit.is_empty() {
-                    // A live composition session is now driving input; whatever plain
-                    // character was last written is no longer relevant to erase.
-                    self.last_ime_seed.clear();
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                self.preedit.clear();
-                let Some(term) = self.term.as_mut() else { return };
-                // Safety net for IMEs that skip Preedit and retroactively replace an
-                // already-committed plain character instead (see `last_ime_seed`'s doc
-                // comment) — a no-op backspace count when, as is normal for Vietnamese
-                // Telex, composition went through Preedit and nothing was written yet.
-                let backspaces = "\x7f".repeat(self.last_ime_seed.chars().count());
-                term.write(&backspaces);
-                term.write(&text);
-                self.last_ime_seed.clear();
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
-            WindowEvent::Ime(_) => {}
+            // On macOS, terminal keyboard/IME input no longer flows through winit's own
+            // `KeyboardInput`/`Ime` events at all — `TerminalInputView` (Phase 1d) holds
+            // first responder and handles it directly, forwarding results via `AppEvent`
+            // (see `user_event`). Non-macOS platforms don't have that view yet and fall
+            // through to the catch-all below, which is currently a no-op (Linux keyboard
+            // input for the terminal is still open — see the plan doc).
             WindowEvent::RedrawRequested => {
                 let (Some(gpu), Some(term)) = (self.gpu.as_mut(), self.term.as_ref()) else {
                     return;
@@ -300,10 +281,11 @@ impl ApplicationHandler<AppEvent> for App {
                             view: &view,
                             resolve_target: None,
                             ops: wgpu::Operations {
+                                // iTerm2's default profile: pure black background.
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.078,
-                                    g: 0.078,
-                                    b: 0.078,
+                                    r: 0.0,
+                                    g: 0.0,
+                                    b: 0.0,
                                     a: 1.0,
                                 }),
                                 store: wgpu::StoreOp::Store,
