@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_app_kit::{NSEvent, NSTextInputClient, NSView};
+use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSTextInputClient, NSView};
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSPoint,
     NSRange, NSRangePointer, NSRect, NSString,
@@ -50,6 +50,30 @@ declare_class!(
 
         #[method(keyDown:)]
         fn key_down(&self, event: &NSEvent) {
+            // Cmd+C/Cmd+V don't reach `doCommandBySelector:`'s `copy:`/`paste:` via
+            // `interpretKeyEvents:` below — that path only covers AppKit's standard *text*
+            // key-binding table (arrows, Ctrl-combos, etc.); Cmd-modified shortcuts are
+            // conventionally resolved as Edit-menu key equivalents instead, which never
+            // fire without an actual menu bar wired up (this app doesn't have one). Handle
+            // them directly here instead of depending on that machinery.
+            unsafe {
+                let flags = event.modifierFlags();
+                if flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand) {
+                    if let Some(chars) = event.charactersIgnoringModifiers() {
+                        match chars.to_string().as_str() {
+                            "c" => {
+                                let _ = self.ivars().proxy.send_event(AppEvent::Copy);
+                                return;
+                            }
+                            "v" => {
+                                let _ = self.ivars().proxy.send_event(AppEvent::Paste);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             let array = NSArray::from_slice(&[event]);
             unsafe { self.interpretKeyEvents(&array) };
         }
@@ -58,6 +82,7 @@ declare_class!(
         fn key_up(&self, _event: &NSEvent) {}
     }
 
+    #[allow(non_snake_case)]
     unsafe impl NSTextInputClient for TerminalInputView {
         #[method(hasMarkedText)]
         unsafe fn hasMarkedText(&self) -> bool {
@@ -153,6 +178,10 @@ declare_class!(
             };
             if let Some(seq) = seq {
                 let _ = self.ivars().proxy.send_event(AppEvent::KeyControl(seq));
+            } else if cmd == sel!(copy:) {
+                let _ = self.ivars().proxy.send_event(AppEvent::Copy);
+            } else if cmd == sel!(paste:) {
+                let _ = self.ivars().proxy.send_event(AppEvent::Paste);
             }
         }
     }

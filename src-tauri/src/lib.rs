@@ -13,19 +13,61 @@ mod usage;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use db::Db;
 use terminal::{TerminalSession, TextPipeline};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
+// Fallback grid size before the window (and its real pixel dimensions) exists —
+// `compute_grid_size` replaces this with the actual fit as soon as `resumed()` runs.
 const COLS: usize = 120;
 const ROWS: usize = 40;
+// Standard-ish terminal cursor blink rate (iTerm2/Terminal.app are both in this ballpark).
+const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+// Must match the `left`/`top` origin used in `RedrawRequested`'s call to `gpu.text.render` —
+// duplicated here (rather than computed once and stored) because it's cheap and keeps the
+// margin tweakable in one place without a stale-cache field to remember to update.
+const TEXT_LEFT_MARGIN: f64 = 8.0;
+const TEXT_TOP_MARGIN: f64 = 4.0;
+
+/// Maps a window-relative physical-pixel point to a display-space terminal cell
+/// (column, row), using the same fixed cell-size assumption `TerminalSession::spawn` gives
+/// the pty (`terminal::CELL_W`/`CELL_H`, scaled by the window's HiDPI factor) — used for
+/// mouse selection and for fitting the grid to the window on resize.
+fn point_to_cell(window: &Window, physical_x: f64, physical_y: f64) -> (usize, i32) {
+    let scale = window.scale_factor();
+    let left = SIDEBAR_WIDTH * scale + TEXT_LEFT_MARGIN * scale;
+    let top = TEXT_TOP_MARGIN * scale;
+    let cell_w = terminal::CELL_W as f64 * scale;
+    let cell_h = terminal::CELL_H as f64 * scale;
+    let col = ((physical_x - left) / cell_w).floor().max(0.0) as usize;
+    let row = ((physical_y - top) / cell_h).floor().max(0.0) as i32;
+    (col, row)
+}
+
+/// How many columns/rows of terminal grid fit in the window at its current size, given the
+/// sidebar strip and render margins — used both for the initial terminal spawn and to keep
+/// the grid (and the pty's own idea of its size, via `TerminalSession::resize`) in sync with
+/// the window on every resize, which the original Phase 1 implementation never did (the grid
+/// was hardcoded to 120x40 regardless of the actual window size).
+fn compute_grid_size(window: &Window) -> (usize, usize) {
+    let scale = window.scale_factor();
+    let size = window.inner_size();
+    let left = SIDEBAR_WIDTH * scale + TEXT_LEFT_MARGIN * scale;
+    let top = TEXT_TOP_MARGIN * scale;
+    let cell_w = terminal::CELL_W as f64 * scale;
+    let cell_h = terminal::CELL_H as f64 * scale;
+    let cols = (((size.width as f64) - left) / cell_w).floor().max(1.0) as usize;
+    let rows = (((size.height as f64) - top) / cell_h).floor().max(1.0) as usize;
+    (cols, rows)
+}
 
 /// Custom winit user event, delivered on the main thread from background threads —
 /// `IpcResponse` from the IPC dispatch threads (ipc.rs), `PtyOutput` from the terminal's pty
@@ -43,6 +85,11 @@ pub enum AppEvent {
     ImePreedit(String),
     ImeCommit(String),
     KeyControl(&'static str),
+    // Sent by `TerminalInputView::doCommandBySelector` when it sees the standard Cmd+C/Cmd+V
+    // key-binding selectors (`copy:`/`paste:`) — actual clipboard I/O happens here in
+    // `user_event` since the view doesn't have access to `TerminalSession`.
+    Copy,
+    Paste,
 }
 
 struct GpuState<'a> {
@@ -64,7 +111,13 @@ struct App {
     // Rc<RefCell<_>> (not Arc<Mutex<_>>) is enough.
     webview: Rc<RefCell<Option<WebView>>>,
     term: Option<TerminalSession>,
-    last_logged: String,
+    // What was actually drawn last frame — `RedrawRequested` skips re-shaping/re-rendering
+    // when neither has changed, since that was pegging the CPU (see the plan doc's Phase 1b
+    // findings). Selection is tracked separately from the text content because dragging a
+    // selection changes what should be on screen (the highlight) without changing the text
+    // itself, so checking content alone would incorrectly skip those frames.
+    last_content: String,
+    last_selection: Vec<(usize, usize)>,
     cursor_pos: (f64, f64),
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
     // it's committed) — not sent to the pty, just overlaid at the cursor when rendering so
@@ -75,6 +128,19 @@ struct App {
     // dropping it would tear down the AppKit view it wraps.
     #[cfg(target_os = "macos")]
     input_view: Option<objc2::rc::Retained<macos_input_view::TerminalInputView>>,
+    // Current grid size, kept in sync with the window via `compute_grid_size` — see that
+    // function's doc comment for why this can't just stay at the `COLS`/`ROWS` constants.
+    cols: usize,
+    rows: usize,
+    // Mouse-drag text selection (Phase 2). `mouse_selecting` is true between a `MouseInput`
+    // press and release in the terminal area (not the sidebar), during which `CursorMoved`
+    // extends the selection.
+    mouse_selecting: bool,
+    // Cursor blink phase, toggled on a timer in `about_to_wait` — see `TerminalSession::
+    // snapshot`'s doc comment for why a small periodic wakeup here is fine even though this
+    // app is otherwise fully event-driven.
+    cursor_visible: bool,
+    next_blink: Instant,
 }
 
 impl App {
@@ -86,12 +152,26 @@ impl App {
             gpu: None,
             webview: Rc::new(RefCell::new(None)),
             term: None,
-            last_logged: String::new(),
+            last_content: String::new(),
+            last_selection: Vec::new(),
             cursor_pos: (0.0, 0.0),
             preedit: String::new(),
             #[cfg(target_os = "macos")]
             input_view: None,
+            cols: COLS,
+            rows: ROWS,
+            mouse_selecting: false,
+            cursor_visible: true,
+            next_blink: Instant::now() + BLINK_INTERVAL,
         }
+    }
+
+    /// Resets the cursor to solid/visible and pushes its next blink-off deadline out — called
+    /// on every keystroke, matching the usual terminal UX where typing while the cursor
+    /// happens to be in its "off" blink phase doesn't make it look unresponsive.
+    fn reset_blink(&mut self) {
+        self.cursor_visible = true;
+        self.next_blink = Instant::now() + BLINK_INTERVAL;
     }
 }
 
@@ -156,9 +236,12 @@ impl ApplicationHandler<AppEvent> for App {
         *self.webview.borrow_mut() = Some(webview);
 
         // --- one hardcoded terminal session (Phase 1b scope — multi-session tiling is Phase 3) ---
+        let (cols, rows) = compute_grid_size(&window);
+        self.cols = cols;
+        self.rows = rows;
         let cwd = session::default_cwd();
         self.term = Some(
-            TerminalSession::spawn(&cwd, COLS, ROWS, self.proxy.clone())
+            TerminalSession::spawn(&cwd, cols, rows, self.proxy.clone())
                 .expect("failed to spawn terminal"),
         );
 
@@ -187,12 +270,14 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::ImePreedit(text) => {
+                self.reset_blink();
                 self.preedit = text;
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
             AppEvent::ImeCommit(text) => {
+                self.reset_blink();
                 self.preedit.clear();
                 if let Some(term) = self.term.as_mut() {
                     term.write(&text);
@@ -202,8 +287,39 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::KeyControl(seq) => {
+                self.reset_blink();
                 if let Some(term) = self.term.as_mut() {
                     term.write(seq);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            AppEvent::Copy => {
+                let Some(term) = self.term.as_ref() else { return };
+                if let Some(text) = term.selection_to_string() {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(text);
+                    }
+                }
+            }
+            AppEvent::Paste => {
+                self.reset_blink();
+                let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+                // A screenshot/copied image has no meaningful text representation to paste
+                // into a pty — matching iTerm2/Warp/VS Code's terminal, write it to a temp
+                // file and paste the path instead, so it can be handed to a CLI tool that
+                // takes a file argument. `get_image` is tried first since a lot of image
+                // sources (e.g. macOS screenshot-to-clipboard) don't also populate a text
+                // representation for `get_text` to fall back on.
+                let pasted = match clipboard.get_image() {
+                    Ok(img) => save_clipboard_image(&img),
+                    Err(_) => clipboard.get_text().ok(),
+                };
+                if let Some(text) = pasted {
+                    if let Some(term) = self.term.as_mut() {
+                        term.write(&text);
+                    }
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -217,8 +333,17 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                if self.mouse_selecting {
+                    if let Some(window) = &self.window {
+                        let (col, row) = point_to_cell(window, position.x, position.y);
+                        if let Some(term) = self.term.as_mut() {
+                            term.update_selection(col.min(self.cols.saturating_sub(1)), row);
+                        }
+                        window.request_redraw();
+                    }
+                }
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, .. } => {
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 // The webview child view keeps AppKit "first responder" status even once
                 // the window regains key-window focus — those are separate concepts, and
                 // `Window::focus_window()` only affects the latter. Explicitly hand first
@@ -230,6 +355,37 @@ impl ApplicationHandler<AppEvent> for App {
                     #[cfg(target_os = "macos")]
                     if let Some(view) = &self.input_view {
                         macos::focus_input_view(view);
+                    }
+                    if let Some(window) = &self.window {
+                        let (col, row) = point_to_cell(window, self.cursor_pos.0, self.cursor_pos.1);
+                        if let Some(term) = self.term.as_mut() {
+                            term.clear_selection();
+                            term.start_selection(col.min(self.cols.saturating_sub(1)), row);
+                        }
+                        self.mouse_selecting = true;
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                self.mouse_selecting = false;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Positive `lines` scrolls further back into scrollback history (matches
+                // `alacritty_terminal::grid::Scroll::Delta`'s convention — see
+                // `TerminalSession::scroll`'s doc comment).
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        (pos.y / terminal::CELL_H as f64).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    if let Some(term) = self.term.as_mut() {
+                        term.scroll(lines);
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
                     }
                 }
             }
@@ -249,6 +405,17 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(wv) = self.webview.borrow().as_ref() {
                         let _ = wv.set_bounds(rect);
                     }
+                    // Keep the grid (and the pty's own `winsize`, so `SIGWINCH`-aware
+                    // programs like `vim`/`htop` redraw correctly) in sync with the window —
+                    // previously hardcoded to 120x40 regardless of actual window size.
+                    let (cols, rows) = compute_grid_size(window);
+                    if (cols, rows) != (self.cols, self.rows) {
+                        self.cols = cols;
+                        self.rows = rows;
+                        if let Some(term) = self.term.as_mut() {
+                            term.resize(cols, rows);
+                        }
+                    }
                 }
             }
             // On macOS, terminal keyboard/IME input no longer flows through winit's own
@@ -261,17 +428,20 @@ impl ApplicationHandler<AppEvent> for App {
                 let (Some(gpu), Some(term)) = (self.gpu.as_mut(), self.term.as_ref()) else {
                     return;
                 };
-                let content = term.snapshot_text_with_preedit(&self.preedit);
+                let tframe = term.snapshot(&self.preedit, self.cursor_visible);
                 // Re-shaping ~4800 cells' worth of text on every redraw — even when nothing
                 // on screen changed — was pegging the CPU and starving the webview's own
-                // rendering on the same OS run loop. Skip the whole frame when idle.
-                if content == self.last_logged {
+                // rendering on the same OS run loop. Skip the whole frame when idle. Selection
+                // is checked separately from content — see `last_selection`'s doc comment.
+                if tframe.content == self.last_content && tframe.selection_cells == self.last_selection {
                     return;
                 }
-                self.last_logged = content.clone();
+                self.last_content = tframe.content.clone();
+                self.last_selection = tframe.selection_cells.clone();
 
-                let frame = gpu.surface.get_current_texture().unwrap();
-                let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let surface_frame = gpu.surface.get_current_texture().unwrap();
+                let view =
+                    surface_frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
                 let mut encoder =
                     gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 {
@@ -300,26 +470,54 @@ impl ApplicationHandler<AppEvent> for App {
                     // width) — scale it or the sidebar's true physical width (e.g. 440px on
                     // a 2x display) leaves text rendered underneath the webview, hidden.
                     let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0) as f32;
-                    let left = SIDEBAR_WIDTH as f32 * scale + 8.0 * scale;
+                    let left = SIDEBAR_WIDTH as f32 * scale + TEXT_LEFT_MARGIN as f32 * scale;
                     gpu.text.render(
                         &gpu.device,
                         &gpu.queue,
                         &mut pass,
-                        &content,
+                        &tframe,
                         left,
-                        4.0 * scale,
+                        TEXT_TOP_MARGIN as f32 * scale,
                         gpu.config.width,
                         gpu.config.height,
                         scale,
+                        terminal::CELL_W * scale,
+                        terminal::CELL_H * scale,
                     );
                 }
                 gpu.queue.submit(Some(encoder.finish()));
-                frame.present();
+                surface_frame.present();
             }
             _ => {}
         }
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_blink {
+            self.cursor_visible = !self.cursor_visible;
+            self.next_blink = now + BLINK_INTERVAL;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        // A small periodic wakeup (twice a second) to drive cursor blinking — negligible next
+        // to the blind per-frame redraw timer this app deliberately moved away from (see the
+        // plan doc's Phase 1b findings); everything else stays purely event-driven.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_blink));
+    }
+}
+
+/// Writes a clipboard image (raw RGBA8, as `arboard` reads it off the system pasteboard) to a
+/// temp PNG file and returns a shell-quoted path to paste into the terminal. Single-quoted
+/// (not escaped) since `std::env::temp_dir()` paths on macOS/Linux don't contain single
+/// quotes in practice — good enough for this app's scope, not a general shell-quoting utility.
+fn save_clipboard_image(img: &arboard::ImageData) -> Option<String> {
+    let buffer =
+        image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.to_vec())?;
+    let path = std::env::temp_dir().join(format!("termhub-paste-{}.png", uuid::Uuid::new_v4()));
+    buffer.save(&path).ok()?;
+    Some(format!("'{}'", path.display()))
 }
 
 fn dev_server_url() -> &'static str {

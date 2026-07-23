@@ -33,6 +33,9 @@ alacritty_terminal = "0.26"
 glyphon = "0.9"
 dirs = "6"
 raw-window-handle = "0.6"
+arboard = "3"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
