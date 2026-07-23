@@ -2,7 +2,7 @@
   "name": "termhub",
   "private": true,
   "version": "0.1.0",
-  "description": "TermHub tiles all your terminal sessions into one window as real shells (portable-pty + xterm.js), built for running multiple AI coding agents (Claude Code, Codex, etc.) in parallel. Rename, persist, and reopen sessions, or pop any one open in iTerm/Warp/Windows Terminal. Tauri + React, MIT licensed.",
+  "description": "TermHub keeps a persistent list of terminal sessions and opens each one in a real external terminal app (iTerm, Warp, Windows Terminal, etc.), built for running multiple AI coding agents (Claude Code, Codex, etc.) in parallel. Rename, persist, and reopen sessions, and track their token usage. Tauri + React, MIT licensed.",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,8 +13,6 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.25.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
