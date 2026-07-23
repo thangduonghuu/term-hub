@@ -4,14 +4,37 @@ import { Sidebar } from "./components/Sidebar";
 import { UsageDashboard } from "./components/UsageDashboard";
 import "./App.css";
 
+// A session counts as "recently active" (shows the sidebar's activity dot) if it produced
+// pty output within this many ms — long enough to stay lit through a burst of fast output,
+// short enough to turn off soon after a command actually finishes.
+const ACTIVITY_WINDOW_MS = 3000;
+const ACTIVITY_POLL_MS = 1000;
+
 function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pendingRenameId, setPendingRenameId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
+  const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     api.listSessions().then(setSessions);
+  }, []);
+
+  useEffect(() => {
+    const poll = () => {
+      api.getActivity().then((activity) => {
+        const now = Date.now();
+        const next = new Set<string>();
+        for (const [id, lastMs] of Object.entries(activity)) {
+          if (now - lastMs < ACTIVITY_WINDOW_MS) next.add(id);
+        }
+        setRecentlyActive(next);
+      });
+    };
+    poll();
+    const interval = setInterval(poll, ACTIVITY_POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   async function handleNew() {
@@ -58,6 +81,7 @@ function App() {
       <Sidebar
         sessions={sessions}
         activeId={activeId}
+        recentlyActive={recentlyActive}
         onNew={handleNew}
         onClose={handleClose}
         onRename={handleRename}

@@ -10,8 +10,9 @@ mod terminal;
 mod usage;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use db::Db;
@@ -24,6 +25,22 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
+
+/// Session id -> unix-epoch milliseconds of its last pty output — shared (not just an `App`
+/// field) because the sidebar's `get_activity` IPC command (Phase 4's activity dot) reads it
+/// from a background dispatch thread (`ipc.rs`), while `App::user_event` writes it on the main
+/// thread whenever `AppEvent::PtyOutput` arrives.
+type Activity = Arc<Mutex<HashMap<String, u64>>>;
+
+/// One tile's change-detection key for `App.last_frames` — id, text spans (with color),
+/// selected cells, and background-colored cells. `RedrawRequested` skips a tile entirely when
+/// none of these changed since the last frame.
+type FrameKey = (
+    String,
+    Vec<(String, Option<(u8, u8, u8)>)>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize, (u8, u8, u8))>,
+);
 // Standard-ish terminal cursor blink rate (iTerm2/Terminal.app are both in this ballpark).
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 // Gap between reconnecting saved sessions on startup (see `pending_reconnects`'s doc comment)
@@ -117,7 +134,9 @@ fn point_to_cell_in_tile(
 /// had changed, pegging the CPU and starving the sidebar webview's own rendering).
 pub enum AppEvent {
     IpcResponse(String),
-    PtyOutput,
+    // Carries which session produced output, so `user_event` can record it in `App.activity`
+    // (Phase 4's sidebar activity dot) as well as trigger a redraw.
+    PtyOutput(String),
     // Sent by `macos_input_view::TerminalInputView` (Phase 1d — see the plan doc) instead of
     // winit's own `WindowEvent::Ime`/`KeyboardInput`, which had a confirmed macOS-only bug:
     // its internal IME state machine could silently drop the keystroke immediately following
@@ -174,7 +193,7 @@ struct App {
     // `RedrawRequested` skips re-shaping/re-rendering a tile whose content and selection
     // haven't changed, since redrawing unconditionally was pegging the CPU (see the plan
     // doc's Phase 1b findings).
-    last_frames: Vec<(String, String, Vec<(usize, usize)>)>,
+    last_frames: Vec<FrameKey>,
     cursor_pos: (f64, f64),
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
     // it's committed) for `active_id`'s session — not sent to the pty, just overlaid at the
@@ -213,10 +232,13 @@ struct App {
     // same nanosecond" trigger for that race entirely.
     pending_reconnects: std::collections::VecDeque<session::SessionMeta>,
     next_reconnect: Instant,
+    // Session id -> last pty-output timestamp, shared with `ipc.rs`'s `get_activity` command
+    // (Phase 4's sidebar activity dot) — see `Activity`'s doc comment.
+    activity: Activity,
 }
 
 impl App {
-    fn new(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>) -> Self {
+    fn new(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, activity: Activity) -> Self {
         Self {
             db,
             proxy,
@@ -236,6 +258,7 @@ impl App {
             cell_w: terminal::CELL_W as f64,
             pending_reconnects: std::collections::VecDeque::new(),
             next_reconnect: Instant::now(),
+            activity,
         }
     }
 
@@ -273,7 +296,7 @@ impl App {
         let rects = tile_rects(window, self.terms.len() + 1);
         let &(_, _, w, h) = rects.last().unwrap_or(&(0.0, 0.0, 0.0, 0.0));
         let (cols, rows) = grid_size_for_area(scale, w * scale, h * scale, self.cell_w);
-        match TerminalSession::spawn(cwd, cols, rows, self.proxy.clone()) {
+        match TerminalSession::spawn(id.clone(), cwd, cols, rows, self.proxy.clone()) {
             Ok(term) => {
                 self.terms.push((id, term));
                 self.refit_all_tiles(window);
@@ -335,11 +358,17 @@ impl ApplicationHandler<AppEvent> for App {
         };
         let db_for_ipc = self.db.clone();
         let proxy_for_ipc = self.proxy.clone();
+        let activity_for_ipc = self.activity.clone();
         let webview = WebViewBuilder::new()
             .with_bounds(rect)
             .with_url(dev_server_url())
             .with_ipc_handler(move |msg| {
-                ipc::spawn_dispatch(db_for_ipc.clone(), proxy_for_ipc.clone(), msg.body());
+                ipc::spawn_dispatch(
+                    db_for_ipc.clone(),
+                    activity_for_ipc.clone(),
+                    proxy_for_ipc.clone(),
+                    msg.body(),
+                );
             })
             .build_as_child(&*window)
             .expect("failed to build sidebar webview");
@@ -388,7 +417,14 @@ impl ApplicationHandler<AppEvent> for App {
                     let _ = wv.evaluate_script(&script);
                 }
             }
-            AppEvent::PtyOutput => {
+            AppEvent::PtyOutput(id) => {
+                if let Ok(mut activity) = self.activity.lock() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    activity.insert(id, now_ms);
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -621,13 +657,50 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 };
                 if self.terms.is_empty() {
+                    // Closing the last tile must still present a frame — returning here left
+                    // whatever was last drawn (the just-closed terminal's content, cursor, and
+                    // border) frozen on screen forever, since nothing else ever calls
+                    // `surface.present()` again once there are zero tiles to redraw.
+                    if !self.last_frames.is_empty() {
+                        self.last_frames.clear();
+                        let surface_frame = gpu.surface.get_current_texture().unwrap();
+                        let view = surface_frame
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut encoder = gpu
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                        {
+                            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: None,
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                                            r: 0.0,
+                                            g: 0.0,
+                                            b: 0.0,
+                                            a: 1.0,
+                                        }),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                        }
+                        gpu.queue.submit(Some(encoder.finish()));
+                        surface_frame.present();
+                    }
                     return;
                 }
                 let scale = window.scale_factor();
                 let rects = tile_rects(window, self.terms.len());
 
                 let mut frames = Vec::with_capacity(self.terms.len());
-                for ((id, term), &(_, _, tw, th)) in self.terms.iter().zip(rects.iter()) {
+                for ((id, term), &(tx, ty, tw, th)) in self.terms.iter().zip(rects.iter()) {
                     let is_active = self.active_id.as_deref() == Some(id.as_str());
                     // Only the focused tile (the one that has keyboard input right now) shows
                     // a cursor and IME preedit — matches the user's own confirmed preference:
@@ -637,15 +710,44 @@ impl ApplicationHandler<AppEvent> for App {
                     let cursor_visible = is_active && self.cursor_visible;
                     let tframe = term.snapshot(preedit, cursor_visible);
                     frames.push((id.clone(), tframe, (tw, th)));
+
+                    // Tell the OS where the active tile's text caret actually is on screen —
+                    // purely for `NSAccessibility` queries (see `macos_input_view`'s doc
+                    // comment on why: a real CLI tool's inline-suggestion popup positions
+                    // itself by querying exactly this, and without it there's nothing for
+                    // that query to find).
+                    #[cfg(target_os = "macos")]
+                    if is_active {
+                        if let (Some(view), Some((col, row))) =
+                            (&self.input_view, term.cursor_position())
+                        {
+                            let cell_w_px = self.cell_w * scale;
+                            let cell_h_px = terminal::CELL_H as f64 * scale;
+                            let x = tx * scale + TEXT_LEFT_MARGIN * scale + col as f64 * cell_w_px;
+                            let y = ty * scale + TEXT_TOP_MARGIN * scale + row as f64 * cell_h_px;
+                            if let Some(rect) =
+                                macos::to_screen_rect(window, x, y, cell_w_px, cell_h_px)
+                            {
+                                view.set_caret_rect(rect);
+                            }
+                        }
+                    }
                 }
 
                 // Re-shaping every tile's text on every redraw — even when nothing on screen
                 // changed anywhere — was pegging the CPU (see the plan doc's Phase 1b
                 // findings). Skip the whole frame only when *no* tile's content or selection
                 // changed since last time.
-                let new_last: Vec<(String, String, Vec<(usize, usize)>)> = frames
+                let new_last: Vec<FrameKey> = frames
                     .iter()
-                    .map(|(id, f, _)| (id.clone(), f.content.clone(), f.selection_cells.clone()))
+                    .map(|(id, f, _)| {
+                        (
+                            id.clone(),
+                            f.spans.clone(),
+                            f.selection_cells.clone(),
+                            f.background_cells.clone(),
+                        )
+                    })
                     .collect();
                 if new_last == self.last_frames {
                     return;
@@ -819,6 +921,7 @@ pub fn run() {
     let proxy = event_loop.create_proxy();
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::new(db, proxy);
+    let activity: Activity = Arc::new(Mutex::new(HashMap::new()));
+    let mut app = App::new(db, proxy, activity);
     event_loop.run_app(&mut app).expect("event loop error");
 }

@@ -6,6 +6,7 @@ import { folderName } from "../lib/path";
 interface Props {
   sessions: SessionInfo[];
   activeId: string | null;
+  recentlyActive: Set<string>;
   onNew: () => void;
   onClose: (id: string) => void;
   onRename: (id: string, name: string) => void;
@@ -20,6 +21,7 @@ interface Props {
 export function Sidebar({
   sessions,
   activeId,
+  recentlyActive,
   onNew,
   onClose,
   onRename,
@@ -140,6 +142,9 @@ export function Sidebar({
                         }}
                         title={session.cwd}
                       >
+                        {recentlyActive.has(session.id) && (
+                          <span className="activity-dot" title="Recent output" />
+                        )}
                         {session.name}
                       </span>
                     )}

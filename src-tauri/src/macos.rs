@@ -2,7 +2,7 @@
 
 use objc2::rc::Retained;
 use objc2_app_kit::{NSResponder, NSTextInputContext};
-use objc2_foundation::MainThreadMarker;
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::event_loop::EventLoopProxy;
 
@@ -54,5 +54,40 @@ pub fn focus_input_view(view: &TerminalInputView) {
                 ctx.activate();
             }
         }
+    }
+}
+
+/// Converts a rectangle in this app's own rendering coordinate space (`x`/`y_from_top`/`w`/`h`,
+/// physical pixels, origin top-left of the window's content area, y increasing *downward* —
+/// matching wgpu/winit convention) into AppKit screen coordinates (origin bottom-left of the
+/// primary display, y increasing *upward*, logical points) — what `NSAccessibility` bounds
+/// queries expect. Used to tell `TerminalInputView` where the terminal's cursor actually is on
+/// screen, purely for `AXBoundsForRangeParameterizedAttribute` (see that view's doc comment).
+pub fn to_screen_rect(
+    window: &winit::window::Window,
+    x: f64,
+    y_from_top: f64,
+    w: f64,
+    h: f64,
+) -> Option<NSRect> {
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return None };
+    let scale = window.scale_factor();
+    unsafe {
+        let ns_view = handle.ns_view.as_ptr().cast::<objc2_app_kit::NSView>();
+        let ns_view: &objc2_app_kit::NSView = &*ns_view;
+        let ns_window = ns_view.window()?;
+        let bounds = ns_view.bounds();
+        let (lx, ly, lw, lh) = (x / scale, y_from_top / scale, w / scale, h / scale);
+        // Flip from this app's top-left/y-down convention to AppKit's own view-local
+        // bottom-left/y-up convention before handing it to `convertRect:toView:`/
+        // `convertRectToScreen:`, which both expect (and preserve) that convention.
+        let flipped_y = bounds.size.height - ly - lh;
+        let local_rect = NSRect {
+            origin: NSPoint { x: lx, y: flipped_y },
+            size: NSSize { width: lw, height: lh },
+        };
+        let window_rect = ns_view.convertRect_toView(local_rect, None);
+        Some(ns_window.convertRectToScreen(window_rect))
     }
 }

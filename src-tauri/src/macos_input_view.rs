@@ -10,15 +10,22 @@
 //! `replacementRange` — which every winit/WezTerm implementation surveyed either mishandles
 //! or explicitly ignores — genuinely doesn't need to be implemented at all here.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSTextInputClient, NSView};
+use objc2_app_kit::{
+    NSAccessibilityBoundsForRangeParameterizedAttribute, NSAccessibilityFocusedAttribute,
+    NSAccessibilityNumberOfCharactersAttribute, NSAccessibilityParentAttribute,
+    NSAccessibilityPositionAttribute, NSAccessibilityRoleAttribute, NSAccessibilitySizeAttribute,
+    NSAccessibilitySelectedTextRangeAttribute, NSAccessibilityTextAreaRole,
+    NSAccessibilityValueAttribute, NSAccessibilityWindowAttribute, NSEvent,
+    NSEventModifierFlags, NSTextInputClient, NSView,
+};
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSPoint,
-    NSRange, NSRangePointer, NSRect, NSString,
+    MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying, NSNotFound,
+    NSNumber, NSPoint, NSRange, NSRangePointer, NSRect, NSString, NSValue,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -27,6 +34,12 @@ use crate::AppEvent;
 pub struct TerminalInputViewIvars {
     proxy: EventLoopProxy<AppEvent>,
     marked_text: RefCell<String>,
+    // Screen-coordinate (AppKit convention: origin bottom-left of the primary display, y
+    // increasing upward) rectangle of the terminal's cursor cell for whichever tile currently
+    // has keyboard focus — updated by `lib.rs` on every redraw via `set_caret_rect`. Exists
+    // purely to answer `AXBoundsForRangeParameterizedAttribute` queries — see the doc comment
+    // on the accessibility methods below for why those matter at all.
+    caret_rect: Cell<NSRect>,
 }
 
 declare_class!(
@@ -94,6 +107,31 @@ declare_class!(
                         }
                     }
                 }
+
+                // Escape, Delete-forward, Home/End, Page Up/Down: AppKit's default key-
+                // binding table maps these to text-editing selectors too (`cancelOperation:`,
+                // `deleteForward:`, `moveToBeginningOfLine:`, `scrollPageUp:`, etc.), none of
+                // which `doCommandBySelector:` below recognizes — they'd otherwise be silently
+                // swallowed with no `KeyControl` ever sent. Confirmed as a real bug: an
+                // interactive TUI (an AI CLI's chat interface) appeared to "not respond to any
+                // key" because Escape specifically — which that kind of program leans on
+                // constantly for canceling/navigating — never reached the pty at all. Identify
+                // these by raw virtual keycode (stable, documented Mac constants) rather than
+                // guessing selector names, same robustness reasoning as the Ctrl-combo case
+                // above.
+                let seq: Option<&'static str> = match event.keyCode() {
+                    0x35 => Some("\x1b"),     // Escape
+                    0x75 => Some("\x1b[3~"),  // Forward Delete
+                    0x73 => Some("\x1b[H"),   // Home
+                    0x77 => Some("\x1b[F"),   // End
+                    0x74 => Some("\x1b[5~"),  // Page Up
+                    0x79 => Some("\x1b[6~"),  // Page Down
+                    _ => None,
+                };
+                if let Some(seq) = seq {
+                    let _ = self.ivars().proxy.send_event(AppEvent::KeyControl(seq));
+                    return;
+                }
             }
             let array = NSArray::from_slice(&[event]);
             unsafe { self.interpretKeyEvents(&array) };
@@ -101,6 +139,98 @@ declare_class!(
 
         #[method(keyUp:)]
         fn key_up(&self, _event: &NSEvent) {}
+
+        // Just enough of the classic (pre-10.10, string-keyed) NSAccessibility protocol —
+        // still the one custom `NSView`s implement — to answer "where is the text caret on
+        // screen". Confirmed as a real, concrete need, not speculative: a CLI tool's desktop
+        // companion app positions its inline-suggestion popup by querying exactly this via
+        // the Accessibility API, and without any conformance here there's nothing for macOS
+        // to query at all — every attempt failed with `accessibility error -25205`
+        // ("can't complete") and the popup silently never appeared. This is deliberately
+        // minimal (real text-editing semantics like actual character offsets aren't
+        // implemented — `caret_rect` is just "wherever the terminal's cursor currently is",
+        // answered for any range/position asked about) rather than a full accessibility
+        // tree; broader screen-reader support would need considerably more than this.
+        #[method(accessibilityIsIgnored)]
+        fn accessibility_is_ignored(&self) -> bool {
+            false
+        }
+
+        #[method_id(accessibilityAttributeNames)]
+        fn accessibility_attribute_names(&self) -> Retained<NSArray<NSString>> {
+            unsafe {
+                NSArray::from_vec(vec![
+                    NSAccessibilityRoleAttribute.copy(),
+                    NSAccessibilityValueAttribute.copy(),
+                    NSAccessibilitySelectedTextRangeAttribute.copy(),
+                    NSAccessibilityNumberOfCharactersAttribute.copy(),
+                    NSAccessibilityFocusedAttribute.copy(),
+                    NSAccessibilityParentAttribute.copy(),
+                    NSAccessibilityWindowAttribute.copy(),
+                    NSAccessibilityPositionAttribute.copy(),
+                    NSAccessibilitySizeAttribute.copy(),
+                ])
+            }
+        }
+
+        #[method_id(accessibilityParameterizedAttributeNames)]
+        fn accessibility_parameterized_attribute_names(&self) -> Retained<NSArray<NSString>> {
+            unsafe {
+                NSArray::from_vec(vec![NSAccessibilityBoundsForRangeParameterizedAttribute.copy()])
+            }
+        }
+
+        #[method_id(accessibilityAttributeValue:)]
+        unsafe fn accessibility_attribute_value(
+            &self,
+            attribute: &NSString,
+        ) -> Option<Retained<AnyObject>> {
+            let result: Option<Retained<AnyObject>> = if attribute
+                .isEqualToString(NSAccessibilityRoleAttribute)
+            {
+                Some(Retained::cast(NSAccessibilityTextAreaRole.copy()))
+            } else if attribute.isEqualToString(NSAccessibilityValueAttribute) {
+                Some(Retained::cast(NSString::from_str("")))
+            } else if attribute.isEqualToString(NSAccessibilitySelectedTextRangeAttribute) {
+                let range = NSRange { location: 0, length: 0 };
+                Some(Retained::cast(NSValue::valueWithRange(range)))
+            } else if attribute.isEqualToString(NSAccessibilityNumberOfCharactersAttribute) {
+                Some(Retained::cast(NSNumber::numberWithInteger(0)))
+            } else if attribute.isEqualToString(NSAccessibilityFocusedAttribute) {
+                Some(Retained::cast(NSNumber::numberWithBool(true)))
+            } else if attribute.isEqualToString(NSAccessibilityParentAttribute)
+                || attribute.isEqualToString(NSAccessibilityWindowAttribute)
+            {
+                let view: &NSView = self.as_ref();
+                view.window().map(|w| Retained::cast(w))
+            } else if attribute.isEqualToString(NSAccessibilityPositionAttribute) {
+                let rect = self.ivars().caret_rect.get();
+                Some(Retained::cast(NSValue::valueWithPoint(rect.origin)))
+            } else if attribute.isEqualToString(NSAccessibilitySizeAttribute) {
+                let rect = self.ivars().caret_rect.get();
+                Some(Retained::cast(NSValue::valueWithSize(rect.size)))
+            } else {
+                None
+            };
+            result
+        }
+
+        #[method_id(accessibilityAttributeValue:forParameter:)]
+        unsafe fn accessibility_attribute_value_for_parameter(
+            &self,
+            attribute: &NSString,
+            _parameter: &AnyObject,
+        ) -> Option<Retained<AnyObject>> {
+            let result: Option<Retained<AnyObject>> = if attribute
+                .isEqualToString(NSAccessibilityBoundsForRangeParameterizedAttribute)
+            {
+                let rect = self.ivars().caret_rect.get();
+                Some(Retained::cast(NSValue::valueWithRect(rect)))
+            } else {
+                None
+            };
+            result
+        }
     }
 
     #[allow(non_snake_case)]
@@ -248,7 +378,16 @@ impl TerminalInputView {
         let this = mtm.alloc::<Self>().set_ivars(TerminalInputViewIvars {
             proxy,
             marked_text: RefCell::new(String::new()),
+            caret_rect: Cell::new(NSRect::ZERO),
         });
         unsafe { msg_send_id![super(this), initWithFrame: NSRect::ZERO] }
+    }
+
+    /// Updates where the terminal's cursor currently is, in AppKit screen coordinates (origin
+    /// bottom-left of the primary display) — called from `lib.rs` on every redraw. Purely for
+    /// `NSAccessibility` queries (see the accessibility methods above); doesn't affect
+    /// anything drawn on screen.
+    pub fn set_caret_rect(&self, rect: NSRect) {
+        self.ivars().caret_rect.set(rect);
     }
 }

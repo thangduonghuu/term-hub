@@ -167,6 +167,17 @@ body {
   white-space: nowrap;
 }
 
+.activity-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: #3fb950;
+  box-shadow: 0 0 4px #3fb950;
+  vertical-align: middle;
+}
+
 .rename-input {
   flex: 1;
   background: #101010;

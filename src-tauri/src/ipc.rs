@@ -19,7 +19,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::commands;
 use crate::db::Db;
-use crate::AppEvent;
+use crate::{Activity, AppEvent};
 
 #[derive(Deserialize)]
 struct IpcRequest {
@@ -30,13 +30,13 @@ struct IpcRequest {
 
 /// Called synchronously from `with_ipc_handler` (main thread). Spawns the actual work on a
 /// background thread and returns immediately.
-pub fn spawn_dispatch(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, raw: &str) {
+pub fn spawn_dispatch(db: Arc<Db>, activity: Activity, proxy: EventLoopProxy<AppEvent>, raw: &str) {
     let Ok(req) = serde_json::from_str::<IpcRequest>(raw) else {
         return;
     };
     let proxy_for_handle = proxy.clone();
     std::thread::spawn(move || {
-        let result = handle(&db, &proxy_for_handle, &req.cmd, req.args);
+        let result = handle(&db, &activity, &proxy_for_handle, &req.cmd, req.args);
         let payload = match result {
             Ok(data) => serde_json::json!({"ok": true, "data": data}),
             Err(error) => serde_json::json!({"ok": false, "error": error}),
@@ -53,8 +53,16 @@ pub fn spawn_dispatch(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, raw: &str) {
 /// `db` mutations here (create/close/focus) also need to spawn/kill/focus the actual live
 /// pty-backed session (Phase 3: multi-session tiling) — that state lives in `App`, on the
 /// main thread, unreachable from this background dispatch thread, so those commands notify
-/// it via `proxy` after the db write succeeds.
-fn handle(db: &Db, proxy: &EventLoopProxy<AppEvent>, cmd: &str, args: Value) -> Result<Value, String> {
+/// it via `proxy` after the db write succeeds. `activity` (Phase 4's sidebar activity dot) is
+/// simpler — just a shared map `App` also writes to, no round-trip through the event loop
+/// needed to read it.
+fn handle(
+    db: &Db,
+    activity: &Activity,
+    proxy: &EventLoopProxy<AppEvent>,
+    cmd: &str,
+    args: Value,
+) -> Result<Value, String> {
     fn to_value<T: serde::Serialize>(v: T) -> Result<Value, String> {
         serde_json::to_value(v).map_err(|e| e.to_string())
     }
@@ -90,6 +98,10 @@ fn handle(db: &Db, proxy: &EventLoopProxy<AppEvent>, cmd: &str, args: Value) -> 
             let id: String = arg(&args, "id").ok_or("missing id")?;
             let _ = proxy.send_event(AppEvent::FocusSession(id));
             to_value(())
+        }
+        "get_activity" => {
+            let map = activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
+            to_value(map.clone())
         }
         "get_usage_summary" => commands::get_usage_summary(db).and_then(to_value),
         "has_anthropic_api_key" => commands::has_anthropic_api_key(db).and_then(to_value),
