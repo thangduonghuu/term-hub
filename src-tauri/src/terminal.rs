@@ -326,6 +326,11 @@ impl TerminalSession {
                     Err(_) => break,
                 }
             }
+            // The shell process is gone (clean exit read as `Ok(0)`, or the pty fd errored
+            // out from under us) — tell `App` so it can mark this tile dead instead of just
+            // leaving its last frame frozen on screen forever with no indication anything
+            // happened (Phase 5's exited-session handling).
+            let _ = proxy.send_event(AppEvent::SessionExited(id));
         });
 
         Ok(Self { term, pty_writer, _pty: pty })
@@ -579,8 +584,10 @@ impl TextPipeline {
     /// Draws a border around one tile in the multi-session grid (Phase 3) — otherwise every
     /// session's pane is just an unbroken black rectangle with no visual separation from its
     /// neighbors. `active` picks a brighter accent color for whichever tile currently has
-    /// keyboard focus. `x`/`y`/`w`/`h`/`thickness` are physical pixels, matching the tile's
-    /// own scissor rect (the caller is expected to have already set that via
+    /// keyboard focus; `exited` (Phase 5) overrides that with a dim red to flag a dead shell
+    /// process, since otherwise a tile whose pty died just freezes with no visual difference
+    /// from a live idle one. `x`/`y`/`w`/`h`/`thickness` are physical pixels, matching the
+    /// tile's own scissor rect (the caller is expected to have already set that via
     /// `RenderPass::set_scissor_rect`, so this never draws outside the tile).
     #[allow(clippy::too_many_arguments)]
     pub fn render_tile_border(
@@ -593,10 +600,13 @@ impl TextPipeline {
         h: f32,
         thickness: f32,
         active: bool,
+        exited: bool,
         viewport_w: u32,
         viewport_h: u32,
     ) {
-        self.selection.render_border(device, pass, x, y, w, h, thickness, active, viewport_w, viewport_h);
+        self.selection.render_border(
+            device, pass, x, y, w, h, thickness, active, exited, viewport_w, viewport_h,
+        );
     }
 
     /// Renders every currently-visible tile's text (left-aligned within its own origin) in one
@@ -897,11 +907,17 @@ impl SelectionPipeline {
         h: f32,
         thickness: f32,
         active: bool,
+        exited: bool,
         viewport_w: u32,
         viewport_h: u32,
     ) {
-        let color =
-            if active { [0.35, 0.55, 1.0, 1.0] } else { [1.0, 1.0, 1.0, 0.3] };
+        let color = if exited {
+            [0.85, 0.3, 0.25, 0.8]
+        } else if active {
+            [0.35, 0.55, 1.0, 1.0]
+        } else {
+            [1.0, 1.0, 1.0, 0.3]
+        };
         let rects = [
             // top
             (x, y, w, thickness, color),

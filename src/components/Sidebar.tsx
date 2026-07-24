@@ -7,6 +7,7 @@ interface Props {
   sessions: SessionInfo[];
   activeId: string | null;
   recentlyActive: Set<string>;
+  exitedIds: Set<string>;
   onNew: () => void;
   onClose: (id: string) => void;
   onRename: (id: string, name: string) => void;
@@ -22,6 +23,7 @@ export function Sidebar({
   sessions,
   activeId,
   recentlyActive,
+  exitedIds,
   onNew,
   onClose,
   onRename,
@@ -142,8 +144,15 @@ export function Sidebar({
                         }}
                         title={session.cwd}
                       >
-                        {recentlyActive.has(session.id) && (
-                          <span className="activity-dot" title="Recent output" />
+                        {exitedIds.has(session.id) ? (
+                          <span
+                            className="exited-dot"
+                            title="Process exited — click the session to restart it"
+                          />
+                        ) : (
+                          recentlyActive.has(session.id) && (
+                            <span className="activity-dot" title="Recent output" />
+                          )
                         )}
                         {session.name}
                       </span>

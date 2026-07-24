@@ -51,6 +51,8 @@ export const api = {
   focusSession: (id: string) => invoke<void>("focus_session", { id }),
   // Session id -> unix-epoch ms of its last pty output, for the sidebar's activity dot.
   getActivity: () => invoke<Record<string, number>>("get_activity"),
+  // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
+  getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
   hasAnthropicApiKey: () => invoke<boolean>("has_anthropic_api_key"),

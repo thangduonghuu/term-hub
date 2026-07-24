@@ -9,6 +9,9 @@ import "./App.css";
 // short enough to turn off soon after a command actually finishes.
 const ACTIVITY_WINDOW_MS = 3000;
 const ACTIVITY_POLL_MS = 1000;
+// Same cadence as activity — exited status changes about as rarely as a shell process dies,
+// but there's no push channel for it (see `get_exited_sessions`'s doc comment), so poll it.
+const EXITED_POLL_MS = 1000;
 
 function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -16,6 +19,7 @@ function App() {
   const [pendingRenameId, setPendingRenameId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
   const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
+  const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     api.listSessions().then(setSessions);
@@ -34,6 +38,15 @@ function App() {
     };
     poll();
     const interval = setInterval(poll, ACTIVITY_POLL_MS);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const poll = () => {
+      api.getExitedSessions().then((ids) => setExitedIds(new Set(ids)));
+    };
+    poll();
+    const interval = setInterval(poll, EXITED_POLL_MS);
     return () => clearInterval(interval);
   }, []);
 
@@ -82,6 +95,7 @@ function App() {
         sessions={sessions}
         activeId={activeId}
         recentlyActive={recentlyActive}
+        exitedIds={exitedIds}
         onNew={handleNew}
         onClose={handleClose}
         onRename={handleRename}

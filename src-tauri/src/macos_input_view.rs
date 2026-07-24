@@ -287,13 +287,23 @@ declare_class!(
             NSArray::new()
         }
 
+        // Where the IME's candidate/conversion window should anchor itself. Vietnamese Telex
+        // (the case this was originally built and tested against) never calls this — it has no
+        // popup, just inline diacritic composition — so returning `NSRect::ZERO` went
+        // unnoticed. CJK input methods (Japanese, Chinese, Korean) rely on exactly this call to
+        // position their candidate window at the actual text caret; with it zeroed, the popup
+        // renders in the wrong place (typically the screen corner) instead of next to the
+        // cursor. `caret_rect` already tracks the real on-screen caret position (kept current
+        // by `lib.rs` on every redraw, originally wired up only for `NSAccessibility` queries —
+        // see `set_caret_rect`'s doc comment) — reuse it here instead of a real per-character
+        // lookup, which a terminal has no document model to support anyway.
         #[method(firstRectForCharacterRange:actualRange:)]
         unsafe fn firstRectForCharacterRange_actualRange(
             &self,
             _range: NSRange,
             _actual_range: NSRangePointer,
         ) -> NSRect {
-            NSRect::ZERO
+            self.ivars().caret_rect.get()
         }
 
         #[method(characterIndexForPoint:)]

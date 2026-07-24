@@ -10,7 +10,7 @@ mod terminal;
 mod usage;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,14 +32,24 @@ const SIDEBAR_WIDTH: f64 = 220.0;
 /// thread whenever `AppEvent::PtyOutput` arrives.
 type Activity = Arc<Mutex<HashMap<String, u64>>>;
 
+/// Ids of sessions whose pty-backed shell process has exited (Phase 5) — shared with `ipc.rs`'s
+/// `get_exited_sessions` command the same way `Activity` is, so the sidebar can poll it from a
+/// background dispatch thread while `App::user_event` writes to it on the main thread whenever
+/// `AppEvent::SessionExited` arrives.
+type Exited = Arc<Mutex<HashSet<String>>>;
+
 /// One tile's change-detection key for `App.last_frames` — id, text spans (with color),
-/// selected cells, and background-colored cells. `RedrawRequested` skips a tile entirely when
-/// none of these changed since the last frame.
+/// selected cells, background-colored cells, and exited state. `RedrawRequested` skips a tile
+/// entirely when none of these changed since the last frame. Exited state has to be in here
+/// too, not just content: a session that dies while its cursor happens to be in its "blink off"
+/// phase leaves `spans` unchanged (the cursor glyph was already absent), so without this the
+/// dead-tile border color would never actually get drawn until something else forced a redraw.
 type FrameKey = (
     String,
     Vec<(String, Option<(u8, u8, u8)>)>,
     Vec<(usize, usize)>,
     Vec<(usize, usize, (u8, u8, u8))>,
+    bool,
 );
 // Standard-ish terminal cursor blink rate (iTerm2/Terminal.app are both in this ballpark).
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -162,6 +172,10 @@ pub enum AppEvent {
     SpawnSession { id: String, cwd: String },
     CloseSession { id: String },
     FocusSession(String),
+    // Sent by a session's pty reader thread (terminal.rs) once its `read()` loop ends — the
+    // shell process is gone. Phase 5: marks the tile dead in `App.exited` instead of leaving
+    // its last frame frozen on screen with no visual difference from a live idle session.
+    SessionExited(String),
 }
 
 struct GpuState<'a> {
@@ -235,10 +249,14 @@ struct App {
     // Session id -> last pty-output timestamp, shared with `ipc.rs`'s `get_activity` command
     // (Phase 4's sidebar activity dot) — see `Activity`'s doc comment.
     activity: Activity,
+    // Ids of sessions whose shell process has exited, shared with `ipc.rs`'s
+    // `get_exited_sessions` command (Phase 5) — see `Exited`'s doc comment. The tile stays in
+    // `terms` (so its scrollback is still visible) but is rendered dead until respawned.
+    exited: Exited,
 }
 
 impl App {
-    fn new(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, activity: Activity) -> Self {
+    fn new(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, activity: Activity, exited: Exited) -> Self {
         Self {
             db,
             proxy,
@@ -259,6 +277,7 @@ impl App {
             pending_reconnects: std::collections::VecDeque::new(),
             next_reconnect: Instant::now(),
             activity,
+            exited,
         }
     }
 
@@ -268,6 +287,27 @@ impl App {
     fn reset_blink(&mut self) {
         self.cursor_visible = true;
         self.next_blink = Instant::now() + BLINK_INTERVAL;
+    }
+
+    fn is_exited(&self, id: &str) -> bool {
+        self.exited.lock().map(|s| s.contains(id)).unwrap_or(false)
+    }
+
+    /// If the currently-focused tile's session has exited, respawns it in place (same id, same
+    /// cwd) instead of writing to its dead pty — lets a click or keystroke on a dead tile
+    /// revive it without going through the sidebar's close-then-reopen. Returns whether it did,
+    /// so callers know to skip whatever pty write/selection they were about to do; the
+    /// keystroke or click that triggered the revive is swallowed rather than also forwarded to
+    /// the freshly spawned shell.
+    fn respawn_active_if_exited(&mut self) -> bool {
+        let Some(id) = self.active_id.clone() else { return false };
+        if !self.is_exited(&id) {
+            return false;
+        }
+        if let Ok(meta) = self.db.get_session(&id) {
+            let _ = self.proxy.send_event(AppEvent::SpawnSession { id, cwd: meta.cwd });
+        }
+        true
     }
 
     fn active_term(&mut self) -> Option<&mut TerminalSession> {
@@ -359,6 +399,7 @@ impl ApplicationHandler<AppEvent> for App {
         let db_for_ipc = self.db.clone();
         let proxy_for_ipc = self.proxy.clone();
         let activity_for_ipc = self.activity.clone();
+        let exited_for_ipc = self.exited.clone();
         let webview = WebViewBuilder::new()
             .with_bounds(rect)
             .with_url(dev_server_url())
@@ -366,6 +407,7 @@ impl ApplicationHandler<AppEvent> for App {
                 ipc::spawn_dispatch(
                     db_for_ipc.clone(),
                     activity_for_ipc.clone(),
+                    exited_for_ipc.clone(),
                     proxy_for_ipc.clone(),
                     msg.body(),
                 );
@@ -439,8 +481,13 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::ImeCommit(text) => {
                 self.reset_blink();
                 self.preedit.clear();
-                if let Some(term) = self.active_term() {
-                    term.write(&text);
+                // A keystroke landing on a dead tile revives it instead of writing into its
+                // dead pty (Phase 5) — the committed text is swallowed rather than also handed
+                // to the freshly spawned shell.
+                if !self.respawn_active_if_exited() {
+                    if let Some(term) = self.active_term() {
+                        term.write(&text);
+                    }
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -448,8 +495,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::KeyControl(seq) => {
                 self.reset_blink();
-                if let Some(term) = self.active_term() {
-                    term.write(seq);
+                if !self.respawn_active_if_exited() {
+                    if let Some(term) = self.active_term() {
+                        term.write(seq);
+                    }
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -457,10 +506,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::KeyByte(byte) => {
                 self.reset_blink();
-                if let Some(term) = self.active_term() {
-                    // `byte` is always < 0x80 (a C0 control code), so it's trivially valid
-                    // single-byte UTF-8 on its own.
-                    term.write(&(byte as char).to_string());
+                if !self.respawn_active_if_exited() {
+                    if let Some(term) = self.active_term() {
+                        // `byte` is always < 0x80 (a C0 control code), so it's trivially valid
+                        // single-byte UTF-8 on its own.
+                        term.write(&(byte as char).to_string());
+                    }
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -510,6 +561,11 @@ impl ApplicationHandler<AppEvent> for App {
                 if !self.spawn_session(&window, id.clone(), &cwd) {
                     return;
                 }
+                // Respawning (whether from the sidebar's "new"/duplicate or reviving a dead
+                // tile — Phase 5) always means the tile is alive again.
+                if let Ok(mut exited) = self.exited.lock() {
+                    exited.remove(&id);
+                }
                 self.active_id = Some(id);
                 #[cfg(target_os = "macos")]
                 if let Some(view) = &self.input_view {
@@ -519,6 +575,9 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::CloseSession { id } => {
                 self.terms.retain(|(tid, _)| *tid != id);
+                if let Ok(mut exited) = self.exited.lock() {
+                    exited.remove(&id);
+                }
                 if self.active_id.as_deref() == Some(id.as_str()) {
                     self.active_id = self.terms.first().map(|(tid, _)| tid.clone());
                 }
@@ -537,6 +596,14 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
+                }
+            }
+            AppEvent::SessionExited(id) => {
+                if let Ok(mut exited) = self.exited.lock() {
+                    exited.insert(id);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
         }
@@ -580,20 +647,25 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 let rects = tile_rects(&window, self.terms.len());
                 if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
-                    let (tx, ty, _, _) = rects[idx];
-                    let (col, row) = point_to_cell_in_tile(
-                        scale,
-                        tx,
-                        ty,
-                        self.cursor_pos.0,
-                        self.cursor_pos.1,
-                        self.cell_w,
-                    );
-                    let (id, term) = &mut self.terms[idx];
-                    term.clear_selection();
-                    term.start_selection(col, row);
+                    let id = self.terms[idx].0.clone();
                     self.active_id = Some(id.clone());
-                    self.selecting_tile = Some(id.clone());
+                    // Clicking a dead tile (Phase 5) revives it instead of starting a text
+                    // selection on its frozen last frame.
+                    if !self.respawn_active_if_exited() {
+                        let (tx, ty, _, _) = rects[idx];
+                        let (col, row) = point_to_cell_in_tile(
+                            scale,
+                            tx,
+                            ty,
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            self.cell_w,
+                        );
+                        let (_, term) = &mut self.terms[idx];
+                        term.clear_selection();
+                        term.start_selection(col, row);
+                        self.selecting_tile = Some(id);
+                    }
                 }
                 window.request_redraw();
             }
@@ -653,6 +725,11 @@ impl ApplicationHandler<AppEvent> for App {
             // through to the catch-all below, which is currently a no-op (Linux keyboard
             // input for the terminal is still open — see the plan doc).
             WindowEvent::RedrawRequested => {
+                // Snapshotted once per frame (not per tile via `self.is_exited`) — `gpu` below
+                // is a mutable borrow of `self` for the rest of this arm, which a `&self`
+                // method call would conflict with.
+                let exited_snapshot: HashSet<String> =
+                    self.exited.lock().map(|s| s.clone()).unwrap_or_default();
                 let (Some(gpu), Some(window)) = (self.gpu.as_mut(), self.window.as_ref()) else {
                     return;
                 };
@@ -702,14 +779,17 @@ impl ApplicationHandler<AppEvent> for App {
                 let mut frames = Vec::with_capacity(self.terms.len());
                 for ((id, term), &(tx, ty, tw, th)) in self.terms.iter().zip(rects.iter()) {
                     let is_active = self.active_id.as_deref() == Some(id.as_str());
+                    let is_exited = exited_snapshot.contains(id);
                     // Only the focused tile (the one that has keyboard input right now) shows
                     // a cursor and IME preedit — matches the user's own confirmed preference:
                     // each tile is an independent terminal, and the cursor marks which one
-                    // you're actually typing into, same as normal window-focus behavior.
+                    // you're actually typing into, same as normal window-focus behavior. A
+                    // dead tile (Phase 5) never shows a cursor regardless of focus — nothing
+                    // is listening on the other end of it to blink for.
                     let preedit = if is_active { self.preedit.as_str() } else { "" };
-                    let cursor_visible = is_active && self.cursor_visible;
+                    let cursor_visible = is_active && self.cursor_visible && !is_exited;
                     let tframe = term.snapshot(preedit, cursor_visible);
-                    frames.push((id.clone(), tframe, (tw, th)));
+                    frames.push((id.clone(), tframe, (tw, th), is_exited));
 
                     // Tell the OS where the active tile's text caret actually is on screen —
                     // purely for `NSAccessibility` queries (see `macos_input_view`'s doc
@@ -740,12 +820,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // changed since last time.
                 let new_last: Vec<FrameKey> = frames
                     .iter()
-                    .map(|(id, f, _)| {
+                    .map(|(id, f, _, is_exited)| {
                         (
                             id.clone(),
                             f.spans.clone(),
                             f.selection_cells.clone(),
                             f.background_cells.clone(),
+                            *is_exited,
                         )
                     })
                     .collect();
@@ -785,7 +866,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // buffer per call), so drawing them per tile in a loop like this is fine —
                     // unlike the text below, there's nothing here for a later tile's draw call
                     // to invalidate out from under an earlier one.
-                    for ((id, _, (tw, th)), &(tx, ty, _, _)) in frames.iter().zip(rects.iter()) {
+                    for ((id, _, (tw, th), is_exited), &(tx, ty, _, _)) in
+                        frames.iter().zip(rects.iter())
+                    {
                         let sx = (tx * scale).round() as f32;
                         let sy = (ty * scale).round() as f32;
                         let sw = (tw * scale).round() as f32;
@@ -800,6 +883,7 @@ impl ApplicationHandler<AppEvent> for App {
                             sh,
                             (1.5 * scale as f32).max(1.0),
                             is_active,
+                            *is_exited,
                             gpu.config.width,
                             gpu.config.height,
                         );
@@ -816,7 +900,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let tile_renders: Vec<terminal::TileRender> = frames
                         .iter()
                         .zip(rects.iter())
-                        .map(|((_, tframe, _), &(tx, ty, tw, th))| {
+                        .map(|((_, tframe, _, _), &(tx, ty, tw, th))| {
                             let sx = (tx * scale).round() as i32;
                             let sy = (ty * scale).round() as i32;
                             let sw = (tw * scale).round() as i32;
@@ -922,6 +1006,7 @@ pub fn run() {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let activity: Activity = Arc::new(Mutex::new(HashMap::new()));
-    let mut app = App::new(db, proxy, activity);
+    let exited: Exited = Arc::new(Mutex::new(HashSet::new()));
+    let mut app = App::new(db, proxy, activity, exited);
     event_loop.run_app(&mut app).expect("event loop error");
 }

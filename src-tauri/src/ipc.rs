@@ -19,7 +19,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::commands;
 use crate::db::Db;
-use crate::{Activity, AppEvent};
+use crate::{Activity, AppEvent, Exited};
 
 #[derive(Deserialize)]
 struct IpcRequest {
@@ -30,13 +30,19 @@ struct IpcRequest {
 
 /// Called synchronously from `with_ipc_handler` (main thread). Spawns the actual work on a
 /// background thread and returns immediately.
-pub fn spawn_dispatch(db: Arc<Db>, activity: Activity, proxy: EventLoopProxy<AppEvent>, raw: &str) {
+pub fn spawn_dispatch(
+    db: Arc<Db>,
+    activity: Activity,
+    exited: Exited,
+    proxy: EventLoopProxy<AppEvent>,
+    raw: &str,
+) {
     let Ok(req) = serde_json::from_str::<IpcRequest>(raw) else {
         return;
     };
     let proxy_for_handle = proxy.clone();
     std::thread::spawn(move || {
-        let result = handle(&db, &activity, &proxy_for_handle, &req.cmd, req.args);
+        let result = handle(&db, &activity, &exited, &proxy_for_handle, &req.cmd, req.args);
         let payload = match result {
             Ok(data) => serde_json::json!({"ok": true, "data": data}),
             Err(error) => serde_json::json!({"ok": false, "error": error}),
@@ -59,6 +65,7 @@ pub fn spawn_dispatch(db: Arc<Db>, activity: Activity, proxy: EventLoopProxy<App
 fn handle(
     db: &Db,
     activity: &Activity,
+    exited: &Exited,
     proxy: &EventLoopProxy<AppEvent>,
     cmd: &str,
     args: Value,
@@ -102,6 +109,12 @@ fn handle(
         "get_activity" => {
             let map = activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
             to_value(map.clone())
+        }
+        // Phase 5: ids of sessions whose shell process has exited, for the sidebar's dead-tile
+        // indicator — same shared-map-no-event-loop-roundtrip pattern as `get_activity` above.
+        "get_exited_sessions" => {
+            let set = exited.lock().map_err(|_| "exited lock poisoned".to_string())?;
+            to_value(set.iter().cloned().collect::<Vec<String>>())
         }
         "get_usage_summary" => commands::get_usage_summary(db).and_then(to_value),
         "has_anthropic_api_key" => commands::has_anthropic_api_key(db).and_then(to_value),

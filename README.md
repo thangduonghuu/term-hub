@@ -4,130 +4,102 @@
 
 # TermHub
 
-Tile every terminal session in one window — built for running multiple AI coding agents in parallel.
+**Tile every terminal session in one window — built for running multiple AI coding agents in parallel.**
 
-![license](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square) ![node](https://img.shields.io/badge/node-18%2B-lightgrey?style=flat-square) ![rust](https://img.shields.io/badge/rust-stable-lightgrey?style=flat-square)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)](LICENSE) [![Node](https://img.shields.io/badge/node-18%2B-lightgrey?style=flat-square)](https://nodejs.org) [![Rust](https://img.shields.io/badge/rust-stable-lightgrey?style=flat-square)](https://www.rust-lang.org) [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square)](#platform-support)
 
-[See the roadmap →](../terminal-manager-prompt.md)
+[Roadmap](../terminal-manager-prompt.md) · [Features](#features) · [Getting Started](#getting-started)
 
 </div>
 
 ---
 
-If you run more than a couple of terminal windows at once — especially juggling several AI
-coding agents (Claude Code, Codex, etc.) in parallel, one per project — you end up with a mess
-of separate OS windows and no single view of what's running where. TermHub puts all of those
-sessions in one window instead: every open session renders as a real, independent shell tiled
-into an even grid, so you can see and type into several at a glance instead of alt-tabbing
-between windows.
+## Overview
 
-It's a cross-platform desktop app (macOS + Windows) built with [Tauri](https://tauri.app)
-(Rust backend) + React/TypeScript (frontend). Each session is a real shell process
-(zsh/bash/PowerShell/cmd) rendered in-app via [`xterm.js`](https://xtermjs.org), backed by a
-real PTY via [`portable-pty`](https://docs.rs/portable-pty) — not a scripted/embedded copy of
-iTerm2 or Windows Terminal, which can't be embedded.
+<div align="center">
 
-![TermHub showing four sessions tiled in a 2x2 grid, one focused with a green border](docs/screenshot.png)
+Running several AI coding agents in parallel (Claude Code, Codex, etc.) usually means one OS
+terminal window per project, with no single view of what's running where. TermHub replaces that
+with one window: every session is a real, independent shell tiled into an even grid, so you can
+see and type into several sessions at a glance instead of alt-tabbing between windows.
+
+</div>
+
+<img src="docs/screenshot.png" width="100%" alt="TermHub showing four sessions tiled in a 2x2 grid, with the session sidebar on the left" />
 
 ## Features
 
-- **Tiled grid of live terminals** — every running session is shown at once, laid out in an
-  even NxM grid (2 sessions → side-by-side, 3–4 → 2×2, 5–6 → 3×2, …) that reflows automatically
-  as you open or close sessions, like a tiling window manager. Click into any pane to type — it
-  routes to that pane's own shell; the focused pane gets a highlighted border.
-- **Per-pane activity indicator** — a status dot in each pane's header flips between
-  idle/working/done based on PTY input and output, so you can tell which agents are still
-  churning at a glance without switching panes.
-- **New / close / rename / switch** between sessions from the sidebar, with a filter box to
-  search sessions by name or path. New sessions drop straight into an editable name field so
-  you can name them immediately, instead of a generic default label you have to double-click
-  later.
-- **PTY resize kept in sync** with each terminal view as panes resize.
-- **Session persistence & auto-restore** — name, working directory, and shell are stored in
-  SQLite, and on launch TermHub reopens every saved session as its own pane, browser-tabs style
-  (reconnecting the actual process is out of scope for MVP — each reopened session starts a
-  fresh shell in the same working directory).
-- **Open in an external terminal** — pick your preferred app (iTerm2, Apple Terminal, Warp,
-  Alacritty, WezTerm, Hyper, kitty on macOS; Windows Terminal/PowerShell/Command Prompt on
-  Windows — auto-detected from what's actually installed) from the sidebar settings dropdown,
-  then hit the `⤢` button on any pane to pop that session's folder open in it. This runs
-  alongside the built-in terminal, it doesn't replace it.
-- **Token usage dashboard** — a toolbar button opens a per-agent usage view (Claude Code, Codex,
-  Gemini, Aider) with today / last-7-days / all-time token totals, a by-session breakdown, and a
-  14-day by-day chart, refreshed every few seconds. Usage is tallied by tailing each agent's own
-  local logs/transcripts (e.g. Claude Code's `~/.claude/projects/**/*.jsonl`, Codex's
-  `~/.codex/sessions/**/rollout-*.jsonl`, Gemini's `~/.gemini/tmp/**/chats/*.jsonl`, Aider's
-  `.aider.chat.history.md`) — no extra instrumentation needed in the agent itself. The Claude
-  Code tab also has an optional API-key-based check against Anthropic's per-key rate-limit
-  headers (a separate quota from the Claude Pro/Max 5-hour session limit, which isn't exposed
-  by any public API).
+| | |
+|---|---|
+| **Tiled terminal grid** | Every open session renders live, laid out in an even NxM grid that reflows as sessions open/close. Click a pane to focus it — focused panes get a highlighted border and live cursor. Scrollback, mouse selection, and copy/paste (including pasting a clipboard image as a temp-file path) are all native, no browser text layer involved. |
+| **Session management** | New / close / rename / duplicate from the sidebar. Sessions are grouped by working directory with a per-group "new session here" shortcut, plus a filter box to search by name or path. |
+| **Activity indicator** | A dot next to each session lights up while its shell has produced output recently, so you can tell which agents are still working without switching panes. |
+| **Exited-session recovery** | If a shell process dies (`exit`, a crash, `kill`), its pane shows a dim red border instead of freezing silently, and the sidebar dot turns red. Click the pane or just start typing to respawn a fresh shell in the same directory — no need to close and reopen the session. |
+| **Session persistence** | Name, working directory, and shell are stored in SQLite; on launch, TermHub reopens every saved session as its own tile (staggered slightly to avoid startup-shell races). Reconnecting to the original process is out of scope — each reopened session starts a fresh shell in the same directory. |
+| **Token usage dashboard** | Per-agent usage (Claude Code, Codex, Gemini, Aider) with today / last-7-days / all-time totals, a by-session breakdown, and a 14-day chart — tallied by tailing each agent's own local logs/transcripts, no extra instrumentation required. Includes an optional API-key-based check against Anthropic's per-key rate-limit headers. |
 
-## Prerequisites
+## Platform Support
+
+| Capability | macOS | Windows / Linux |
+|---|---|---|
+| Session management, persistence, usage tracking | ✅ | ✅ |
+| Terminal rendering | ✅ | ✅ |
+| Terminal keyboard / IME input | ✅ | ⚠️ not yet implemented |
+
+Typing into a terminal pane currently requires macOS — support for other platforms is on the
+[roadmap](../terminal-manager-prompt.md).
+
+## Getting Started
+
+### Prerequisites
 
 - [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
 - [Node.js](https://nodejs.org/) 18+
-- Tauri platform prerequisites: https://tauri.app/start/prerequisites/
+- [Tauri platform prerequisites](https://tauri.app/start/prerequisites/)
 
-## Development
+### Development
 
 ```sh
 npm install
 npm run tauri dev
 ```
 
-## Building & releasing
+## Building & Releasing
 
 ```sh
 npm run tauri build
 ```
 
-This produces a release build and platform installers under `src-tauri/target/release/bundle/`.
+Produces a release build and platform installers under `src-tauri/target/release/bundle/`.
 
-**macOS**
+<details>
+<summary><strong>macOS</strong></summary>
 
 - The app bundle lands at `src-tauri/target/release/bundle/macos/TermHub.app` — drag it into
   `/Applications` (or `cp -R` it there) to install it like any other Mac app.
-- Tauri also tries to wrap that into a `.dmg` under `bundle/dmg/`. This step shells out to
-  `hdiutil`/Finder scripting and can fail in sandboxed or headless environments (e.g. CI, some
+- Tauri also wraps the bundle into a `.dmg` under `bundle/dmg/`. This step shells out to
+  `hdiutil`/Finder scripting and can fail in sandboxed or headless environments (CI, some
   automation shells) with `error running bundle_dmg.sh` — that's just the installer-image step;
-  `TermHub.app` itself still builds successfully and works fine used directly, no `.dmg` needed
-  for personal use.
-- The app isn't code-signed (no Apple Developer certificate configured), so macOS Gatekeeper will
-  refuse to open it normally on first launch. Right-click the app → **Open** (instead of
-  double-clicking) and confirm, or allow it via **System Settings → Privacy & Security**.
+  `TermHub.app` itself still builds successfully and works fine used directly.
+- The app isn't code-signed, so Gatekeeper will refuse to open it on first launch. Right-click →
+  **Open** (instead of double-clicking) and confirm, or allow it via **System Settings → Privacy
+  & Security**.
 
-**Windows**
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
 
 - Build on a Windows machine (Tauri doesn't cross-compile a Windows installer from macOS/Linux)
   — same `npm run tauri build` command, with an MSVC toolchain and the Tauri Windows
-  prerequisites installed (see the link above).
+  prerequisites installed.
 - Produces an `.msi` and/or `.exe` (NSIS) installer under `bundle/msi/` and `bundle/nsis/`.
-- Unsigned installers will similarly trip Windows SmartScreen on first run ("Windows protected
-  your PC") — click **More info → Run anyway**.
+- Unsigned installers will trip Windows SmartScreen on first run ("Windows protected your PC")
+  — click **More info → Run anyway**.
+- Terminal keyboard input isn't wired up on Windows yet — see [Platform support](#platform-support).
 
-## Project layout
-
-- `src/` — React + TypeScript frontend:
-  - `components/TerminalView.tsx` — xterm.js instance wired to a session's PTY events; tracks
-    per-pane activity state.
-  - `components/TerminalPane.tsx` — pane chrome (title, close, open-externally, activity dot)
-    around a `TerminalView`.
-  - `components/Sidebar.tsx` — session list, filter, rename, new/close/reopen, external-app
-    setting.
-  - `components/UsageDashboard.tsx` — per-agent token usage view (stats, by-session and
-    by-day breakdowns, Claude API rate-limit check).
-  - `lib/api.ts` — typed wrappers around the Tauri commands below.
-- `src-tauri/src/` — Rust backend:
-  - `pty_manager.rs` — spawns/tracks PTY processes, streams output as Tauri events.
-  - `db.rs` — SQLite-backed session registry and usage tables (`rusqlite`).
-  - `external_terminal.rs` — detects installed terminal apps and launches a session's folder
-    in one.
-  - `usage/` — pluggable adapters (`claude_code.rs`, `codex.rs`, `gemini.rs`, `aider.rs`) that
-    tail each agent's local logs/transcripts and a background `tracker.rs` poller that persists
-    parsed token counts to SQLite.
-  - `commands.rs` — Tauri commands invoked from the frontend.
+</details>
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-# term-hub
