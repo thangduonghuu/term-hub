@@ -176,6 +176,10 @@ pub enum AppEvent {
     // shell process is gone. Phase 5: marks the tile dead in `App.exited` instead of leaving
     // its last frame frozen on screen with no visual difference from a live idle session.
     SessionExited(String),
+    // Sent by `ipc.rs`'s `set_usage_overlay` command when the usage dashboard modal opens or
+    // closes — widens/narrows the sidebar webview to match (see `App.webview_full`'s doc
+    // comment for why the modal needs this instead of just being full-window-sized always).
+    SetUsageOverlay(bool),
 }
 
 struct GpuState<'a> {
@@ -253,6 +257,17 @@ struct App {
     // `get_exited_sessions` command (Phase 5) — see `Exited`'s doc comment. The tile stays in
     // `terms` (so its scrollback is still visible) but is rendered dead until respawned.
     exited: Exited,
+    // Whether the sidebar webview should currently cover the *whole* window instead of just
+    // the `SIDEBAR_WIDTH` strip — true while the usage dashboard modal is open. The modal is
+    // React content rendered inside that same webview with CSS expecting to center itself over
+    // a full-window viewport (`position: fixed; inset: 0`), but the webview is normally kept
+    // narrow on purpose (see the mouse-click guard in `window_event`'s `MouseInput` handler)
+    // so clicks past the sidebar fall through to the native terminal tiles instead of being
+    // captured by the child webview. Left narrow, the modal only had a 220px-wide viewport to
+    // center itself in and rendered clipped against that edge instead of over the app.
+    // Widening the webview only while the modal is actually open keeps the click-passthrough
+    // behavior intact the rest of the time.
+    webview_full: bool,
 }
 
 impl App {
@@ -278,6 +293,7 @@ impl App {
             next_reconnect: Instant::now(),
             activity,
             exited,
+            webview_full: false,
         }
     }
 
@@ -313,6 +329,20 @@ impl App {
     fn active_term(&mut self) -> Option<&mut TerminalSession> {
         let id = self.active_id.clone()?;
         self.terms.iter_mut().find(|(tid, _)| *tid == id).map(|(_, t)| t)
+    }
+
+    /// The sidebar webview's bounds for the current window size — the narrow `SIDEBAR_WIDTH`
+    /// strip normally, or the full window while `webview_full` is set (see its doc comment).
+    /// Shared by initial webview creation, the resize handler, and the usage-overlay toggle so
+    /// all three agree on what "full" and "narrow" mean.
+    fn webview_rect(&self, window: &Window) -> Rect {
+        let scale = window.scale_factor();
+        let size = window.inner_size();
+        let width = if self.webview_full { size.width as f64 / scale } else { SIDEBAR_WIDTH };
+        Rect {
+            position: LogicalPosition::new(0.0, 0.0).into(),
+            size: LogicalSize::new(width, size.height as f64 / scale).into(),
+        }
     }
 
     /// Refits every open session's grid (and its pty's `winsize`) to its current tile — called
@@ -361,7 +391,6 @@ impl ApplicationHandler<AppEvent> for App {
         window.set_ime_allowed(true);
 
         let size = window.inner_size();
-        let scale = window.scale_factor();
 
         // --- wgpu terminal surface, fills the whole window; the sidebar webview docks on
         // top of the left strip of it via native child-view compositing ---
@@ -392,10 +421,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.cell_w = text.measure_cell_width() as f64;
 
         // --- sidebar webview docked to the left strip, replacing the old Tauri-owned window ---
-        let rect = Rect {
-            position: LogicalPosition::new(0.0, 0.0).into(),
-            size: LogicalSize::new(SIDEBAR_WIDTH, size.height as f64 / scale).into(),
-        };
+        let rect = self.webview_rect(&window);
         let db_for_ipc = self.db.clone();
         let proxy_for_ipc = self.proxy.clone();
         let activity_for_ipc = self.activity.clone();
@@ -606,6 +632,14 @@ impl ApplicationHandler<AppEvent> for App {
                     w.request_redraw();
                 }
             }
+            AppEvent::SetUsageOverlay(open) => {
+                self.webview_full = open;
+                let Some(window) = self.window.clone() else { return };
+                let rect = self.webview_rect(&window);
+                if let Some(wv) = self.webview.borrow().as_ref() {
+                    let _ = wv.set_bounds(rect);
+                }
+            }
         }
     }
 
@@ -704,11 +738,7 @@ impl ApplicationHandler<AppEvent> for App {
                     gpu.text.resize(&gpu.queue, gpu.config.width, gpu.config.height);
                 }
                 if let Some(window) = self.window.clone() {
-                    let rect = Rect {
-                        position: LogicalPosition::new(0.0, 0.0).into(),
-                        size: LogicalSize::new(SIDEBAR_WIDTH, size.height as f64 / window.scale_factor())
-                            .into(),
-                    };
+                    let rect = self.webview_rect(&window);
                     if let Some(wv) = self.webview.borrow().as_ref() {
                         let _ = wv.set_bounds(rect);
                     }

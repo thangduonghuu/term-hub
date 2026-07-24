@@ -1,8 +1,6 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use super::{home_dir, parse_rfc3339_to_unix, UsageAdapter, UsageEvent};
+use super::{home_dir, parse_rfc3339_to_unix, read_new_lines, UsageAdapter, UsageEvent};
 
 /// Reads Claude Code's per-project session transcripts at
 /// `~/.claude/projects/<cwd-with-dashes>/<sessionId>.jsonl`. Each line is a JSON event; token
@@ -46,16 +44,9 @@ impl UsageAdapter for ClaudeCodeAdapter {
         path: &Path,
         since_offset: u64,
     ) -> Result<(Vec<UsageEvent>, u64), String> {
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
-        let len = file.metadata().map_err(|e| e.to_string())?.len();
-        // If the file got shorter than our last offset, it was rotated/truncated — start over.
-        let start = if len < since_offset { 0 } else { since_offset };
-        file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-        let reader = BufReader::new(file);
-
+        let (lines, new_offset) = read_new_lines(path, since_offset)?;
         let mut events = Vec::new();
-        for line in reader.lines() {
-            let line = line.map_err(|e| e.to_string())?;
+        for line in lines {
             if line.trim().is_empty() {
                 continue;
             }
@@ -63,7 +54,7 @@ impl UsageAdapter for ClaudeCodeAdapter {
                 events.push(event);
             }
         }
-        Ok((events, len))
+        Ok((events, new_offset))
     }
 }
 

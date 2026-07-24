@@ -25,6 +25,15 @@ function App() {
     api.listSessions().then(setSessions);
   }, []);
 
+  // The usage dashboard is a centered-overlay modal rendered inside the sidebar webview, which
+  // is normally kept narrow (just the sidebar strip) so clicks past it reach the native
+  // terminal tiles instead of being captured by the webview. Its CSS only has as much viewport
+  // to center itself in as the webview actually is, so widen the webview to the full window
+  // while the modal is open, and narrow it back when it closes.
+  useEffect(() => {
+    api.setUsageOverlay(showUsage);
+  }, [showUsage]);
+
   useEffect(() => {
     const poll = () => {
       api.getActivity().then((activity) => {

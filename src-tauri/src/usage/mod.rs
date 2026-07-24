@@ -72,6 +72,37 @@ pub trait UsageAdapter: Send + Sync {
     ) -> Result<(Vec<UsageEvent>, u64), String>;
 }
 
+/// Opens `path`, seeks to `since_offset` (or 0 if the file's shrunk since then — rotated or
+/// truncated), and returns every *complete* (newline-terminated) line found since, plus the
+/// byte offset to resume from next time. Deliberately does **not** return a trailing line with
+/// no `\n` yet: `tracker.rs` polls every few seconds while the owning agent CLI can still be
+/// mid-write to the file, and every adapter here used to advance its offset straight to
+/// end-of-file regardless — a line caught half-written failed to parse (or parsed as garbage)
+/// and its tokens were lost for good, since the offset had already moved past it and nothing
+/// ever re-read it. Left unconsumed here, that same partial line is simply read again, complete,
+/// on the next poll.
+fn read_new_lines(path: &Path, since_offset: u64) -> Result<(Vec<String>, u64), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    let start = if len < since_offset { 0 } else { since_offset };
+    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+
+    let Some(last_newline) = buf.iter().rposition(|&b| b == b'\n') else {
+        // Not even one complete line since `start` — nothing to parse yet, and don't advance
+        // past it so the next poll re-reads it once it actually has a terminator.
+        return Ok((Vec::new(), start));
+    };
+    let lines = String::from_utf8_lossy(&buf[..=last_newline])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Ok((lines, start + last_newline as u64 + 1))
+}
+
 pub fn all_adapters() -> Vec<Box<dyn UsageAdapter>> {
     vec![
         Box::new(claude_code::ClaudeCodeAdapter),

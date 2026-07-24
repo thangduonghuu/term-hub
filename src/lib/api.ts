@@ -54,6 +54,9 @@ export const api = {
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
   getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
+  // Widens/narrows the sidebar webview to full-window while the usage dashboard modal is
+  // open/closed — it's centered-overlay CSS only has as much viewport as the webview itself.
+  setUsageOverlay: (open: boolean) => invoke<void>("set_usage_overlay", { open }),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
   hasAnthropicApiKey: () => invoke<boolean>("has_anthropic_api_key"),
   setAnthropicApiKey: (key: string) => invoke<void>("set_anthropic_api_key", { key }),

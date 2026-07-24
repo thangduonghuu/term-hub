@@ -116,6 +116,15 @@ fn handle(
             let set = exited.lock().map_err(|_| "exited lock poisoned".to_string())?;
             to_value(set.iter().cloned().collect::<Vec<String>>())
         }
+        // The usage dashboard is a full-window-centered modal rendered inside the sidebar
+        // webview, which is normally kept narrow (just the sidebar strip) so clicks past it
+        // fall through to the native terminal tiles — see `App.webview_full`'s doc comment.
+        // Widen it only while the modal is actually open.
+        "set_usage_overlay" => {
+            let open: bool = arg(&args, "open").ok_or("missing open")?;
+            let _ = proxy.send_event(AppEvent::SetUsageOverlay(open));
+            to_value(())
+        }
         "get_usage_summary" => commands::get_usage_summary(db).and_then(to_value),
         "has_anthropic_api_key" => commands::has_anthropic_api_key(db).and_then(to_value),
         "set_anthropic_api_key" => {
