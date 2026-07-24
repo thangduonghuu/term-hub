@@ -186,8 +186,12 @@ impl Db {
 
     pub fn usage_per_day(&self) -> rusqlite::Result<Vec<DayUsage>> {
         let conn = self.0.lock().unwrap();
+        // `'localtime'` (not just `'unixepoch'`) — without it SQLite buckets by UTC calendar
+        // day, which silently disagrees with what the dashboard's "Today"/"Last 7 days" tiles
+        // mean by "today" for anyone not at UTC+0 (e.g. a whole 9-hour-wide daily mismatch at
+        // UTC+9). See `UsageDashboard.tsx`'s matching local-date fix.
         let mut stmt = conn.prepare(
-            "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch') as day, agent,
+            "SELECT strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') as day, agent,
                     SUM(tokens_in), SUM(tokens_out)
              FROM usage_events GROUP BY day, agent ORDER BY day DESC",
         )?;

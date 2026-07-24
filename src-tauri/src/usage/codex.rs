@@ -1,8 +1,8 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use super::{home_dir, parse_rfc3339_to_unix, UsageAdapter, UsageEvent};
+use super::{home_dir, parse_rfc3339_to_unix, read_new_lines, UsageAdapter, UsageEvent};
 
 /// Reads Codex CLI's rollout files at `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. The first
 /// line (`session_meta`) carries the cwd for the whole file; per-turn token counts come as
@@ -29,23 +29,20 @@ impl UsageAdapter for CodexAdapter {
         path: &Path,
         since_offset: u64,
     ) -> Result<(Vec<UsageEvent>, u64), String> {
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
-        let len = file.metadata().map_err(|e| e.to_string())?.len();
-        let start = if len < since_offset { 0 } else { since_offset };
-        file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-        let reader = BufReader::new(file);
+        let (lines, new_offset) = read_new_lines(path, since_offset)?;
 
         // token_count events don't repeat the session's cwd, only session_meta does — if we're
-        // resuming mid-file (start > 0) we won't see that line again this poll, so fetch it once.
-        let mut cwd = if start == 0 {
+        // resuming mid-file (since_offset > 0) we won't see that line again this poll, so fetch
+        // it once. (On the rare rotation/truncation reset `read_new_lines` handles internally,
+        // this redundantly re-reads it from the now-different file's first line — harmless.)
+        let mut cwd = if since_offset == 0 {
             None
         } else {
             read_cwd_from_start(path)
         };
         let mut events = Vec::new();
 
-        for line in reader.lines() {
-            let line = line.map_err(|e| e.to_string())?;
+        for line in lines {
             if line.trim().is_empty() {
                 continue;
             }
@@ -97,7 +94,7 @@ impl UsageAdapter for CodexAdapter {
                 _ => {}
             }
         }
-        Ok((events, len))
+        Ok((events, new_offset))
     }
 }
 
