@@ -210,6 +210,7 @@ impl TerminalSession {
     pub fn spawn(
         id: String,
         cwd: &str,
+        shell: &str,
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<AppEvent>,
@@ -272,11 +273,22 @@ impl TerminalSession {
         {
             env.insert(stale.to_string(), String::new());
         }
+        // Previously always `None` regardless of the session's own `SessionMeta.shell` — every
+        // session silently got `alacritty_terminal`'s own default ($SHELL/COMSPEC) no matter
+        // what was actually stored for it. `shell` empty also falls back to that default,
+        // rather than trying to spawn a literal empty program path.
+        let shell_opt =
+            if shell.trim().is_empty() { None } else { Some(tty::Shell::new(shell.to_string(), Vec::new())) };
         let pty_options = tty::Options {
-            shell: None,
+            shell: shell_opt,
             working_directory: Some(cwd.into()),
             drain_on_exit: true,
             env,
+            // Windows-only field (`alacritty_terminal::tty::Options::escape_args`) — standard
+            // C-runtime argument escaping, the same convention every other Windows program
+            // expects its argv to follow.
+            #[cfg(target_os = "windows")]
+            escape_args: true,
         };
         let window_size = WindowSize {
             num_lines: rows as u16,

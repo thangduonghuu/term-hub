@@ -1,11 +1,32 @@
 use uuid::Uuid;
 
 use crate::db::Db;
+use crate::external_terminal;
 use crate::session::{default_cwd, default_shell, SessionInfo, SessionMeta};
 use crate::usage::UsageSummary;
 
 pub fn get_default_cwd() -> String {
     default_cwd()
+}
+
+/// Terminal apps installed on this machine (e.g. iTerm2, Warp) that a session's folder can be
+/// opened in as an alternative to the built-in native terminal.
+pub fn list_terminal_apps() -> Vec<String> {
+    external_terminal::list_apps()
+}
+
+const EXTERNAL_TERMINAL_APP_SETTING: &str = "external_terminal_app";
+
+pub fn get_preferred_terminal_app(db: &Db) -> Result<Option<String>, String> {
+    db.get_setting(EXTERNAL_TERMINAL_APP_SETTING).map_err(|e| e.to_string())
+}
+
+pub fn set_preferred_terminal_app(db: &Db, app: &str) -> Result<(), String> {
+    db.set_setting(EXTERNAL_TERMINAL_APP_SETTING, app).map_err(|e| e.to_string())
+}
+
+pub fn open_external_terminal(app: &str, cwd: &str) -> Result<(), String> {
+    external_terminal::open_external(app, cwd)
 }
 
 pub fn list_sessions(db: &Db) -> Result<Vec<SessionInfo>, String> {
@@ -20,7 +41,14 @@ pub fn create_session(
 ) -> Result<SessionInfo, String> {
     let id = Uuid::new_v4().to_string();
     let cwd = cwd.unwrap_or_else(default_cwd);
-    let shell = default_shell();
+    // The settings-table override (see `get_default_shell`/`set_default_shell`) wins if set,
+    // otherwise fall back to $SHELL/COMSPEC same as before.
+    let shell = db
+        .get_setting(DEFAULT_SHELL_SETTING)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(default_shell);
     let name = name.unwrap_or_else(|| "Session".to_string());
     let created_at = unix_now();
 
@@ -45,6 +73,23 @@ pub fn get_usage_summary(db: &Db) -> Result<UsageSummary, String> {
     let per_day = db.usage_per_day().map_err(|e| e.to_string())?;
     let (total_tokens_in, total_tokens_out) = db.usage_grand_total().map_err(|e| e.to_string())?;
     Ok(UsageSummary { per_session, per_agent, per_day, total_tokens_in, total_tokens_out })
+}
+
+const DEFAULT_SHELL_SETTING: &str = "default_shell";
+
+/// The configured default-shell override, or `None` if unset (new sessions fall back to
+/// `$SHELL`/`COMSPEC` — see `create_session`). Distinct from `get_default_cwd`'s `default_cwd()`
+/// pairing: that one has no settings-table override yet, this one does.
+pub fn get_default_shell(db: &Db) -> Result<Option<String>, String> {
+    db.get_setting(DEFAULT_SHELL_SETTING).map_err(|e| e.to_string())
+}
+
+pub fn set_default_shell(db: &Db, shell: &str) -> Result<(), String> {
+    db.set_setting(DEFAULT_SHELL_SETTING, shell).map_err(|e| e.to_string())
+}
+
+pub fn clear_default_shell(db: &Db) -> Result<(), String> {
+    db.delete_setting(DEFAULT_SHELL_SETTING).map_err(|e| e.to_string())
 }
 
 const ANTHROPIC_API_KEY_SETTING: &str = "anthropic_api_key";

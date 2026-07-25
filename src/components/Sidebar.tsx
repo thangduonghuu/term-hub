@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { BarChart3, Copy, FolderPlus, Plus, X } from "lucide-react";
+import { BarChart3, Copy, ExternalLink, FolderPlus, Plus, Settings, X } from "lucide-react";
 import type { SessionInfo } from "../lib/api";
 import { folderName } from "../lib/path";
 
@@ -14,7 +14,9 @@ interface Props {
   onSelect: (id: string) => void;
   onDuplicate: (session: SessionInfo) => void;
   onNewInFolder: (cwd: string) => void;
+  onOpenExternal: (session: SessionInfo) => void;
   onOpenUsage: () => void;
+  onOpenSettings: () => void;
   pendingRenameId: string | null;
   onPendingRenameHandled: () => void;
 }
@@ -30,7 +32,9 @@ export function Sidebar({
   onSelect,
   onDuplicate,
   onNewInFolder,
+  onOpenExternal,
   onOpenUsage,
+  onOpenSettings,
   pendingRenameId,
   onPendingRenameHandled,
 }: Props) {
@@ -84,6 +88,9 @@ export function Sidebar({
         <div className="sidebar-header-actions">
           <button className="usage-toggle-btn" onClick={onOpenUsage} title="Token usage">
             <BarChart3 size={15} />
+          </button>
+          <button className="usage-toggle-btn" onClick={onOpenSettings} title="Settings">
+            <Settings size={15} />
           </button>
           <button className="new-session-btn" onClick={onNew} title="New session">
             <Plus size={16} />
@@ -157,6 +164,16 @@ export function Sidebar({
                         {session.name}
                       </span>
                     )}
+                    <button
+                      className="duplicate-btn"
+                      title="Open this folder in an external terminal"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenExternal(session);
+                      }}
+                    >
+                      <ExternalLink size={13} />
+                    </button>
                     <button
                       className="duplicate-btn"
                       title="Duplicate session"

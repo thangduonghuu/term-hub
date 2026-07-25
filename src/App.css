@@ -561,6 +561,23 @@ body {
   background: #3a3a3a;
 }
 
+.usage-section select {
+  background: #202020;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  color: #e6e6e6;
+  padding: 6px 8px;
+  font-size: 12px;
+  width: 100%;
+}
+
+.settings-saved-hint {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: #3fb950;
+}
+
 .claude-key-active-row {
   display: flex;
   gap: 8px;
