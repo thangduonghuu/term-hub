@@ -1,161 +1,98 @@
-import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { useEffect, useState } from "react";
 import { api, type SessionInfo } from "./lib/api";
 import { Sidebar } from "./components/Sidebar";
-import { TerminalPane } from "./components/TerminalPane";
 import { UsageDashboard } from "./components/UsageDashboard";
-import type { TerminalHandle } from "./components/TerminalView";
-import { computeStatus, type SessionStatus } from "./lib/status";
+import { SettingsPanel } from "./components/SettingsPanel";
 import "./App.css";
 
-// Lays panes out in as square a grid as possible (2 -> 2x1, 3/4 -> 2x2, 5/6 -> 3x2, ...)
-// so N terminals always divide the screen evenly, like a tiling window manager.
-function gridColumns(count: number): number {
-  if (count <= 1) return 1;
-  return Math.ceil(Math.sqrt(count));
-}
-
-const EXTERNAL_APP_STORAGE_KEY = "termhub.externalApp";
-const IDLE_TICK_MS = 5_000;
+// A session counts as "recently active" (shows the sidebar's activity dot) if it produced
+// pty output within this many ms — long enough to stay lit through a burst of fast output,
+// short enough to turn off soon after a command actually finishes.
+const ACTIVITY_WINDOW_MS = 3000;
+const ACTIVITY_POLL_MS = 1000;
+// Same cadence as activity — exited status changes about as rarely as a shell process dies,
+// but there's no push channel for it (see `get_exited_sessions`'s doc comment), so poll it.
+const EXITED_POLL_MS = 1000;
 
 function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [terminalApps, setTerminalApps] = useState<string[]>([]);
-  const [externalApp, setExternalApp] = useState<string>(
-    () => localStorage.getItem(EXTERNAL_APP_STORAGE_KEY) ?? "",
-  );
   const [pendingRenameId, setPendingRenameId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
-  // Panes that should render in the grid this app run — separate from `running` so an
-  // exited shell's pane stays put (with its scrollback) instead of disappearing.
-  const [openPaneIds, setOpenPaneIds] = useState<Set<string>>(new Set());
-  const [tick, setTick] = useState(0);
-  const paneRefs = useRef<Record<string, TerminalHandle | null>>({});
-  const lastActivityRef = useRef<Record<string, number>>({});
+  const [showSettings, setShowSettings] = useState(false);
+  const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
+  const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    (async () => {
-      const list = await api.listSessions();
-      if (list.length === 0) {
-        const created = await api.createSession();
-        setSessions([created]);
-        setOpenPaneIds(new Set([created.id]));
-        setActiveId(created.id);
-      } else {
-        // Restore every saved session as an open pane on launch, like a browser
-        // restoring tabs — don't leave the user staring at an empty grid.
-        const reopened = await Promise.all(list.map((s) => api.reopenSession(s.id)));
-        setSessions(reopened);
-        setOpenPaneIds(new Set(reopened.map((s) => s.id)));
-        setActiveId(reopened[0].id);
-      }
-    })();
+    api.listSessions().then(setSessions);
   }, []);
 
+  // Both the usage dashboard and settings are centered-overlay modals rendered inside the
+  // sidebar webview, which is normally kept narrow (just the sidebar strip) so clicks past it
+  // reach the native terminal tiles instead of being captured by the webview. Their CSS only
+  // has as much viewport to center itself in as the webview actually is, so widen the webview
+  // to the full window while either is open, and narrow it back once both are closed.
   useEffect(() => {
-    api.listTerminalApps().then((apps) => {
-      setTerminalApps(apps);
-      setExternalApp((prev) => (prev && apps.includes(prev) ? prev : (apps[0] ?? "")));
-    });
-  }, []);
+    api.setOverlayOpen(showUsage || showSettings);
+  }, [showUsage, showSettings]);
 
   useEffect(() => {
-    let unlistenExit: (() => void) | undefined;
-    let unlistenOutput: (() => void) | undefined;
-
-    listen<{ id: string }>("pty-exit", (event) => {
-      setSessions((prev) =>
-        prev.map((s) => (s.id === event.payload.id ? { ...s, running: false } : s)),
-      );
-    }).then((fn) => {
-      unlistenExit = fn;
-    });
-
-    listen<{ id: string; data: string }>("pty-output", (event) => {
-      lastActivityRef.current[event.payload.id] = Date.now();
-    }).then((fn) => {
-      unlistenOutput = fn;
-    });
-
-    const interval = setInterval(() => setTick((t) => t + 1), IDLE_TICK_MS);
-
-    return () => {
-      unlistenExit?.();
-      unlistenOutput?.();
-      clearInterval(interval);
+    const poll = () => {
+      api.getActivity().then((activity) => {
+        const now = Date.now();
+        const next = new Set<string>();
+        for (const [id, lastMs] of Object.entries(activity)) {
+          if (now - lastMs < ACTIVITY_WINDOW_MS) next.add(id);
+        }
+        setRecentlyActive(next);
+      });
     };
+    poll();
+    const interval = setInterval(poll, ACTIVITY_POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
-  function handleExternalAppChange(app: string) {
-    setExternalApp(app);
-    localStorage.setItem(EXTERNAL_APP_STORAGE_KEY, app);
-  }
-
-  function handleOpenExternal(cwd: string) {
-    if (!externalApp) return;
-    api.openExternalTerminal(externalApp, cwd).catch((err) => {
-      console.error("Failed to open external terminal:", err);
-    });
-  }
+  useEffect(() => {
+    const poll = () => {
+      api.getExitedSessions().then((ids) => setExitedIds(new Set(ids)));
+    };
+    poll();
+    const interval = setInterval(poll, EXITED_POLL_MS);
+    return () => clearInterval(interval);
+  }, []);
 
   async function handleNew() {
     const created = await api.createSession();
     setSessions((prev) => [...prev, created]);
-    setOpenPaneIds((prev) => new Set(prev).add(created.id));
-    setActiveId(created.id);
     setPendingRenameId(created.id);
+    setActiveId(created.id);
   }
 
   async function handleNewInFolder(cwd: string) {
     const created = await api.createSession(undefined, cwd);
     setSessions((prev) => [...prev, created]);
-    setOpenPaneIds((prev) => new Set(prev).add(created.id));
-    setActiveId(created.id);
     setPendingRenameId(created.id);
+    setActiveId(created.id);
   }
 
   async function handleDuplicate(session: SessionInfo) {
     const created = await api.createSession(`${session.name} copy`, session.cwd);
     setSessions((prev) => [...prev, created]);
-    setOpenPaneIds((prev) => new Set(prev).add(created.id));
     setActiveId(created.id);
   }
 
-  function focusPane(id: string) {
+  // Phase 3: every session has a live tiled terminal on the Rust side (see lib.rs's
+  // `App.terms`) — clicking it in the sidebar both highlights it here and hands it real
+  // keyboard focus over there.
+  function handleSelect(id: string) {
     setActiveId(id);
-    document.getElementById(`pane-${id}`)?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-      inline: "nearest",
-    });
-    paneRefs.current[id]?.focus();
-  }
-
-  async function handleReopen(id: string) {
-    const info = await api.reopenSession(id);
-    lastActivityRef.current[id] = Date.now();
-    setSessions((prev) => prev.map((s) => (s.id === id ? info : s)));
-    setOpenPaneIds((prev) => new Set(prev).add(id));
-    setActiveId(id);
+    api.focusSession(id);
   }
 
   async function handleClose(id: string) {
     await api.closeSession(id);
-    delete paneRefs.current[id];
-    delete lastActivityRef.current[id];
-    setOpenPaneIds((prev) => {
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
-    setSessions((prev) => {
-      const next = prev.filter((s) => s.id !== id);
-      if (activeId === id) {
-        setActiveId(next.length > 0 ? next[0].id : null);
-      }
-      return next;
-    });
+    setSessions((prev) => prev.filter((s) => s.id !== id));
+    if (activeId === id) setActiveId(null);
   }
 
   async function handleRename(id: string, name: string) {
@@ -163,69 +100,64 @@ function App() {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, name } : s)));
   }
 
-  const openSessions = sessions.filter((s) => openPaneIds.has(s.id));
-  const cols = gridColumns(openSessions.length);
-  const rows = Math.max(1, Math.ceil(openSessions.length / cols));
-
-  const now = Date.now();
-  void tick; // recompute statuses every IDLE_TICK_MS
-  const statuses: Record<string, SessionStatus> = {};
-  for (const s of sessions) {
-    statuses[s.id] = computeStatus(
-      s.running,
-      openPaneIds.has(s.id),
-      lastActivityRef.current[s.id],
-      now,
-    );
+  // Pops a session's folder open in a separate terminal app, alongside (not instead of) the
+  // built-in one. Uses the saved preference from Settings if there is one; otherwise falls back
+  // to whatever's auto-detected as installed, so this works with zero configuration too.
+  async function handleOpenExternal(session: SessionInfo) {
+    const preferred = await api.getPreferredTerminalApp();
+    const app = preferred || (await api.listTerminalApps())[0];
+    if (!app) {
+      setShowSettings(true);
+      return;
+    }
+    api.openExternalTerminal(app, session.cwd);
   }
+
+  // New/close/next/prev-session keyboard shortcuts (Cmd+T/Cmd+W/Cmd+Shift+]/Cmd+Shift+[) are
+  // caught natively by `macos_input_view.rs` (this webview never has keyboard focus, so a
+  // regular `keydown` listener here would never fire) and forwarded in as this DOM event —
+  // see `AppEvent::KeyboardShortcut`'s doc comment. Handled here rather than natively since
+  // `sessions`/`activeId` are this component's state, not the Rust side's.
+  useEffect(() => {
+    function onShortcut(e: Event) {
+      const action = (e as CustomEvent<string>).detail;
+      if (action === "new-session") {
+        handleNew();
+      } else if (action === "close-session") {
+        if (activeId) handleClose(activeId);
+      } else if (action === "next-session" || action === "prev-session") {
+        if (sessions.length === 0) return;
+        const idx = sessions.findIndex((s) => s.id === activeId);
+        const delta = action === "next-session" ? 1 : -1;
+        const nextIdx = idx === -1 ? 0 : (idx + delta + sessions.length) % sessions.length;
+        handleSelect(sessions[nextIdx].id);
+      }
+    }
+    window.addEventListener("termhub:shortcut", onShortcut);
+    return () => window.removeEventListener("termhub:shortcut", onShortcut);
+  }, [sessions, activeId]);
 
   return (
     <div className="app-shell">
       <Sidebar
         sessions={sessions}
-        statuses={statuses}
         activeId={activeId}
-        onSelect={focusPane}
+        recentlyActive={recentlyActive}
+        exitedIds={exitedIds}
         onNew={handleNew}
         onClose={handleClose}
         onRename={handleRename}
-        onReopen={handleReopen}
+        onSelect={handleSelect}
         onDuplicate={handleDuplicate}
         onNewInFolder={handleNewInFolder}
+        onOpenExternal={handleOpenExternal}
         onOpenUsage={() => setShowUsage(true)}
-        terminalApps={terminalApps}
-        externalApp={externalApp}
-        onExternalAppChange={handleExternalAppChange}
+        onOpenSettings={() => setShowSettings(true)}
         pendingRenameId={pendingRenameId}
         onPendingRenameHandled={() => setPendingRenameId(null)}
       />
-      <main
-        className="terminal-grid"
-        style={{
-          gridTemplateColumns: `repeat(${cols}, 1fr)`,
-          gridTemplateRows: `repeat(${rows}, 1fr)`,
-        }}
-      >
-        {openSessions.map((s) => (
-          <TerminalPane
-            key={s.id}
-            ref={(handle) => {
-              paneRefs.current[s.id] = handle;
-            }}
-            session={s}
-            active={s.id === activeId}
-            status={statuses[s.id] ?? "closed"}
-            onFocus={focusPane}
-            onClose={handleClose}
-            onOpenExternal={handleOpenExternal}
-            canOpenExternal={terminalApps.length > 0}
-          />
-        ))}
-        {openSessions.length === 0 && (
-          <div className="empty-state">No sessions. Click + to start one.</div>
-        )}
-      </main>
       {showUsage && <UsageDashboard onClose={() => setShowUsage(false)} />}
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
     </div>
   );
 }

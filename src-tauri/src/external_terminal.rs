@@ -1,19 +1,19 @@
+//! Popping a session's folder open in a real, separate terminal app (iTerm2, Warp, Windows
+//! Terminal, etc.) — restored from the pre-`change-engine-for-terminal` implementation (dropped
+//! silently during that rewrite, no functional changes here). Runs alongside the built-in
+//! native terminal, doesn't replace it — this is purely `open`/`wt.exe`-style process spawning,
+//! no relationship to the app's own PTY/rendering layer.
+
 use std::path::Path;
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
 pub fn list_apps() -> Vec<String> {
-    let candidates = [
-        "Terminal", "iTerm", "Warp", "Alacritty", "WezTerm", "Hyper", "kitty",
-    ];
+    let candidates = ["Terminal", "iTerm", "Warp", "Alacritty", "WezTerm", "Hyper", "kitty"];
     let search_dirs = ["/Applications", "/System/Applications"];
     candidates
         .iter()
-        .filter(|name| {
-            search_dirs
-                .iter()
-                .any(|dir| Path::new(&format!("{dir}/{name}.app")).exists())
-        })
+        .filter(|name| search_dirs.iter().any(|dir| Path::new(&format!("{dir}/{name}.app")).exists()))
         .map(|s| s.to_string())
         .collect()
 }
@@ -39,10 +39,7 @@ pub fn list_apps() -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 pub fn open_external(app: &str, cwd: &str) -> Result<(), String> {
-    Command::new("open")
-        .args(["-a", app, cwd])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    Command::new("open").args(["-a", app, cwd]).spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -53,9 +50,7 @@ pub fn open_external(app: &str, cwd: &str) -> Result<(), String> {
         "PowerShell" => Command::new("cmd")
             .args(["/C", "start", "powershell", "-NoExit", "-Command", &format!("cd '{cwd}'")])
             .spawn(),
-        _ => Command::new("cmd")
-            .args(["/C", "start", "cmd", "/K", &format!("cd /d {cwd}")])
-            .spawn(),
+        _ => Command::new("cmd").args(["/C", "start", "cmd", "/K", &format!("cd /d {cwd}")]).spawn(),
     };
     result.map_err(|e| e.to_string())?;
     Ok(())

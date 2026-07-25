@@ -27,6 +27,17 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
+// `date.toISOString().slice(0, 10)` gives the UTC calendar day, not the local one — wrong for
+// "Today"/"Last 7 days" anywhere off UTC+0 (e.g. a 9-hour-wide daily mismatch at UTC+9). Backed
+// by local `getFullYear`/`getMonth`/`getDate` instead, matching `db.rs`'s `usage_per_day` query
+// (which buckets with SQLite's `'localtime'` modifier for the same reason).
+function localDateString(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 function agentLabel(agent: string): string {
   if (agent === "claude-code") return "Claude Code";
   if (agent === "codex") return "Codex";
@@ -263,8 +274,8 @@ export function UsageDashboard({ onClose }: Props) {
       const dayRows = summary.per_day.filter((d) => d.agent === agent);
       const sessionRowsRaw = summary.per_session.filter((s) => s.agent === agent);
 
-      const todayStr = new Date().toISOString().slice(0, 10);
-      const sevenDaysAgoStr = new Date(Date.now() - 6 * 86_400_000).toISOString().slice(0, 10);
+      const todayStr = localDateString(new Date());
+      const sevenDaysAgoStr = localDateString(new Date(Date.now() - 6 * 86_400_000));
       const todayEntry = dayRows.find((d) => d.day === todayStr);
       const last7 = dayRows.filter((d) => d.day >= sevenDaysAgoStr);
       const last7In = last7.reduce((sum, d) => sum + d.tokens_in, 0);

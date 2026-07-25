@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./ipc";
 
 export interface SessionInfo {
   id: string;
@@ -6,7 +6,6 @@ export interface SessionInfo {
   cwd: string;
   shell: string;
   created_at: number;
-  running: boolean;
 }
 
 export interface SessionUsage {
@@ -46,15 +45,30 @@ export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   createSession: (name?: string, cwd?: string) =>
     invoke<SessionInfo>("create_session", { name, cwd }),
-  reopenSession: (id: string) => invoke<SessionInfo>("reopen_session", { id }),
-  writePty: (id: string, data: string) => invoke<void>("write_pty", { id, data }),
-  resizePty: (id: string, rows: number, cols: number) =>
-    invoke<void>("resize_pty", { id, rows, cols }),
   renameSession: (id: string, name: string) =>
     invoke<void>("rename_session", { id, name }),
   closeSession: (id: string) => invoke<void>("close_session", { id }),
+  focusSession: (id: string) => invoke<void>("focus_session", { id }),
+  // Session id -> unix-epoch ms of its last pty output, for the sidebar's activity dot.
+  getActivity: () => invoke<Record<string, number>>("get_activity"),
+  // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
+  getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
+  // Widens/narrows the sidebar webview to full-window while any full-screen modal (usage
+  // dashboard, settings) is open/closed — their centered-overlay CSS only has as much viewport
+  // to work with as the webview itself.
+  setOverlayOpen: (open: boolean) => invoke<void>("set_overlay_open", { open }),
+  // The configured default-shell override for new sessions, or null if unset ($SHELL/COMSPEC
+  // is used instead — see `commands::create_session`).
+  getDefaultShell: () => invoke<string | null>("get_default_shell"),
+  setDefaultShell: (shell: string) => invoke<void>("set_default_shell", { shell }),
+  clearDefaultShell: () => invoke<void>("clear_default_shell"),
+  // Terminal apps installed on this machine (iTerm2, Warp, Windows Terminal, etc.) that a
+  // session's folder can be popped open in as an alternative to the built-in native terminal.
   listTerminalApps: () => invoke<string[]>("list_terminal_apps"),
+  getPreferredTerminalApp: () => invoke<string | null>("get_preferred_terminal_app"),
+  setPreferredTerminalApp: (app: string) =>
+    invoke<void>("set_preferred_terminal_app", { app }),
   openExternalTerminal: (app: string, cwd: string) =>
     invoke<void>("open_external_terminal", { app, cwd }),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
