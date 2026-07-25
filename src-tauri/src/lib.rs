@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod external_terminal;
 mod ipc;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -137,6 +138,25 @@ fn point_to_cell_in_tile(
     (col, row)
 }
 
+/// Maps a plain (unmodified-by-Control) character to the C0 control byte a terminal expects for
+/// Ctrl+that-character, e.g. `b` (Ctrl+B) → 0x02. Matches the standard VT100-derived convention
+/// every terminal follows (`byte = uppercase(c) - 'A' + 1` for letters, plus a handful of
+/// punctuation keys), not something specific to this app. Shared by `macos_input_view.rs`'s
+/// Ctrl-combo handling and `window_event`'s non-macOS `KeyboardInput` handling below — the same
+/// mapping regardless of which platform's input path produced the keystroke.
+fn control_byte(c: char) -> Option<u8> {
+    match c.to_ascii_uppercase() {
+        'A'..='Z' => Some(c.to_ascii_uppercase() as u8 - b'A' + 1),
+        '[' => Some(0x1B), // same byte as plain Escape
+        '\\' => Some(0x1C),
+        ']' => Some(0x1D),
+        '^' => Some(0x1E),
+        '_' => Some(0x1F),
+        '?' => Some(0x7F), // same byte as Backspace/DEL
+        _ => None,
+    }
+}
+
 /// Custom winit user event, delivered on the main thread from background threads —
 /// `IpcResponse` from the IPC dispatch threads (ipc.rs), `PtyOutput` from a terminal's pty
 /// reader thread (terminal.rs) so redraws are driven by actual new output instead of a
@@ -169,17 +189,26 @@ pub enum AppEvent {
     // commands successfully touch the database — the *live* pty-backed session (Phase 3:
     // multi-session tiling) is owned entirely here in `App`, not reachable from the IPC
     // dispatch background threads, so it's created/destroyed/focused in response to these.
-    SpawnSession { id: String, cwd: String },
+    SpawnSession { id: String, cwd: String, shell: String },
     CloseSession { id: String },
     FocusSession(String),
     // Sent by a session's pty reader thread (terminal.rs) once its `read()` loop ends — the
     // shell process is gone. Phase 5: marks the tile dead in `App.exited` instead of leaving
     // its last frame frozen on screen with no visual difference from a live idle session.
     SessionExited(String),
-    // Sent by `ipc.rs`'s `set_usage_overlay` command when the usage dashboard modal opens or
-    // closes — widens/narrows the sidebar webview to match (see `App.webview_full`'s doc
-    // comment for why the modal needs this instead of just being full-window-sized always).
-    SetUsageOverlay(bool),
+    // Sent by `ipc.rs`'s `set_overlay_open` command whenever any full-window modal (usage
+    // dashboard, settings) opens or closes — widens/narrows the sidebar webview to match (see
+    // `App.webview_full`'s doc comment for why a modal needs this instead of the webview just
+    // being full-window-sized always). The frontend is responsible for only reporting "closed"
+    // once *every* modal it owns is closed, since this is a single shared flag, not a count.
+    SetOverlayOpen(bool),
+    // Sent by `macos_input_view::key_down` for the new/close/next/prev-session shortcuts
+    // (Cmd+T/Cmd+W/Cmd+Shift+]/Cmd+Shift+[). Session bookkeeping (the `sessions` list,
+    // `activeId`) lives in the sidebar's React state, not here in `App`, so this is forwarded
+    // into the webview as a DOM event rather than handled natively — same reasoning as why
+    // `SpawnSession`/`CloseSession` originate from IPC commands, just in the opposite
+    // direction. One of "new-session"/"close-session"/"next-session"/"prev-session".
+    KeyboardShortcut(&'static str),
 }
 
 struct GpuState<'a> {
@@ -223,6 +252,14 @@ struct App {
     // dropping it would tear down the AppKit view it wraps.
     #[cfg(target_os = "macos")]
     input_view: Option<objc2::rc::Retained<macos_input_view::TerminalInputView>>,
+    // Non-macOS terminal keyboard/IME input (Phase 5) goes through winit's own
+    // `WindowEvent::KeyboardInput`/`Ime` instead of a custom view — winit's own handling was
+    // only disabled for macOS due to its confirmed IME bug (see `AppEvent::ImePreedit`'s doc
+    // comment), so this reuses it as-is rather than reimplementing a second custom input path.
+    // `KeyboardInput` events don't carry modifier state directly; it has to be tracked
+    // separately from `WindowEvent::ModifiersChanged` and consulted here.
+    #[cfg(not(target_os = "macos"))]
+    modifiers: winit::keyboard::ModifiersState,
     // Mouse-drag text selection (Phase 2). `selecting_tile` holds the id of the session whose
     // selection is being extended — fixed at mouse-down, not re-resolved as the cursor moves,
     // so dragging past a tile's edge keeps extending that tile's selection rather than
@@ -285,6 +322,8 @@ impl App {
             preedit: String::new(),
             #[cfg(target_os = "macos")]
             input_view: None,
+            #[cfg(not(target_os = "macos"))]
+            modifiers: winit::keyboard::ModifiersState::empty(),
             selecting_tile: None,
             cursor_visible: true,
             next_blink: Instant::now() + BLINK_INTERVAL,
@@ -321,7 +360,8 @@ impl App {
             return false;
         }
         if let Ok(meta) = self.db.get_session(&id) {
-            let _ = self.proxy.send_event(AppEvent::SpawnSession { id, cwd: meta.cwd });
+            let _ =
+                self.proxy.send_event(AppEvent::SpawnSession { id, cwd: meta.cwd, shell: meta.shell });
         }
         true
     }
@@ -361,12 +401,12 @@ impl App {
     /// grid), then resizes every other already-open tile to fit the new total — shared by
     /// live session creation (`AppEvent::SpawnSession`) and the staggered startup reconnect
     /// (`pending_reconnects`). Returns whether the spawn succeeded.
-    fn spawn_session(&mut self, window: &Window, id: String, cwd: &str) -> bool {
+    fn spawn_session(&mut self, window: &Window, id: String, cwd: &str, shell: &str) -> bool {
         let scale = window.scale_factor();
         let rects = tile_rects(window, self.terms.len() + 1);
         let &(_, _, w, h) = rects.last().unwrap_or(&(0.0, 0.0, 0.0, 0.0));
         let (cols, rows) = grid_size_for_area(scale, w * scale, h * scale, self.cell_w);
-        match TerminalSession::spawn(id.clone(), cwd, cols, rows, self.proxy.clone()) {
+        match TerminalSession::spawn(id.clone(), cwd, shell, cols, rows, self.proxy.clone()) {
             Ok(term) => {
                 self.terms.push((id, term));
                 self.refit_all_tiles(window);
@@ -460,7 +500,7 @@ impl ApplicationHandler<AppEvent> for App {
             .filter(|m| std::path::Path::new(&m.cwd).is_dir())
             .collect();
         if let Some(first) = metas.pop_front() {
-            self.spawn_session(&window, first.id, &first.cwd);
+            self.spawn_session(&window, first.id, &first.cwd, &first.shell);
         }
         self.pending_reconnects = metas;
         self.next_reconnect = Instant::now() + RECONNECT_STAGGER;
@@ -573,7 +613,7 @@ impl ApplicationHandler<AppEvent> for App {
                     w.request_redraw();
                 }
             }
-            AppEvent::SpawnSession { id, cwd } => {
+            AppEvent::SpawnSession { id, cwd, shell } => {
                 let Some(window) = self.window.clone() else { return };
                 self.terms.retain(|(tid, _)| *tid != id);
                 // `spawn_session` sizes the new session for the tile it will actually end up
@@ -584,7 +624,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // prompt rendered for the wrong width, which a later resize doesn't
                 // retroactively fix (confirmed: this was the cause of the garbled/overflowing
                 // first prompt seen when creating a session while others were already open).
-                if !self.spawn_session(&window, id.clone(), &cwd) {
+                if !self.spawn_session(&window, id.clone(), &cwd, &shell) {
                     return;
                 }
                 // Respawning (whether from the sidebar's "new"/duplicate or reviving a dead
@@ -632,12 +672,23 @@ impl ApplicationHandler<AppEvent> for App {
                     w.request_redraw();
                 }
             }
-            AppEvent::SetUsageOverlay(open) => {
+            AppEvent::SetOverlayOpen(open) => {
                 self.webview_full = open;
                 let Some(window) = self.window.clone() else { return };
                 let rect = self.webview_rect(&window);
                 if let Some(wv) = self.webview.borrow().as_ref() {
                     let _ = wv.set_bounds(rect);
+                }
+            }
+            AppEvent::KeyboardShortcut(name) => {
+                if let Some(wv) = self.webview.borrow().as_ref() {
+                    // `name` is always one of this module's own string literals (see the
+                    // `AppEvent::KeyboardShortcut` doc comment) — never user input — so this
+                    // doesn't need JSON-escaping.
+                    let script = format!(
+                        "window.dispatchEvent(new CustomEvent('termhub:shortcut', {{ detail: '{name}' }}))"
+                    );
+                    let _ = wv.evaluate_script(&script);
                 }
             }
         }
@@ -751,9 +802,95 @@ impl ApplicationHandler<AppEvent> for App {
             // On macOS, terminal keyboard/IME input no longer flows through winit's own
             // `KeyboardInput`/`Ime` events at all — `TerminalInputView` (Phase 1d) holds
             // first responder and handles it directly, forwarding results via `AppEvent`
-            // (see `user_event`). Non-macOS platforms don't have that view yet and fall
-            // through to the catch-all below, which is currently a no-op (Linux keyboard
-            // input for the terminal is still open — see the plan doc).
+            // (see `user_event`). Non-macOS platforms don't have that custom view (Phase 5) —
+            // winit's own handling was only ever disabled for macOS specifically, due to its
+            // confirmed IME bug, so it's used as-is here instead of a second custom input path.
+            #[cfg(not(target_os = "macos"))]
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+            #[cfg(not(target_os = "macos"))]
+            WindowEvent::KeyboardInput { event, .. } => {
+                use winit::keyboard::{Key, NamedKey};
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                self.reset_blink();
+                // A keystroke landing on a dead tile revives it instead of writing into its
+                // dead pty (Phase 5) — same behavior as the macOS input path.
+                if self.respawn_active_if_exited() {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                // Ctrl+letter (interrupt, EOF, readline shortcuts, etc.) needs the raw C0
+                // control byte, same as macOS's handling — `event.text` is `None` for these
+                // (Ctrl doesn't produce printable text), so this has to come from
+                // `logical_key` instead.
+                let seq: Option<String> = if self.modifiers.control_key() {
+                    match &event.logical_key {
+                        Key::Character(s) => {
+                            s.chars().next().and_then(control_byte).map(|b| (b as char).to_string())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    match event.logical_key.as_ref() {
+                        Key::Named(NamedKey::Enter) => Some("\r".to_string()),
+                        Key::Named(NamedKey::Backspace) => Some("\x7f".to_string()),
+                        Key::Named(NamedKey::Tab) => Some("\t".to_string()),
+                        Key::Named(NamedKey::Escape) => Some("\x1b".to_string()),
+                        Key::Named(NamedKey::ArrowLeft) => Some("\x1b[D".to_string()),
+                        Key::Named(NamedKey::ArrowRight) => Some("\x1b[C".to_string()),
+                        Key::Named(NamedKey::ArrowUp) => Some("\x1b[A".to_string()),
+                        Key::Named(NamedKey::ArrowDown) => Some("\x1b[B".to_string()),
+                        Key::Named(NamedKey::Delete) => Some("\x1b[3~".to_string()),
+                        Key::Named(NamedKey::Home) => Some("\x1b[H".to_string()),
+                        Key::Named(NamedKey::End) => Some("\x1b[F".to_string()),
+                        Key::Named(NamedKey::PageUp) => Some("\x1b[5~".to_string()),
+                        Key::Named(NamedKey::PageDown) => Some("\x1b[6~".to_string()),
+                        // Plain character keys, including anything IME composition already
+                        // resolved to final text — dead keys/composing-in-progress states
+                        // report `text: None` and are correctly ignored here.
+                        _ => event.text.as_ref().map(|s| s.to_string()),
+                    }
+                };
+                if let Some(seq) = seq {
+                    if let Some(term) = self.active_term() {
+                        term.write(&seq);
+                    }
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            // Composed text from a system IME (Pinyin, Kana, etc.) — `KeyboardInput` above
+            // doesn't fire with real text for keys consumed by an in-progress composition, so
+            // this is the only path those come through. Mirrors macOS's
+            // `AppEvent::ImePreedit`/`ImeCommit` handling in `user_event`.
+            #[cfg(not(target_os = "macos"))]
+            WindowEvent::Ime(ime_event) => {
+                match ime_event {
+                    winit::event::Ime::Preedit(text, _) => {
+                        self.reset_blink();
+                        self.preedit = text;
+                    }
+                    winit::event::Ime::Commit(text) => {
+                        self.reset_blink();
+                        self.preedit.clear();
+                        if !self.respawn_active_if_exited() {
+                            if let Some(term) = self.active_term() {
+                                term.write(&text);
+                            }
+                        }
+                    }
+                    winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 // Snapshotted once per frame (not per tile via `self.is_exited`) — `gpu` below
                 // is a mutable borrow of `self` for the rest of this arm, which a `&self`
@@ -808,6 +945,10 @@ impl ApplicationHandler<AppEvent> for App {
 
                 let mut frames = Vec::with_capacity(self.terms.len());
                 for ((id, term), &(tx, ty, tw, th)) in self.terms.iter().zip(rects.iter()) {
+                    // Only actually read inside the `#[cfg(target_os = "macos")]` accessibility
+                    // block below — this no-op keeps them from warning as unused on other
+                    // platforms without needing to cfg-gate the destructuring pattern itself.
+                    let _ = (tx, ty);
                     let is_active = self.active_id.as_deref() == Some(id.as_str());
                     let is_exited = exited_snapshot.contains(id);
                     // Only the focused tile (the one that has keyboard input right now) shows
@@ -974,7 +1115,7 @@ impl ApplicationHandler<AppEvent> for App {
         if now >= self.next_reconnect {
             if let Some(meta) = self.pending_reconnects.pop_front() {
                 if let Some(window) = self.window.clone() {
-                    self.spawn_session(&window, meta.id, &meta.cwd);
+                    self.spawn_session(&window, meta.id, &meta.cwd, &meta.shell);
                     window.request_redraw();
                 }
                 self.next_reconnect = now + RECONNECT_STAGGER;

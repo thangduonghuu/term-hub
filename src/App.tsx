@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type SessionInfo } from "./lib/api";
 import { Sidebar } from "./components/Sidebar";
 import { UsageDashboard } from "./components/UsageDashboard";
+import { SettingsPanel } from "./components/SettingsPanel";
 import "./App.css";
 
 // A session counts as "recently active" (shows the sidebar's activity dot) if it produced
@@ -18,6 +19,7 @@ function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pendingRenameId, setPendingRenameId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
   const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
 
@@ -25,14 +27,14 @@ function App() {
     api.listSessions().then(setSessions);
   }, []);
 
-  // The usage dashboard is a centered-overlay modal rendered inside the sidebar webview, which
-  // is normally kept narrow (just the sidebar strip) so clicks past it reach the native
-  // terminal tiles instead of being captured by the webview. Its CSS only has as much viewport
-  // to center itself in as the webview actually is, so widen the webview to the full window
-  // while the modal is open, and narrow it back when it closes.
+  // Both the usage dashboard and settings are centered-overlay modals rendered inside the
+  // sidebar webview, which is normally kept narrow (just the sidebar strip) so clicks past it
+  // reach the native terminal tiles instead of being captured by the webview. Their CSS only
+  // has as much viewport to center itself in as the webview actually is, so widen the webview
+  // to the full window while either is open, and narrow it back once both are closed.
   useEffect(() => {
-    api.setUsageOverlay(showUsage);
-  }, [showUsage]);
+    api.setOverlayOpen(showUsage || showSettings);
+  }, [showUsage, showSettings]);
 
   useEffect(() => {
     const poll = () => {
@@ -98,6 +100,43 @@ function App() {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, name } : s)));
   }
 
+  // Pops a session's folder open in a separate terminal app, alongside (not instead of) the
+  // built-in one. Uses the saved preference from Settings if there is one; otherwise falls back
+  // to whatever's auto-detected as installed, so this works with zero configuration too.
+  async function handleOpenExternal(session: SessionInfo) {
+    const preferred = await api.getPreferredTerminalApp();
+    const app = preferred || (await api.listTerminalApps())[0];
+    if (!app) {
+      setShowSettings(true);
+      return;
+    }
+    api.openExternalTerminal(app, session.cwd);
+  }
+
+  // New/close/next/prev-session keyboard shortcuts (Cmd+T/Cmd+W/Cmd+Shift+]/Cmd+Shift+[) are
+  // caught natively by `macos_input_view.rs` (this webview never has keyboard focus, so a
+  // regular `keydown` listener here would never fire) and forwarded in as this DOM event —
+  // see `AppEvent::KeyboardShortcut`'s doc comment. Handled here rather than natively since
+  // `sessions`/`activeId` are this component's state, not the Rust side's.
+  useEffect(() => {
+    function onShortcut(e: Event) {
+      const action = (e as CustomEvent<string>).detail;
+      if (action === "new-session") {
+        handleNew();
+      } else if (action === "close-session") {
+        if (activeId) handleClose(activeId);
+      } else if (action === "next-session" || action === "prev-session") {
+        if (sessions.length === 0) return;
+        const idx = sessions.findIndex((s) => s.id === activeId);
+        const delta = action === "next-session" ? 1 : -1;
+        const nextIdx = idx === -1 ? 0 : (idx + delta + sessions.length) % sessions.length;
+        handleSelect(sessions[nextIdx].id);
+      }
+    }
+    window.addEventListener("termhub:shortcut", onShortcut);
+    return () => window.removeEventListener("termhub:shortcut", onShortcut);
+  }, [sessions, activeId]);
+
   return (
     <div className="app-shell">
       <Sidebar
@@ -111,11 +150,14 @@ function App() {
         onSelect={handleSelect}
         onDuplicate={handleDuplicate}
         onNewInFolder={handleNewInFolder}
+        onOpenExternal={handleOpenExternal}
         onOpenUsage={() => setShowUsage(true)}
+        onOpenSettings={() => setShowSettings(true)}
         pendingRenameId={pendingRenameId}
         onPendingRenameHandled={() => setPendingRenameId(null)}
       />
       {showUsage && <UsageDashboard onClose={() => setShowUsage(false)} />}
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
     </div>
   );
 }

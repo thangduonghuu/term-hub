@@ -54,9 +54,23 @@ export const api = {
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
   getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
-  // Widens/narrows the sidebar webview to full-window while the usage dashboard modal is
-  // open/closed — it's centered-overlay CSS only has as much viewport as the webview itself.
-  setUsageOverlay: (open: boolean) => invoke<void>("set_usage_overlay", { open }),
+  // Widens/narrows the sidebar webview to full-window while any full-screen modal (usage
+  // dashboard, settings) is open/closed — their centered-overlay CSS only has as much viewport
+  // to work with as the webview itself.
+  setOverlayOpen: (open: boolean) => invoke<void>("set_overlay_open", { open }),
+  // The configured default-shell override for new sessions, or null if unset ($SHELL/COMSPEC
+  // is used instead — see `commands::create_session`).
+  getDefaultShell: () => invoke<string | null>("get_default_shell"),
+  setDefaultShell: (shell: string) => invoke<void>("set_default_shell", { shell }),
+  clearDefaultShell: () => invoke<void>("clear_default_shell"),
+  // Terminal apps installed on this machine (iTerm2, Warp, Windows Terminal, etc.) that a
+  // session's folder can be popped open in as an alternative to the built-in native terminal.
+  listTerminalApps: () => invoke<string[]>("list_terminal_apps"),
+  getPreferredTerminalApp: () => invoke<string | null>("get_preferred_terminal_app"),
+  setPreferredTerminalApp: (app: string) =>
+    invoke<void>("set_preferred_terminal_app", { app }),
+  openExternalTerminal: (app: string, cwd: string) =>
+    invoke<void>("open_external_terminal", { app, cwd }),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
   hasAnthropicApiKey: () => invoke<boolean>("has_anthropic_api_key"),
   setAnthropicApiKey: (key: string) => invoke<void>("set_anthropic_api_key", { key }),

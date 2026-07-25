@@ -73,6 +73,11 @@ declare_class!(
                 let flags = event.modifierFlags();
                 if flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand) {
                     if let Some(chars) = event.charactersIgnoringModifiers() {
+                        // New/close/next/prev-session shortcuts, matching iTerm2's bindings
+                        // (this app already presents itself as `TERM_PROGRAM=iTerm.app` — see
+                        // `TerminalSession::spawn`'s doc comment). `charactersIgnoringModifiers`
+                        // still applies Shift (only Cmd/Ctrl/Option are ignored), so Cmd+Shift+]
+                        // arrives here as "}", not "]" — checked below accordingly.
                         match chars.to_string().as_str() {
                             "c" => {
                                 let _ = self.ivars().proxy.send_event(AppEvent::Copy);
@@ -80,6 +85,34 @@ declare_class!(
                             }
                             "v" => {
                                 let _ = self.ivars().proxy.send_event(AppEvent::Paste);
+                                return;
+                            }
+                            "t" => {
+                                let _ = self
+                                    .ivars()
+                                    .proxy
+                                    .send_event(AppEvent::KeyboardShortcut("new-session"));
+                                return;
+                            }
+                            "w" => {
+                                let _ = self
+                                    .ivars()
+                                    .proxy
+                                    .send_event(AppEvent::KeyboardShortcut("close-session"));
+                                return;
+                            }
+                            "}" => {
+                                let _ = self
+                                    .ivars()
+                                    .proxy
+                                    .send_event(AppEvent::KeyboardShortcut("next-session"));
+                                return;
+                            }
+                            "{" => {
+                                let _ = self
+                                    .ivars()
+                                    .proxy
+                                    .send_event(AppEvent::KeyboardShortcut("prev-session"));
                                 return;
                             }
                             _ => {}
@@ -100,7 +133,7 @@ declare_class!(
                     // ourselves.
                     if let Some(chars) = event.charactersIgnoringModifiers() {
                         if let Some(c) = chars.to_string().chars().next() {
-                            if let Some(byte) = control_byte(c) {
+                            if let Some(byte) = crate::control_byte(c) {
                                 let _ = self.ivars().proxy.send_event(AppEvent::KeyByte(byte));
                                 return;
                             }
@@ -347,23 +380,6 @@ declare_class!(
         }
     }
 );
-
-/// Maps a plain (unmodified-by-Control) character to the C0 control byte a terminal expects
-/// for Ctrl+that-character, e.g. `b` (Ctrl+B) → 0x02. Matches the standard VT100-derived
-/// convention every terminal follows (`byte = uppercase(c) - 'A' + 1` for letters, plus a
-/// handful of punctuation keys), not something specific to this app.
-fn control_byte(c: char) -> Option<u8> {
-    match c.to_ascii_uppercase() {
-        'A'..='Z' => Some(c.to_ascii_uppercase() as u8 - b'A' + 1),
-        '[' => Some(0x1B), // same byte as plain Escape
-        '\\' => Some(0x1C),
-        ']' => Some(0x1D),
-        '^' => Some(0x1E),
-        '_' => Some(0x1F),
-        '?' => Some(0x7F), // same byte as Backspace/DEL
-        _ => None,
-    }
-}
 
 /// `setMarkedText:`/`insertText:` can hand us either a plain `NSString` or an
 /// `NSAttributedString` (marked text sometimes carries underline-style attributes) — Apple's

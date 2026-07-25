@@ -79,6 +79,17 @@ fn handle(
 
     match cmd {
         "get_default_cwd" => to_value(commands::get_default_cwd()),
+        "list_terminal_apps" => to_value(commands::list_terminal_apps()),
+        "get_preferred_terminal_app" => commands::get_preferred_terminal_app(db).and_then(to_value),
+        "set_preferred_terminal_app" => {
+            let app: String = arg(&args, "app").ok_or("missing app")?;
+            commands::set_preferred_terminal_app(db, &app).and_then(to_value)
+        }
+        "open_external_terminal" => {
+            let app: String = arg(&args, "app").ok_or("missing app")?;
+            let cwd: String = arg(&args, "cwd").ok_or("missing cwd")?;
+            commands::open_external_terminal(&app, &cwd).and_then(to_value)
+        }
         "list_sessions" => commands::list_sessions(db).and_then(to_value),
         "create_session" => {
             let name: Option<String> = arg(&args, "name");
@@ -87,6 +98,7 @@ fn handle(
             let _ = proxy.send_event(AppEvent::SpawnSession {
                 id: info.meta.id.clone(),
                 cwd: info.meta.cwd.clone(),
+                shell: info.meta.shell.clone(),
             });
             to_value(info)
         }
@@ -116,15 +128,21 @@ fn handle(
             let set = exited.lock().map_err(|_| "exited lock poisoned".to_string())?;
             to_value(set.iter().cloned().collect::<Vec<String>>())
         }
-        // The usage dashboard is a full-window-centered modal rendered inside the sidebar
-        // webview, which is normally kept narrow (just the sidebar strip) so clicks past it
-        // fall through to the native terminal tiles — see `App.webview_full`'s doc comment.
-        // Widen it only while the modal is actually open.
-        "set_usage_overlay" => {
+        // Any full-window-centered modal (usage dashboard, settings) rendered inside the
+        // sidebar webview, which is normally kept narrow (just the sidebar strip) so clicks
+        // past it fall through to the native terminal tiles — see `App.webview_full`'s doc
+        // comment. Widen it only while a modal is actually open.
+        "set_overlay_open" => {
             let open: bool = arg(&args, "open").ok_or("missing open")?;
-            let _ = proxy.send_event(AppEvent::SetUsageOverlay(open));
+            let _ = proxy.send_event(AppEvent::SetOverlayOpen(open));
             to_value(())
         }
+        "get_default_shell" => commands::get_default_shell(db).and_then(to_value),
+        "set_default_shell" => {
+            let shell: String = arg(&args, "shell").ok_or("missing shell")?;
+            commands::set_default_shell(db, &shell).and_then(to_value)
+        }
+        "clear_default_shell" => commands::clear_default_shell(db).and_then(to_value),
         "get_usage_summary" => commands::get_usage_summary(db).and_then(to_value),
         "has_anthropic_api_key" => commands::has_anthropic_api_key(db).and_then(to_value),
         "set_anthropic_api_key" => {
