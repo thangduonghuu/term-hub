@@ -1072,12 +1072,13 @@ impl ApplicationHandler<AppEvent> for App {
                     let tile_renders: Vec<terminal::TileRender> = frames
                         .iter()
                         .zip(rects.iter())
-                        .map(|((_, tframe, _, _), &(tx, ty, tw, th))| {
+                        .map(|((id, tframe, _, _), &(tx, ty, tw, th))| {
                             let sx = (tx * scale).round() as i32;
                             let sy = (ty * scale).round() as i32;
                             let sw = (tw * scale).round() as i32;
                             let sh = (th * scale).round() as i32;
                             terminal::TileRender {
+                                id: id.as_str(),
                                 frame: tframe,
                                 left: sx as f32 + TEXT_LEFT_MARGIN as f32 * scale as f32,
                                 top: sy as f32 + TEXT_TOP_MARGIN as f32 * scale as f32,
