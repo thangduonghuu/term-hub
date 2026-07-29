@@ -3,6 +3,7 @@ import { api, type SessionInfo } from "./lib/api";
 import { Sidebar } from "./components/Sidebar";
 import { UsageDashboard } from "./components/UsageDashboard";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { QuickOpen } from "./components/QuickOpen";
 import "./App.css";
 
 // A session counts as "recently active" (shows the sidebar's activity dot) if it produced
@@ -20,6 +21,7 @@ function App() {
   const [pendingRenameId, setPendingRenameId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showQuickOpen, setShowQuickOpen] = useState(false);
   const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
   const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
 
@@ -33,8 +35,8 @@ function App() {
   // has as much viewport to center itself in as the webview actually is, so widen the webview
   // to the full window while either is open, and narrow it back once both are closed.
   useEffect(() => {
-    api.setOverlayOpen(showUsage || showSettings);
-  }, [showUsage, showSettings]);
+    api.setOverlayOpen(showUsage || showSettings || showQuickOpen);
+  }, [showUsage, showSettings, showQuickOpen]);
 
   useEffect(() => {
     const poll = () => {
@@ -73,6 +75,17 @@ function App() {
     setSessions((prev) => [...prev, created]);
     setPendingRenameId(created.id);
     setActiveId(created.id);
+  }
+
+  // VSCode's Cmd+R "Open Recent" — opens the quick-pick over previously-opened folders instead
+  // of going straight to a native browse dialog (that's the picker's own "Browse…" row).
+  function handleOpenFolder() {
+    setShowQuickOpen(true);
+  }
+
+  function handleQuickOpenSelect(path: string) {
+    setShowQuickOpen(false);
+    handleNewInFolder(path);
   }
 
   async function handleDuplicate(session: SessionInfo) {
@@ -123,6 +136,8 @@ function App() {
       const action = (e as CustomEvent<string>).detail;
       if (action === "new-session") {
         handleNew();
+      } else if (action === "open-folder") {
+        handleOpenFolder();
       } else if (action === "close-session") {
         if (activeId) handleClose(activeId);
       } else if (action === "next-session" || action === "prev-session") {
@@ -150,6 +165,7 @@ function App() {
         onSelect={handleSelect}
         onDuplicate={handleDuplicate}
         onNewInFolder={handleNewInFolder}
+        onOpenFolder={handleOpenFolder}
         onOpenExternal={handleOpenExternal}
         onOpenUsage={() => setShowUsage(true)}
         onOpenSettings={() => setShowSettings(true)}
@@ -158,6 +174,9 @@ function App() {
       />
       {showUsage && <UsageDashboard onClose={() => setShowUsage(false)} />}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showQuickOpen && (
+        <QuickOpen onSelect={handleQuickOpenSelect} onClose={() => setShowQuickOpen(false)} />
+      )}
     </div>
   );
 }

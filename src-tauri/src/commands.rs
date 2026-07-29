@@ -9,6 +9,15 @@ pub fn get_default_cwd() -> String {
     default_cwd()
 }
 
+/// Native "Open Folder" dialog (VSCode-style) — lets the user pick any directory on disk to
+/// open as a new session, rather than being limited to the default cwd or an already-open
+/// session's folder. `None` if the user cancels. No `tauri-plugin-dialog` here: this app never
+/// calls `tauri::Builder` (see `lib.rs::run()`), so there's no `AppHandle`/`Manager` for a Tauri
+/// plugin to hang off of — `rfd` is a standalone crate that doesn't need one.
+pub fn pick_folder() -> Option<String> {
+    rfd::FileDialog::new().pick_folder().map(|p| p.to_string_lossy().to_string())
+}
+
 /// Terminal apps installed on this machine (e.g. iTerm2, Warp) that a session's folder can be
 /// opened in as an alternative to the built-in native terminal.
 pub fn list_terminal_apps() -> Vec<String> {
@@ -54,8 +63,23 @@ pub fn create_session(
 
     let meta = SessionMeta { id, name, cwd, shell, created_at };
     db.insert_session(&meta).map_err(|e| e.to_string())?;
+    // Every opened folder counts toward the "Open Recent" MRU list, regardless of how the
+    // session was created (new/duplicate/"new session here"/the Open Recent picker itself) —
+    // see `touch_recent_folder`'s doc comment for why this is a separate table from `sessions`.
+    db.touch_recent_folder(&meta.cwd, created_at).map_err(|e| e.to_string())?;
 
     Ok(SessionInfo { meta })
+}
+
+/// Folders previously opened as a session, most-recent first, for the "Open Recent" picker
+/// (VSCode's Cmd+R equivalent here is Ctrl+R — see `macos_input_view.rs`).
+pub fn list_recent_folders(db: &Db) -> Result<Vec<String>, String> {
+    db.list_recent_folders().map_err(|e| e.to_string())
+}
+
+/// Removes one folder from the "Open Recent" list without touching any session open in it.
+pub fn remove_recent_folder(db: &Db, path: &str) -> Result<(), String> {
+    db.remove_recent_folder(path).map_err(|e| e.to_string())
 }
 
 pub fn rename_session(db: &Db, id: &str, name: &str) -> Result<(), String> {
