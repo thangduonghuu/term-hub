@@ -518,6 +518,9 @@ impl TerminalSession {
 /// One tile's worth of input to `TextPipeline::render_all` — see that method's doc comment for
 /// why every tile must be batched into one call instead of one `render` call per tile.
 pub struct TileRender<'a> {
+    /// Session id — keys `TextPipeline`'s per-tile shaped-`Buffer` cache (see `render_all`'s
+    /// doc comment), so it must be stable across frames for the same tile.
+    pub id: &'a str,
     pub frame: &'a Frame,
     /// Top-left origin of this tile's *text* (already offset past the render margin),
     /// physical pixels.
@@ -532,6 +535,11 @@ pub struct TileRender<'a> {
     pub cell_h: f32,
 }
 
+/// What a tile's shaped `Buffer` in `TextPipeline::buffer_cache` was shaped *from* — if none of
+/// these changed since last frame, the cached `Buffer` is still valid and re-shaping (the
+/// expensive part, see `render_all`) can be skipped for that tile.
+type ShapeKey = (Vec<(String, Option<(u8, u8, u8)>)>, u32, u32, u32);
+
 pub struct TextPipeline {
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -539,6 +547,10 @@ pub struct TextPipeline {
     text_renderer: TextRenderer,
     viewport: Viewport,
     selection: SelectionPipeline,
+    /// Per-tile (keyed by session id) shaped-text cache — see `render_all`'s doc comment on why
+    /// this exists. Entries for tiles no longer on screen are pruned each call so a closed
+    /// session's `Buffer` doesn't linger forever.
+    buffer_cache: std::collections::HashMap<String, (ShapeKey, Buffer)>,
 }
 
 impl TextPipeline {
@@ -558,7 +570,15 @@ impl TextPipeline {
         let text_renderer =
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let selection = SelectionPipeline::new(device, format);
-        Self { font_system, swash_cache, atlas, text_renderer, viewport, selection }
+        Self {
+            font_system,
+            swash_cache,
+            atlas,
+            text_renderer,
+            viewport,
+            selection,
+            buffer_cache: std::collections::HashMap::new(),
+        }
     }
 
     pub fn resize(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
@@ -693,8 +713,28 @@ impl TextPipeline {
         let mut default_attrs = base_attrs.clone();
         default_attrs.color_opt = Some(DEFAULT_FG);
 
-        let mut buffers = Vec::with_capacity(tiles.len());
+        // Drop cached buffers for tiles no longer on screen (closed sessions) so the cache
+        // doesn't grow without bound.
+        let live_ids: std::collections::HashSet<&str> = tiles.iter().map(|t| t.id).collect();
+        self.buffer_cache.retain(|id, _| live_ids.contains(id.as_str()));
+
+        // Re-shaping every tile's text on every call, even for tiles whose content didn't
+        // change since the last frame, was the actual CPU cost behind visible typing lag once
+        // more than one session was tiled: typing (or any output) in *one* tile forced a
+        // redraw, and a redraw re-shaped *all* tiles' text — including ones sitting there
+        // unchanged. Cache the shaped `Buffer` per tile (keyed by session id) and only re-shape
+        // when its content, scale, or the viewport size actually changed.
         for t in tiles {
+            let key: ShapeKey =
+                (t.frame.spans.clone(), scale_factor.to_bits(), viewport_w, viewport_h);
+            let needs_reshape = self
+                .buffer_cache
+                .get(t.id)
+                .map(|(cached_key, _)| cached_key != &key)
+                .unwrap_or(true);
+            if !needs_reshape {
+                continue;
+            }
             let mut buffer = Buffer::new(&mut self.font_system, metrics);
             buffer.set_size(&mut self.font_system, Some(viewport_w as f32), Some(viewport_h as f32));
             let spans: Vec<(&str, Attrs)> = t
@@ -720,14 +760,18 @@ impl TextPipeline {
                 None,
             );
             buffer.shape_until_scroll(&mut self.font_system, false);
-            buffers.push(buffer);
+            self.buffer_cache.insert(t.id.to_string(), (key, buffer));
         }
 
         let text_areas: Vec<TextArea> = tiles
             .iter()
-            .zip(buffers.iter())
-            .map(|(t, buffer)| {
+            .map(|t| {
                 let (cl, ct, cr, cb) = t.clip;
+                let buffer = &self
+                    .buffer_cache
+                    .get(t.id)
+                    .expect("just shaped or already cached above")
+                    .1;
                 TextArea {
                     buffer,
                     left: t.left,
