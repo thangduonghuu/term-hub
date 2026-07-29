@@ -8,7 +8,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)](LICENSE) [![Node](https://img.shields.io/badge/node-18%2B-lightgrey?style=flat-square)](https://nodejs.org) [![Rust](https://img.shields.io/badge/rust-stable-lightgrey?style=flat-square)](https://www.rust-lang.org) [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square)](#platform-support)
 
-[Roadmap](../terminal-manager-prompt.md) · [Features](#features) · [Getting Started](#getting-started)
+[Features](#features) · [Installation](#installation) · [Uninstalling](#uninstalling) · [Building from Source](#building-from-source)
 
 </div>
 
@@ -55,10 +55,24 @@ cloneable file handle the way a Unix fd has), which this app's I/O-sharing model
 support yet. Keyboard/IME input *has* a real implementation for non-macOS (winit's own
 `KeyboardInput`/`Ime` handling, verified via cross-compilation), but it can't be runtime-tested
 until the PTY layer is fixed — no Windows machine has actually run this app since the engine
-rewrite. Linux was never in scope (see the [roadmap](../terminal-manager-prompt.md)'s Platform
-Scope). Details in the roadmap doc.
+rewrite. Linux was never in scope.
 
-## Getting Started
+## Installation
+
+TermHub currently supports **macOS only** (see [Platform Support](#platform-support)).
+
+### Download a prebuilt build
+
+1. Grab the latest `.dmg` from the [Releases page](https://github.com/thangduonghuu/term-hub/releases).
+2. Open the `.dmg` and drag **TermHub.app** into `/Applications`.
+3. TermHub isn't code-signed, so Gatekeeper blocks it on the first launch. Right-click
+   **TermHub.app** → **Open** (instead of double-clicking) and confirm — or allow it afterwards
+   via **System Settings → Privacy & Security**. This is only needed once.
+
+If no release is available yet, or you want the latest unreleased changes, build from source
+instead (below).
+
+## Building from Source
 
 ### Prerequisites
 
@@ -73,45 +87,55 @@ npm install
 npm run tauri dev
 ```
 
-## Building & Releasing
+### Release build
 
 ```sh
 npm run tauri build
 ```
 
-Produces a release build and platform installers under `src-tauri/target/release/bundle/`.
+Produces a release build and installer under `src-tauri/target/release/bundle/`. The app bundle
+lands at `src-tauri/target/release/bundle/macos/TermHub.app` — drag it into `/Applications` (or
+`cp -R` it there) to install it, same as the prebuilt download above (including the same
+one-time Gatekeeper step, since self-built binaries aren't signed either).
+
+Tauri also wraps the bundle into a `.dmg` under `bundle/dmg/`. This step shells out to
+`hdiutil`/Finder scripting and can fail in sandboxed or headless environments (CI, some
+automation shells) with `error running bundle_dmg.sh` — that's just the installer-image step;
+`TermHub.app` itself still builds successfully and works fine used directly. A common cause is
+macOS blocking the build from sending Apple events to Finder
+(`Not authorized to send Apple events to Finder. (-1743)`); grant it under **System Settings →
+Privacy & Security → Automation** (enable Finder for the terminal app running the build), then
+re-run `npm run tauri build`.
 
 <details>
-<summary><strong>macOS</strong></summary>
+<summary><strong>Windows (not yet buildable)</strong></summary>
 
-- The app bundle lands at `src-tauri/target/release/bundle/macos/TermHub.app` — drag it into
-  `/Applications` (or `cp -R` it there) to install it like any other Mac app.
-- Tauri also wraps the bundle into a `.dmg` under `bundle/dmg/`. This step shells out to
-  `hdiutil`/Finder scripting and can fail in sandboxed or headless environments (CI, some
-  automation shells) with `error running bundle_dmg.sh` — that's just the installer-image step;
-  `TermHub.app` itself still builds successfully and works fine used directly.
-- The app isn't code-signed, so Gatekeeper will refuse to open it on first launch. Right-click →
-  **Open** (instead of double-clicking) and confirm, or allow it via **System Settings → Privacy
-  & Security**.
+`cargo check --target x86_64-pc-windows-gnu` currently fails in `terminal.rs` (the PTY layer is
+Unix-only) — see [Platform Support](#platform-support) for the exact gap. Once that's fixed, the
+process will be: build on a Windows machine (Tauri doesn't cross-compile a Windows installer from
+macOS/Linux) with an MSVC toolchain and the Tauri Windows prerequisites installed, using the same
+`npm run tauri build` command, producing an `.msi` and/or `.exe` (NSIS) installer under
+`bundle/msi/` and `bundle/nsis/`. Unsigned installers will trip Windows SmartScreen on first run
+("Windows protected your PC") — click **More info → Run anyway**.
 
 </details>
 
-<details>
-<summary><strong>Windows</strong></summary>
+## Uninstalling
 
-**Doesn't build yet** — `cargo check --target x86_64-pc-windows-gnu` fails in `terminal.rs`
-(the PTY layer is Unix-only). See [Platform support](#platform-support) and the
-[roadmap](../terminal-manager-prompt.md) for the exact gap. The rest of this section describes
-the intended process once that's fixed.
+1. Quit TermHub if it's running.
+2. Remove the app:
 
-- Build on a Windows machine (Tauri doesn't cross-compile a Windows installer from macOS/Linux)
-  — same `npm run tauri build` command, with an MSVC toolchain and the Tauri Windows
-  prerequisites installed.
-- Produces an `.msi` and/or `.exe` (NSIS) installer under `bundle/msi/` and `bundle/nsis/`.
-- Unsigned installers will trip Windows SmartScreen on first run ("Windows protected your PC")
-  — click **More info → Run anyway**.
+   ```sh
+   rm -rf /Applications/TermHub.app
+   ```
 
-</details>
+   (or drag it from `/Applications` to the Trash in Finder).
+3. Optional — also remove saved data (sessions, settings, and usage history are stored in a local
+   SQLite database, untouched by step 2):
+
+   ```sh
+   rm -rf ~/Library/Application\ Support/com.termhub.app
+   ```
 
 ## License
 
