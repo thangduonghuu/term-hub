@@ -468,8 +468,10 @@ impl ApplicationHandler<AppEvent> for App {
         let exited_for_ipc = self.exited.clone();
         let webview = WebViewBuilder::new()
             .with_bounds(rect)
-            .with_transparent(true)
-            .with_url(dev_server_url())
+            .with_custom_protocol("app".into(), |_id, request| {
+                asset_response(request.uri().path())
+            })
+            .with_url(frontend_url())
             .with_ipc_handler(move |msg| {
                 ipc::spawn_dispatch(
                     db_for_ipc.clone(),
@@ -1147,8 +1149,49 @@ fn save_clipboard_image(img: &arboard::ImageData) -> Option<String> {
     Some(format!("'{}'", path.display()))
 }
 
-fn dev_server_url() -> &'static str {
-    "http://localhost:1420"
+/// The built frontend (`npm run build`'s `dist/`), embedded into the binary at compile time so
+/// a release build is actually standalone. Without this, the release `.app` had no frontend of
+/// its own at all: `frontendDist` in `tauri.conf.json` is a no-op here since this app never
+/// calls `tauri::Builder`/`generate_context!()` — the Tauri CLI still *builds* `dist/` via
+/// `beforeBuildCommand`, but nothing ever copied it into the bundle or loaded it, so the
+/// shipped `.app` only ever rendered anything if a `npm run dev` vite server happened to still
+/// be running on `localhost:1420` in the background. Confirmed by inspecting a built bundle's
+/// `Contents/Resources` — just the icon, no `dist/` in sight.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../dist"]
+struct Assets;
+
+/// Custom-protocol handler serving `Assets` — registered under the `"app"` scheme below.
+/// Request paths are root-absolute (`/assets/index-XXXX.js`, per Vite's default `base: "/"`),
+/// matching how `rust-embed` keys files relative to `dist/`. The empty/`/` path means the
+/// initial navigation to `app://localhost/` itself, so it maps to `index.html`.
+fn asset_response(path: &str) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
+    let path = path.trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    match Assets::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            wry::http::Response::builder()
+                .header("Content-Type", mime.as_ref())
+                .body(file.data)
+                .unwrap()
+        }
+        None => wry::http::Response::builder()
+            .status(404)
+            .body(std::borrow::Cow::from(Vec::new()))
+            .unwrap(),
+    }
+}
+
+/// `npm run tauri dev`'s vite server in debug builds (unchanged — `beforeDevCommand` starts it,
+/// same as always); the embedded `Assets` above via the custom `"app"` protocol in release
+/// builds, so the shipped `.app` no longer depends on a dev server being alive somewhere.
+fn frontend_url() -> String {
+    if cfg!(debug_assertions) {
+        "http://localhost:1420".to_string()
+    } else {
+        "app://localhost/".to_string()
+    }
 }
 
 fn app_data_dir() -> std::path::PathBuf {

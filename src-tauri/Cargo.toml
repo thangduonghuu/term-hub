@@ -26,7 +26,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 winit = "0.30"
-wry = { version = "0.55", features = ["transparent"] }
+wry = { version = "0.55", features = ["protocol"] }
+rust-embed = "8"
+mime_guess = "2"
 wgpu = "25"
 pollster = "0.4"
 alacritty_terminal = "0.26"
