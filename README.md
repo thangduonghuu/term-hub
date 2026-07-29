@@ -8,7 +8,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)](LICENSE) [![Node](https://img.shields.io/badge/node-18%2B-lightgrey?style=flat-square)](https://nodejs.org) [![Rust](https://img.shields.io/badge/rust-stable-lightgrey?style=flat-square)](https://www.rust-lang.org) [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square)](#platform-support)
 
-[Features](#features) · [Installation](#installation) · [Uninstalling](#uninstalling) · [Building from Source](#building-from-source)
+[Features](#features) · [Keyboard Shortcuts](#keyboard-shortcuts) · [Installation](#installation) · [Uninstalling](#uninstalling) · [Building from Source](#building-from-source)
 
 </div>
 
@@ -33,13 +33,28 @@ see and type into several sessions at a glance instead of alt-tabbing between wi
 |---|---|
 | **Tiled terminal grid** | Every open session renders live, laid out in an even NxM grid that reflows as sessions open/close. Click a pane to focus it — focused panes get a highlighted border and live cursor. Scrollback, mouse selection, and copy/paste (including pasting a clipboard image as a temp-file path) are all native, no browser text layer involved. |
 | **Session management** | New / close / rename / duplicate from the sidebar. Sessions are grouped by working directory with a per-group "new session here" shortcut, plus a filter box to search by name or path. |
-| **Keyboard shortcuts** | Cmd+T new session, Cmd+W close the active one, Cmd+Shift+]/Cmd+Shift+[ to cycle next/previous — matching iTerm2's bindings. macOS only for now. |
+| **Open Recent** | A sidebar button (and Ctrl+R) opens a VSCode-style "Open Recent" quick-pick: type to filter every folder you've ever opened a session in, arrow keys + Enter (or click) to open it as a new session, and a "Browse for folder…" row at the bottom for anything not in the list yet (native OS picker). Hover/select a row to reveal an ✕ that removes it from the list without closing any session still open there. See [Keyboard Shortcuts](#keyboard-shortcuts) for the Ctrl+R tradeoff. |
 | **Activity indicator** | A dot next to each session lights up while its shell has produced output recently, so you can tell which agents are still working without switching panes. |
 | **Exited-session recovery** | If a shell process dies (`exit`, a crash, `kill`), its pane shows a dim red border instead of freezing silently, and the sidebar dot turns red. Click the pane or just start typing to respawn a fresh shell in the same directory — no need to close and reopen the session. |
-| **Session persistence** | Name, working directory, and shell are stored in SQLite; on launch, TermHub reopens every saved session as its own tile (staggered slightly to avoid startup-shell races). Reconnecting to the original process is out of scope — each reopened session starts a fresh shell in the same directory. |
+| **Session persistence** | Name, working directory, and shell are stored in SQLite. On launch, if any sessions were saved, TermHub asks "Reopen all previous sessions?" — Yes reopens every one as its own tile (staggered slightly to avoid startup-shell races); No discards the saved list outright (same as closing every session), though those folders stay in the Open Recent picker. Reconnecting to the original process is out of scope either way — each reopened session starts a fresh shell in the same directory. |
 | **Open in an external terminal** | A per-session button pops that session's folder open in a real, separate terminal app (iTerm2, Warp, Windows Terminal, etc. — auto-detected from what's installed), alongside the built-in terminal. Pick a preferred app in Settings, or it falls back to whatever's detected. |
 | **Settings** | A gear icon in the sidebar opens a settings panel: override the default shell new sessions spawn (e.g. `/bin/zsh`, `fish`) — leave blank to use `$SHELL`/`COMSPEC`, only affects sessions created after saving — and pick a preferred external terminal app. |
 | **Token usage dashboard** | Per-agent usage (Claude Code, Codex, Gemini, Aider) with today / last-7-days / all-time totals, a by-session breakdown, and a 14-day chart — tallied by tailing each agent's own local logs/transcripts, no extra instrumentation required. Includes an optional API-key-based check against Anthropic's per-key rate-limit headers. |
+
+## Keyboard Shortcuts
+
+Matches iTerm2's own bindings apart from Ctrl+R. macOS only for now.
+
+| Shortcut | Action |
+|---|---|
+| `Cmd+T` | New session |
+| `Cmd+W` | Close the active session |
+| `Cmd+Shift+]` / `Cmd+Shift+[` | Cycle to the next / previous session |
+| `Ctrl+R` | Open the [Open Recent](#features) folder picker |
+
+**Note on Ctrl+R:** it's normally the shell's reverse-i-search. Binding it here means
+reverse-i-search no longer reaches the shell in any session — a deliberate tradeoff (chosen over
+the conflict-free `Cmd+O`), not a bug.
 
 ## Platform Support
 

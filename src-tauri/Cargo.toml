@@ -26,7 +26,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 winit = "0.30"
-wry = "0.55"
+wry = { version = "0.55", features = ["transparent"] }
 wgpu = "25"
 pollster = "0.4"
 alacritty_terminal = "0.26"
@@ -36,6 +36,7 @@ raw-window-handle = "0.6"
 arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"

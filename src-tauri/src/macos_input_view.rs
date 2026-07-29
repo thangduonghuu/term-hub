@@ -120,7 +120,7 @@ declare_class!(
                     }
                 } else if flags.contains(NSEventModifierFlags::NSEventModifierFlagControl) {
                     // Ctrl+letter (Ctrl+C to interrupt, Ctrl+D for EOF, Ctrl+Z to suspend,
-                    // Ctrl+L to clear, Ctrl+U/R/A/E for shell readline editing, etc.) must
+                    // Ctrl+L to clear, Ctrl+U/A/E for shell readline editing, etc.) must
                     // reach the pty as the raw C0 control byte the shell expects —
                     // `interpretKeyEvents:` below is the wrong path for these even though it
                     // *does* process Ctrl-combos (unlike Cmd-combos above): AppKit's default
@@ -131,7 +131,21 @@ declare_class!(
                     // something we'd forward — breaking the shell's own (also emacs-style)
                     // readline shortcuts. Bypass that table entirely and send the byte
                     // ourselves.
+                    //
+                    // Ctrl+R is the one deliberate exception: it's bound app-wide to Open
+                    // Folder (see README/goal-doc — chosen over Cmd+O per explicit user
+                    // preference), so it no longer reaches the pty at all. Readline's
+                    // reverse-i-search (what Ctrl+R used to do here, same bucket as Ctrl+U/A/E
+                    // above) is unreachable in every session as a result — a known, accepted
+                    // regression, not an oversight.
                     if let Some(chars) = event.charactersIgnoringModifiers() {
+                        if chars.to_string() == "r" {
+                            let _ = self
+                                .ivars()
+                                .proxy
+                                .send_event(AppEvent::KeyboardShortcut("open-folder"));
+                            return;
+                        }
                         if let Some(c) = chars.to_string().chars().next() {
                             if let Some(byte) = crate::control_byte(c) {
                                 let _ = self.ivars().proxy.send_event(AppEvent::KeyByte(byte));

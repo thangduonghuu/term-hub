@@ -468,6 +468,7 @@ impl ApplicationHandler<AppEvent> for App {
         let exited_for_ipc = self.exited.clone();
         let webview = WebViewBuilder::new()
             .with_bounds(rect)
+            .with_transparent(true)
             .with_url(dev_server_url())
             .with_ipc_handler(move |msg| {
                 ipc::spawn_dispatch(
@@ -1161,6 +1162,27 @@ pub fn run() {
     let db = Arc::new(
         Db::open(&app_data_dir().join("termhub.sqlite")).expect("failed to open database"),
     );
+
+    // Ask before silently respawning every saved session on launch — skipped entirely when
+    // there's nothing saved (fresh install, nothing to ask about). This runs before the window/
+    // event loop exist at all, so a plain blocking native dialog is enough; the actual
+    // reconnect-on-launch logic (`App`'s window-creation handler) reads sessions straight from
+    // `db` afterward, so clearing it here is sufficient to skip reconnecting — no separate
+    // "declined" flag needed anywhere else. Declining discards the saved list outright (same as
+    // closing every session individually), not just skipping this one launch, so there's
+    // nothing stale left to ask about next time either. `recent_folders` is untouched either
+    // way (see `clear_sessions`'s doc comment) — those folders stay reachable from Open Recent.
+    if !db.list_sessions().unwrap_or_default().is_empty() {
+        let reopen = rfd::MessageDialog::new()
+            .set_title("TermHub")
+            .set_description("Reopen all previous sessions?")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if reopen == rfd::MessageDialogResult::No {
+            db.clear_sessions().expect("failed to clear saved sessions");
+        }
+    }
+
     usage::spawn_tracker(db.clone());
 
     let mut builder = EventLoop::<AppEvent>::with_user_event();

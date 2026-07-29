@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { BarChart3, Copy, ExternalLink, FolderPlus, Plus, Settings, X } from "lucide-react";
+import { BarChart3, Copy, ExternalLink, FolderOpen, FolderPlus, Plus, Settings, X } from "lucide-react";
 import type { SessionInfo } from "../lib/api";
 import { folderName } from "../lib/path";
 
@@ -14,6 +14,7 @@ interface Props {
   onSelect: (id: string) => void;
   onDuplicate: (session: SessionInfo) => void;
   onNewInFolder: (cwd: string) => void;
+  onOpenFolder: () => void;
   onOpenExternal: (session: SessionInfo) => void;
   onOpenUsage: () => void;
   onOpenSettings: () => void;
@@ -32,6 +33,7 @@ export function Sidebar({
   onSelect,
   onDuplicate,
   onNewInFolder,
+  onOpenFolder,
   onOpenExternal,
   onOpenUsage,
   onOpenSettings,
@@ -91,6 +93,9 @@ export function Sidebar({
           </button>
           <button className="usage-toggle-btn" onClick={onOpenSettings} title="Settings">
             <Settings size={15} />
+          </button>
+          <button className="new-session-btn" onClick={onOpenFolder} title="Open folder… (Ctrl+R)">
+            <FolderOpen size={15} />
           </button>
           <button className="new-session-btn" onClick={onNew} title="New session">
             <Plus size={16} />
