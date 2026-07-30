@@ -37,6 +37,7 @@ arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
+rust-embed = "8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"

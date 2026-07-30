@@ -27,6 +27,35 @@ use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
 
+// The sidebar webview served `dev_server_url()` unconditionally in every build, dev and
+// release alike — fine under `tauri dev` (Vite is actually listening on :1420), but a packaged
+// `.app` launched standalone has no dev server, so the webview silently failed to load and the
+// sidebar rendered blank (no visible navigation strip, though `SIDEBAR_WIDTH` was still being
+// reserved in the tile layout). Release builds instead serve the `npm run build` output
+// (`../dist`, matching `frontendDist` in tauri.conf.json) embedded directly in the binary via a
+// custom `termhub://` protocol, the same approach Tauri's own asset protocol uses.
+#[cfg(not(debug_assertions))]
+mod assets {
+    #[derive(rust_embed::RustEmbed)]
+    #[folder = "../dist"]
+    pub struct Assets;
+
+    pub fn mime_of(path: &str) -> &'static str {
+        match path.rsplit('.').next().unwrap_or("") {
+            "html" => "text/html",
+            "js" | "mjs" => "text/javascript",
+            "css" => "text/css",
+            "json" => "application/json",
+            "svg" => "image/svg+xml",
+            "png" => "image/png",
+            "ico" => "image/x-icon",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
 /// Session id -> unix-epoch milliseconds of its last pty output — shared (not just an `App`
 /// field) because the sidebar's `get_activity` IPC command (Phase 4's activity dot) reads it
 /// from a background dispatch thread (`ipc.rs`), while `App::user_event` writes it on the main
@@ -58,7 +87,7 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 // — heavy shell configs (Powerlevel10k's instant-prompt, rbenv/nvm init, etc.) can race with
 // themselves when several copies start at the exact same instant; spreading the spawns out
 // avoids that without meaningfully slowing down how fast the app feels ready to use.
-const RECONNECT_STAGGER: Duration = Duration::from_millis(700);
+const RECONNECT_STAGGER: Duration = Duration::from_millis(1500);
 // Must match the `left`/`top` origin used in `RedrawRequested`'s call to `gpu.text.render` for
 // each tile — duplicated here (rather than computed once and stored) because it's cheap and
 // keeps the margin tweakable in one place without a stale-cache field to remember to update.
@@ -466,10 +495,27 @@ impl ApplicationHandler<AppEvent> for App {
         let proxy_for_ipc = self.proxy.clone();
         let activity_for_ipc = self.activity.clone();
         let exited_for_ipc = self.exited.clone();
-        let webview = WebViewBuilder::new()
-            .with_bounds(rect)
-            .with_transparent(true)
-            .with_url(dev_server_url())
+        let webview = WebViewBuilder::new().with_bounds(rect).with_transparent(true);
+        #[cfg(debug_assertions)]
+        let webview = webview.with_url(dev_server_url());
+        #[cfg(not(debug_assertions))]
+        let webview = webview
+            .with_custom_protocol("termhub".into(), |_id, request| {
+                let path = request.uri().path().trim_start_matches('/');
+                let path = if path.is_empty() { "index.html" } else { path };
+                match assets::Assets::get(path) {
+                    Some(file) => wry::http::Response::builder()
+                        .header("Content-Type", assets::mime_of(path))
+                        .body(std::borrow::Cow::from(file.data.into_owned()))
+                        .unwrap(),
+                    None => wry::http::Response::builder()
+                        .status(404)
+                        .body(std::borrow::Cow::from(Vec::new()))
+                        .unwrap(),
+                }
+            })
+            .with_url("termhub://localhost/index.html");
+        let webview = webview
             .with_ipc_handler(move |msg| {
                 ipc::spawn_dispatch(
                     db_for_ipc.clone(),
@@ -1147,6 +1193,7 @@ fn save_clipboard_image(img: &arboard::ImageData) -> Option<String> {
     Some(format!("'{}'", path.display()))
 }
 
+#[cfg(debug_assertions)]
 fn dev_server_url() -> &'static str {
     "http://localhost:1420"
 }
