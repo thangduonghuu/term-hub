@@ -12,7 +12,13 @@ body,
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: #e6e6e6;
-  background: #181818;
+  /* Transparent, not `#181818` — the sidebar webview is now natively transparent (see
+     `lib.rs`'s `with_transparent(true)`) and gets widened to cover the whole window while a
+     modal (Usage/Settings/QuickOpen) is open. An opaque body here would paint over the native
+     terminal tiles for the entire time it's widened, making every open session look like it
+     vanished. `.sidebar` supplies its own opaque background for the normal narrow view, and
+     each modal panel supplies its own — nothing actually needs body to be opaque. */
+  background: transparent;
 }
 
 .app-shell {
@@ -613,6 +619,123 @@ body {
 .claude-limits-label {
   color: #9a9a9a;
   text-transform: capitalize;
+}
+
+.quickopen-overlay {
+  position: fixed;
+  inset: 0;
+  /* No dark scrim, unlike `.usage-overlay` — Ctrl+R is meant to be a quick, non-blocking
+     picker (VSCode's Cmd+R), so the terminal sessions behind it should stay fully visible, not
+     get dimmed out like the full-page Usage/Settings modals do. */
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 14vh;
+  z-index: 10;
+}
+
+.quickopen-panel {
+  width: min(560px, 92vw);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: #1a1a1a;
+  border: 1px solid #2e2e2e;
+  border-radius: 10px;
+  overflow: hidden;
+  /* Sits directly over visible terminal content now (no dimming backdrop), so it needs its own
+     contrast/depth instead of relying on a dark scrim behind it. */
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+}
+
+.quickopen-input {
+  background: #101010;
+  color: #e6e6e6;
+  border: none;
+  border-bottom: 1px solid #2e2e2e;
+  border-radius: 10px 10px 0 0;
+  padding: 12px 14px;
+  font-size: 14px;
+  outline: none;
+}
+
+.quickopen-input:focus {
+  box-shadow: inset 0 0 0 2px #d8a657;
+}
+
+.quickopen-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  overflow-y: auto;
+}
+
+.quickopen-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.quickopen-item.selected {
+  background: #34424f;
+}
+
+.quickopen-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.quickopen-path {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  color: #9a9a9a;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.quickopen-remove-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: #9a9a9a;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.quickopen-item.selected .quickopen-remove-btn,
+.quickopen-item:hover .quickopen-remove-btn {
+  display: inline-flex;
+}
+
+.quickopen-remove-btn:hover {
+  color: #f85149;
+}
+
+.quickopen-browse {
+  color: #9a9a9a;
+  border-top: 1px solid #2e2e2e;
+  margin-top: 4px;
+  padding-top: 10px;
+}
+
+.quickopen-empty {
+  padding: 14px 10px;
+  color: #7a7a7a;
+  font-size: 13px;
+  text-align: center;
 }
 
 .claude-limits-value {

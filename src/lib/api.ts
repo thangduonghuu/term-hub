@@ -54,6 +54,12 @@ export const api = {
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
   getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
+  // Native OS folder-browse dialog — null if the user cancels. Used by the "Browse…" row in the
+  // Open Recent picker, for folders that aren't in the MRU list yet.
+  pickFolder: () => invoke<string | null>("pick_folder"),
+  // Folders previously opened as a session, most-recent first (VSCode's "Open Recent").
+  listRecentFolders: () => invoke<string[]>("list_recent_folders"),
+  removeRecentFolder: (path: string) => invoke<void>("remove_recent_folder", { path }),
   // Widens/narrows the sidebar webview to full-window while any full-screen modal (usage
   // dashboard, settings) is open/closed — their centered-overlay CSS only has as much viewport
   // to work with as the webview itself.

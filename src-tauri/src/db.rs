@@ -33,7 +33,25 @@ impl Db {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recent_folders (
+                path TEXT PRIMARY KEY,
+                last_opened_at INTEGER NOT NULL
             );",
+        )?;
+        // Backfill from whatever sessions already exist (e.g. every session predating the
+        // `recent_folders` table, or a session restored at startup — `App::new`'s reconnect
+        // path reads `sessions` directly and never calls `create_session`, so it never touches
+        // this table on its own). Otherwise the Open Recent picker looks empty on first use
+        // even with sessions already open, and its only actionable row is "Browse for
+        // folder…" — which just opens a native picker, easily mistaken for the feature being
+        // broken. Idempotent upsert, safe to run on every open.
+        conn.execute(
+            "INSERT INTO recent_folders (path, last_opened_at)
+             SELECT cwd, MAX(created_at) FROM sessions GROUP BY cwd
+             ON CONFLICT(path) DO UPDATE SET
+                last_opened_at = MAX(last_opened_at, excluded.last_opened_at)",
+            [],
         )?;
         Ok(Db(Mutex::new(conn)))
     }
@@ -59,6 +77,16 @@ impl Db {
     pub fn delete_session(&self, id: &str) -> rusqlite::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Discards every saved session in one shot — used when the user declines the "reopen
+    /// previous sessions?" prompt on launch (`run()`), so there's nothing stale left to ask
+    /// about again next time. Doesn't touch `recent_folders`: those folders should still be
+    /// reachable from the Open Recent picker even if their sessions were declined.
+    pub fn clear_sessions(&self) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute("DELETE FROM sessions", [])?;
         Ok(())
     }
 
@@ -127,6 +155,48 @@ impl Db {
             |row| row.get(0),
         )
         .optional()
+    }
+
+    /// Caps the "Open Recent" MRU list at this many entries — old ones fall off as new folders
+    /// get opened, same idea as VSCode's own recent-folders list.
+    const RECENT_FOLDERS_LIMIT: i64 = 30;
+
+    /// Records `path` as just-opened for the "Open Recent" picker (`create_session`'s caller).
+    /// Independent of the `sessions` table — unlike a session row, this survives `close_session`,
+    /// since the whole point is remembering folders you've opened even after you're done with
+    /// them. Re-opening an already-listed folder just bumps its timestamp (upsert), not a dupe.
+    pub fn touch_recent_folder(&self, path: &str, timestamp: i64) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO recent_folders (path, last_opened_at) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET last_opened_at = excluded.last_opened_at",
+            params![path, timestamp],
+        )?;
+        conn.execute(
+            "DELETE FROM recent_folders WHERE path NOT IN (
+                SELECT path FROM recent_folders ORDER BY last_opened_at DESC LIMIT ?1
+            )",
+            params![Self::RECENT_FOLDERS_LIMIT],
+        )?;
+        Ok(())
+    }
+
+    /// Most-recently-opened folders first, for the "Open Recent" picker.
+    pub fn list_recent_folders(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT path FROM recent_folders ORDER BY last_opened_at DESC")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Removes one entry from the "Open Recent" list (the picker's per-row X) — never touches
+    /// the `sessions` table, so it has no effect on any session that happens to still be open in
+    /// that folder.
+    pub fn remove_recent_folder(&self, path: &str) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute("DELETE FROM recent_folders WHERE path = ?1", params![path])?;
+        Ok(())
     }
 
     pub fn insert_usage_event(

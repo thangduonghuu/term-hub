@@ -79,6 +79,12 @@ fn handle(
 
     match cmd {
         "get_default_cwd" => to_value(commands::get_default_cwd()),
+        "pick_folder" => to_value(commands::pick_folder()),
+        "list_recent_folders" => commands::list_recent_folders(db).and_then(to_value),
+        "remove_recent_folder" => {
+            let path: String = arg(&args, "path").ok_or("missing path")?;
+            commands::remove_recent_folder(db, &path).and_then(to_value)
+        }
         "list_terminal_apps" => to_value(commands::list_terminal_apps()),
         "get_preferred_terminal_app" => commands::get_preferred_terminal_app(db).and_then(to_value),
         "set_preferred_terminal_app" => {
