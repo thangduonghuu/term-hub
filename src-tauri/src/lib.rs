@@ -1024,9 +1024,10 @@ impl ApplicationHandler<AppEvent> for App {
                             let x = tx * scale + TEXT_LEFT_MARGIN * scale + col as f64 * cell_w_px;
                             let y = ty * scale + TEXT_TOP_MARGIN * scale + row as f64 * cell_h_px;
                             if let Some(rect) =
-                                macos::to_screen_rect(window, x, y, cell_w_px, cell_h_px)
+                                macos::to_screen_rect(window, scale, x, y, cell_w_px, cell_h_px)
                             {
                                 view.set_caret_rect(rect);
+                                macos::send_cursor_position(rect);
                             }
                         }
                     }

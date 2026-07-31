@@ -251,10 +251,10 @@ declare_class!(
                 let view: &NSView = self.as_ref();
                 view.window().map(|w| Retained::cast(w))
             } else if attribute.isEqualToString(NSAccessibilityPositionAttribute) {
-                let rect = self.ivars().caret_rect.get();
+                let rect = self.ax_screen_rect();
                 Some(Retained::cast(NSValue::valueWithPoint(rect.origin)))
             } else if attribute.isEqualToString(NSAccessibilitySizeAttribute) {
-                let rect = self.ivars().caret_rect.get();
+                let rect = self.ax_screen_rect();
                 Some(Retained::cast(NSValue::valueWithSize(rect.size)))
             } else {
                 None
@@ -268,10 +268,8 @@ declare_class!(
             attribute: &NSString,
             _parameter: &AnyObject,
         ) -> Option<Retained<AnyObject>> {
-            let result: Option<Retained<AnyObject>> = if attribute
-                .isEqualToString(NSAccessibilityBoundsForRangeParameterizedAttribute)
-            {
-                let rect = self.ivars().caret_rect.get();
+            let result: Option<Retained<AnyObject>> = if attribute.to_string() == "AXBoundsForRange" {
+                let rect = self.ax_screen_rect();
                 Some(Retained::cast(NSValue::valueWithRect(rect)))
             } else {
                 None
@@ -340,17 +338,29 @@ declare_class!(
         // unnoticed. CJK input methods (Japanese, Chinese, Korean) rely on exactly this call to
         // position their candidate window at the actual text caret; with it zeroed, the popup
         // renders in the wrong place (typically the screen corner) instead of next to the
-        // cursor. `caret_rect` already tracks the real on-screen caret position (kept current
-        // by `lib.rs` on every redraw, originally wired up only for `NSAccessibility` queries —
-        // see `set_caret_rect`'s doc comment) — reuse it here instead of a real per-character
-        // lookup, which a terminal has no document model to support anyway.
+        // cursor.
+        //
+        // Confirmed (via tracing every stage of the pipeline) that this method's return value —
+        // not `accessibilityAttributeValue:forParameter:`'s, even though that one is also
+        // called and computes the right answer — is what actually reaches `AXUIElementCopy-
+        // ParameterizedAttributeValue` for `kAXBoundsForRangeParameterizedAttribute`: macOS
+        // apparently prefers a view's `NSTextInputClient` answer over its classic
+        // `NSAccessibility` one for text-caret bounds queries when a view implements both,
+        // regardless of what the classic protocol method itself returns. So this needs to
+        // return the same AX-flipped (top-left/y-down) rect `ax_screen_rect` computes, not the
+        // raw AppKit-native (bottom-left/y-up) `caret_rect` — despite `firstRectForCharacterRange:`
+        // conventionally wanting AppKit-native "screen coordinates" for real IME popups. Safe to
+        // make this trade here: Vietnamese Telex (the only IME actually exercised so far) never
+        // calls this at all, so there's no verified-working real-IME behavior to regress —
+        // whereas the overlay positioning this rect drives is this file's entire reason for
+        // existing.
         #[method(firstRectForCharacterRange:actualRange:)]
         unsafe fn firstRectForCharacterRange_actualRange(
             &self,
             _range: NSRange,
             _actual_range: NSRangePointer,
         ) -> NSRect {
-            self.ivars().caret_rect.get()
+            self.ax_screen_rect()
         }
 
         #[method(characterIndexForPoint:)]
@@ -429,5 +439,42 @@ impl TerminalInputView {
     /// anything drawn on screen.
     pub fn set_caret_rect(&self, rect: NSRect) {
         self.ivars().caret_rect.set(rect);
+    }
+
+    /// `caret_rect` in the coordinate convention `NSAccessibility` clients (`AXUIElementCopy-
+    /// AttributeValue` etc.) actually expect: origin top-left of the *primary* display
+    /// (`NSScreen.screens[0]`, the one with the menu bar), y increasing *downward*. This is a
+    /// real, well-documented quirk, not a guess: it's the one AX API surface that has always
+    /// used a flipped convention relative to every other AppKit screen coordinate — apps that
+    /// hand-implement the classic `NSAccessibility` protocol (as this view does, rather than
+    /// getting it for free from a standard control) are responsible for doing that flip
+    /// themselves; AppKit doesn't do it automatically just because you answered with a plain
+    /// `NSValue`. Missing this exact flip was confirmed as a real, concrete bug: it left the X
+    /// coordinate (unaffected by a Y-only flip) correctly tracking the live cursor column, while
+    /// the Y coordinate came out mirrored — an AX client asking "how far down is the cursor"
+    /// got back "how far up" instead, placing anything positioned against it (e.g. a CLI tool's
+    /// suggestion popup — see the accessibility methods' doc comment) far from the actual
+    /// on-screen row. `firstRectForCharacterRange:` deliberately does NOT use this — that's an
+    /// `NSTextInputClient` method, which (like the rest of AppKit) wants the normal
+    /// bottom-left/y-up convention `caret_rect` is already stored in.
+    fn ax_screen_rect(&self) -> NSRect {
+        let rect = self.ivars().caret_rect.get();
+        // Reads a value `crate::macos::to_screen_rect` refreshes on every redraw — see that
+        // static's own doc comment for why: calling `NSScreen::screens` directly from *here*
+        // consistently failed (confirmed by tracing both a panicking and a `new_unchecked`
+        // `MainThreadMarker`, neither fixed it), because whatever thread the AX server actually
+        // delivers this callback on isn't the one `+[NSScreen screens]` itself requires, and
+        // that failure happens below Rust — not something a Rust-side panic guard can catch.
+        // Reading a plain atomic here needs no thread affinity at all.
+        let screen_height = f64::from_bits(
+            crate::macos::PRIMARY_SCREEN_HEIGHT_BITS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        NSRect {
+            origin: NSPoint {
+                x: rect.origin.x,
+                y: screen_height - rect.origin.y - rect.size.height,
+            },
+            size: rect.size,
+        }
     }
 }
