@@ -621,8 +621,8 @@ body {
   /* Same dark scrim as `.usage-overlay` — a transparent-webview version of this (so terminal
      sessions stayed visible behind it) turned out to break rendering of the sidebar webview
      itself (blank window), a much worse regression than the terminals being temporarily
-     covered like Usage/Settings already do. Sessions still reappear correctly once this
-     closes, same as those two. */
+     covered like Usage/Settings already do. Reverted; sessions still reappear correctly once
+     this closes, same as those two. */
   background: rgba(0, 0, 0, 0.55);
   display: flex;
   align-items: flex-start;
