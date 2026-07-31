@@ -247,6 +247,17 @@ impl TerminalSession {
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
         env.insert("TERM_PROGRAM".to_string(), "iTerm.app".to_string());
+        // `TERM_PROGRAM` alone isn't enough: kiro-cli-term (its inline-suggestion pty wrapper)
+        // also reads `ITERM_SESSION_ID` — real iTerm2 sets one per-pane (`w<N>t<N>p<N>:<UUID>`)
+        // and tools in this lineage (fig/figterm-derived) key their per-pane suggestion IPC
+        // socket off it. Every real iTerm2 pane has this set; a from-scratch TermHub session
+        // never did, which reads as "not really iTerm2" no matter what `TERM_PROGRAM` claims,
+        // and the tool silently no-ops rather than erroring. One synthetic UUID per spawned
+        // session here mirrors what a real pane would already have.
+        env.insert(
+            "ITERM_SESSION_ID".to_string(),
+            format!("w0t0p0:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
+        );
         // `tty::Options.env` only *adds/overrides* vars, it can't remove an inherited one —
         // but setting these to an empty string has the same effect for every shell-script
         // `-z "$VAR"` check that matters here (though *not* necessarily for a compiled

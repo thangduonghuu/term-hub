@@ -27,6 +27,35 @@ use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
 
+// The sidebar webview served `dev_server_url()` unconditionally in every build, dev and
+// release alike — fine under `tauri dev` (Vite is actually listening on :1420), but a packaged
+// `.app` launched standalone has no dev server, so the webview silently failed to load and the
+// sidebar rendered blank (no visible navigation strip, though `SIDEBAR_WIDTH` was still being
+// reserved in the tile layout). Release builds instead serve the `npm run build` output
+// (`../dist`, matching `frontendDist` in tauri.conf.json) embedded directly in the binary via a
+// custom `termhub://` protocol, the same approach Tauri's own asset protocol uses.
+#[cfg(not(debug_assertions))]
+mod assets {
+    #[derive(rust_embed::RustEmbed)]
+    #[folder = "../dist"]
+    pub struct Assets;
+
+    pub fn mime_of(path: &str) -> &'static str {
+        match path.rsplit('.').next().unwrap_or("") {
+            "html" => "text/html",
+            "js" | "mjs" => "text/javascript",
+            "css" => "text/css",
+            "json" => "application/json",
+            "svg" => "image/svg+xml",
+            "png" => "image/png",
+            "ico" => "image/x-icon",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
 /// Session id -> unix-epoch milliseconds of its last pty output — shared (not just an `App`
 /// field) because the sidebar's `get_activity` IPC command (Phase 4's activity dot) reads it
 /// from a background dispatch thread (`ipc.rs`), while `App::user_event` writes it on the main
@@ -58,7 +87,7 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 // — heavy shell configs (Powerlevel10k's instant-prompt, rbenv/nvm init, etc.) can race with
 // themselves when several copies start at the exact same instant; spreading the spawns out
 // avoids that without meaningfully slowing down how fast the app feels ready to use.
-const RECONNECT_STAGGER: Duration = Duration::from_millis(700);
+const RECONNECT_STAGGER: Duration = Duration::from_millis(1500);
 // Must match the `left`/`top` origin used in `RedrawRequested`'s call to `gpu.text.render` for
 // each tile — duplicated here (rather than computed once and stored) because it's cheap and
 // keeps the margin tweakable in one place without a stale-cache field to remember to update.
@@ -466,12 +495,27 @@ impl ApplicationHandler<AppEvent> for App {
         let proxy_for_ipc = self.proxy.clone();
         let activity_for_ipc = self.activity.clone();
         let exited_for_ipc = self.exited.clone();
-        let webview = WebViewBuilder::new()
-            .with_bounds(rect)
-            .with_custom_protocol("app".into(), |_id, request| {
-                asset_response(request.uri().path())
+        let webview = WebViewBuilder::new().with_bounds(rect).with_transparent(true);
+        #[cfg(debug_assertions)]
+        let webview = webview.with_url(dev_server_url());
+        #[cfg(not(debug_assertions))]
+        let webview = webview
+            .with_custom_protocol("termhub".into(), |_id, request| {
+                let path = request.uri().path().trim_start_matches('/');
+                let path = if path.is_empty() { "index.html" } else { path };
+                match assets::Assets::get(path) {
+                    Some(file) => wry::http::Response::builder()
+                        .header("Content-Type", assets::mime_of(path))
+                        .body(std::borrow::Cow::from(file.data.into_owned()))
+                        .unwrap(),
+                    None => wry::http::Response::builder()
+                        .status(404)
+                        .body(std::borrow::Cow::from(Vec::new()))
+                        .unwrap(),
+                }
             })
-            .with_url(frontend_url())
+            .with_url("termhub://localhost/index.html");
+        let webview = webview
             .with_ipc_handler(move |msg| {
                 ipc::spawn_dispatch(
                     db_for_ipc.clone(),
@@ -1149,49 +1193,9 @@ fn save_clipboard_image(img: &arboard::ImageData) -> Option<String> {
     Some(format!("'{}'", path.display()))
 }
 
-/// The built frontend (`npm run build`'s `dist/`), embedded into the binary at compile time so
-/// a release build is actually standalone. Without this, the release `.app` had no frontend of
-/// its own at all: `frontendDist` in `tauri.conf.json` is a no-op here since this app never
-/// calls `tauri::Builder`/`generate_context!()` — the Tauri CLI still *builds* `dist/` via
-/// `beforeBuildCommand`, but nothing ever copied it into the bundle or loaded it, so the
-/// shipped `.app` only ever rendered anything if a `npm run dev` vite server happened to still
-/// be running on `localhost:1420` in the background. Confirmed by inspecting a built bundle's
-/// `Contents/Resources` — just the icon, no `dist/` in sight.
-#[derive(rust_embed::RustEmbed)]
-#[folder = "../dist"]
-struct Assets;
-
-/// Custom-protocol handler serving `Assets` — registered under the `"app"` scheme below.
-/// Request paths are root-absolute (`/assets/index-XXXX.js`, per Vite's default `base: "/"`),
-/// matching how `rust-embed` keys files relative to `dist/`. The empty/`/` path means the
-/// initial navigation to `app://localhost/` itself, so it maps to `index.html`.
-fn asset_response(path: &str) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
-    let path = path.trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
-    match Assets::get(path) {
-        Some(file) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            wry::http::Response::builder()
-                .header("Content-Type", mime.as_ref())
-                .body(file.data)
-                .unwrap()
-        }
-        None => wry::http::Response::builder()
-            .status(404)
-            .body(std::borrow::Cow::from(Vec::new()))
-            .unwrap(),
-    }
-}
-
-/// `npm run tauri dev`'s vite server in debug builds (unchanged — `beforeDevCommand` starts it,
-/// same as always); the embedded `Assets` above via the custom `"app"` protocol in release
-/// builds, so the shipped `.app` no longer depends on a dev server being alive somewhere.
-fn frontend_url() -> String {
-    if cfg!(debug_assertions) {
-        "http://localhost:1420".to_string()
-    } else {
-        "app://localhost/".to_string()
-    }
+#[cfg(debug_assertions)]
+fn dev_server_url() -> &'static str {
+    "http://localhost:1420"
 }
 
 fn app_data_dir() -> std::path::PathBuf {
