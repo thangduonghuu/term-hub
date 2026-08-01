@@ -12,13 +12,7 @@ body,
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: #e6e6e6;
-  /* Transparent, not `#181818` — the sidebar webview is now natively transparent (see
-     `lib.rs`'s `with_transparent(true)`) and gets widened to cover the whole window while a
-     modal (Usage/Settings/QuickOpen) is open. An opaque body here would paint over the native
-     terminal tiles for the entire time it's widened, making every open session look like it
-     vanished. `.sidebar` supplies its own opaque background for the normal narrow view, and
-     each modal panel supplies its own — nothing actually needs body to be opaque. */
-  background: transparent;
+  background: #181818;
 }
 
 .app-shell {
@@ -624,9 +618,12 @@ body {
 .quickopen-overlay {
   position: fixed;
   inset: 0;
-  /* No dark scrim, unlike `.usage-overlay` — Ctrl+R is meant to be a quick, non-blocking
-     picker (VSCode's Cmd+R), so the terminal sessions behind it should stay fully visible, not
-     get dimmed out like the full-page Usage/Settings modals do. */
+  /* Same dark scrim as `.usage-overlay` — a transparent-webview version of this (so terminal
+     sessions stayed visible behind it) turned out to break rendering of the sidebar webview
+     itself (blank window), a much worse regression than the terminals being temporarily
+     covered like Usage/Settings already do. Reverted; sessions still reappear correctly once
+     this closes, same as those two. */
+  background: rgba(0, 0, 0, 0.55);
   display: flex;
   align-items: flex-start;
   justify-content: center;
