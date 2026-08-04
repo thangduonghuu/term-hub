@@ -152,6 +152,19 @@ function App() {
     return () => window.removeEventListener("termhub:shortcut", onShortcut);
   }, [sessions, activeId]);
 
+  // Dismiss any open overlay when the window loses focus (Cmd+Tab away, clicking another app,
+  // etc.) or Escape is pressed — see `dismiss_overlays` in lib.rs, which fires this for both.
+  // Left open, a modal would be stranded on screen behind whatever the user switched to.
+  useEffect(() => {
+    function onDismiss() {
+      setShowUsage(false);
+      setShowSettings(false);
+      setShowQuickOpen(false);
+    }
+    window.addEventListener("termhub:close-overlays", onDismiss);
+    return () => window.removeEventListener("termhub:close-overlays", onDismiss);
+  }, []);
+
   return (
     <div className="app-shell">
       <Sidebar
