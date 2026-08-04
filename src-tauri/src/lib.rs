@@ -400,6 +400,18 @@ impl App {
         self.terms.iter_mut().find(|(tid, _)| *tid == id).map(|(_, t)| t)
     }
 
+    /// Tells the frontend to close any open overlay (usage dashboard, settings, quick-open) —
+    /// fired both when the window loses focus (see `WindowEvent::Focused`) and when Escape is
+    /// pressed while one is open (see the `KeyControl`/non-macOS `KeyboardInput` handling
+    /// below), since neither the terminal's native keyboard focus nor window-focus state has
+    /// any way to know an overlay is open on top of it.
+    fn dismiss_overlays(&self) {
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let _ = wv
+                .evaluate_script("window.dispatchEvent(new CustomEvent('termhub:close-overlays'))");
+        }
+    }
+
     /// The sidebar webview's bounds for the current window size — the narrow `SIDEBAR_WIDTH`
     /// strip normally, or the full window while `webview_full` is set (see its doc comment).
     /// Shared by initial webview creation, the resize handler, and the usage-overlay toggle so
@@ -607,6 +619,14 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::KeyControl(seq) => {
+                // Escape closes an open overlay instead of reaching the terminal — the custom
+                // `TerminalInputView` (macOS) always turns Escape into this event regardless of
+                // whether an overlay is covering the screen, since it has no notion of the
+                // webview's own state.
+                if seq == "\x1b" && self.webview_full {
+                    self.dismiss_overlays();
+                    return;
+                }
                 self.reset_blink();
                 if !self.respawn_active_if_exited() {
                     if let Some(term) = self.active_term() {
@@ -904,7 +924,11 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 };
                 if let Some(seq) = seq {
-                    if let Some(term) = self.active_term() {
+                    // Escape closes an open overlay instead of reaching the terminal — see
+                    // `dismiss_overlays`'s doc comment.
+                    if seq == "\x1b" && self.webview_full {
+                        self.dismiss_overlays();
+                    } else if let Some(term) = self.active_term() {
                         term.write(&seq);
                     }
                 }
@@ -1147,6 +1171,15 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 gpu.queue.submit(Some(encoder.finish()));
                 surface_frame.present();
+            }
+            WindowEvent::Focused(focused) => {
+                // The window losing focus (Cmd+Tab away, clicking another app, clicking the
+                // dock, etc.) should dismiss any open overlay (usage dashboard, settings,
+                // quick-open) rather than leaving it stranded on screen once the user's
+                // attention — and the webview's own key-window status — has moved elsewhere.
+                if !focused {
+                    self.dismiss_overlays();
+                }
             }
             _ => {}
         }

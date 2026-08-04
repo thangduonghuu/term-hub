@@ -116,6 +116,33 @@ pub fn clear_default_shell(db: &Db) -> Result<(), String> {
     db.delete_setting(DEFAULT_SHELL_SETTING).map_err(|e| e.to_string())
 }
 
+const LUMEN_PROMPT_SEEN_SETTING: &str = "lumen_prompt_seen";
+
+/// Whether the "try Lumen" sidebar promo (see `LumenPromo.tsx`) has already been dismissed or
+/// acted on — it's a one-time, first-launch suggestion, not something to keep nagging about on
+/// every session's startup.
+pub fn has_seen_lumen_prompt(db: &Db) -> Result<bool, String> {
+    Ok(db.get_setting(LUMEN_PROMPT_SEEN_SETTING).map_err(|e| e.to_string())?.is_some())
+}
+
+pub fn mark_lumen_prompt_seen(db: &Db) -> Result<(), String> {
+    db.set_setting(LUMEN_PROMPT_SEEN_SETTING, "1").map_err(|e| e.to_string())
+}
+
+/// Opens a URL in the user's default browser — same plain-process-spawning approach as
+/// `external_terminal::open_external` (this app never calls `tauri::Builder`, so there's no
+/// `AppHandle` for `tauri-plugin-opener` to hang off of).
+pub fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    result.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 const ANTHROPIC_API_KEY_SETTING: &str = "anthropic_api_key";
 
 pub fn has_anthropic_api_key(db: &Db) -> Result<bool, String> {

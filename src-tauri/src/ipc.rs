@@ -96,6 +96,12 @@ fn handle(
             let cwd: String = arg(&args, "cwd").ok_or("missing cwd")?;
             commands::open_external_terminal(&app, &cwd).and_then(to_value)
         }
+        "has_seen_lumen_prompt" => commands::has_seen_lumen_prompt(db).and_then(to_value),
+        "mark_lumen_prompt_seen" => commands::mark_lumen_prompt_seen(db).and_then(to_value),
+        "open_url" => {
+            let url: String = arg(&args, "url").ok_or("missing url")?;
+            commands::open_url(&url).and_then(to_value)
+        }
         "list_sessions" => commands::list_sessions(db).and_then(to_value),
         "create_session" => {
             let name: Option<String> = arg(&args, "name");

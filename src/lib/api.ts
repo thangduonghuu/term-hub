@@ -77,6 +77,10 @@ export const api = {
     invoke<void>("set_preferred_terminal_app", { app }),
   openExternalTerminal: (app: string, cwd: string) =>
     invoke<void>("open_external_terminal", { app, cwd }),
+  // Whether the one-time "try Lumen" sidebar promo has already been dismissed/acted on.
+  hasSeenLumenPrompt: () => invoke<boolean>("has_seen_lumen_prompt"),
+  markLumenPromptSeen: () => invoke<void>("mark_lumen_prompt_seen"),
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
   hasAnthropicApiKey: () => invoke<boolean>("has_anthropic_api_key"),
   setAnthropicApiKey: (key: string) => invoke<void>("set_anthropic_api_key", { key }),
