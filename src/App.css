@@ -248,6 +248,69 @@ body {
   font-size: 12px;
 }
 
+.lumen-promo {
+  position: relative;
+  margin: 8px;
+  padding: 10px 12px;
+  background: #1c2b20;
+  border: 1px solid #3fb95044;
+  border-radius: 8px;
+}
+
+.lumen-promo-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #7a7a7a;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.lumen-promo-close:hover {
+  background: #2e2e2e;
+  color: #e6e6e6;
+}
+
+.lumen-promo-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #3fb950;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-right: 16px;
+}
+
+.lumen-promo-body {
+  margin: 6px 0 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #cfcfcf;
+}
+
+.lumen-promo-cta {
+  width: 100%;
+  background: #2e2e2e;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  color: #e6e6e6;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.lumen-promo-cta:hover {
+  background: #3a3a3a;
+}
+
 .session-empty-panel {
   flex: 1;
   display: flex;

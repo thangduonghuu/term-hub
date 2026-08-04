@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { BarChart3, Copy, ExternalLink, FolderOpen, FolderPlus, Plus, Settings, X } from "lucide-react";
 import type { SessionInfo } from "../lib/api";
 import { folderName } from "../lib/path";
+import { LumenPromo } from "./LumenPromo";
 
 interface Props {
   sessions: SessionInfo[];
@@ -209,6 +210,7 @@ export function Sidebar({
           <div className="no-results">No matching sessions.</div>
         )}
       </div>
+      <LumenPromo />
     </aside>
   );
 }
