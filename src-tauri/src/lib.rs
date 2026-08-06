@@ -97,6 +97,10 @@ const RECONNECT_STAGGER: Duration = Duration::from_millis(1500);
 // keeps the margin tweakable in one place without a stale-cache field to remember to update.
 const TEXT_LEFT_MARGIN: f64 = 8.0;
 const TEXT_TOP_MARGIN: f64 = 4.0;
+// Logical px; scaled to physical px the same way border thickness is. Clamped per-tile against
+// half the tile's own width/height (see `render_rounded_corners`) so this stays sane once
+// enough sessions are open that tiles shrink well below this.
+const TILE_CORNER_RADIUS: f64 = 10.0;
 
 /// Logical-space (x, y, width, height) rectangles — one per currently-open session, in the
 /// same order as `App.terms` — tiling them across the window's terminal area (everything
@@ -733,20 +737,36 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Paste => {
                 self.reset_blink();
-                let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
-                // A screenshot/copied image has no meaningful text representation to paste
-                // into a pty — matching iTerm2/Warp/VS Code's terminal, write it to a temp
-                // file and paste the path instead, so it can be handed to a CLI tool that
-                // takes a file argument. `get_image` is tried first since a lot of image
-                // sources (e.g. macOS screenshot-to-clipboard) don't also populate a text
-                // representation for `get_text` to fall back on.
-                let pasted = match clipboard.get_image() {
-                    Ok(img) => save_clipboard_image(&img),
-                    Err(_) => clipboard.get_text().ok(),
+                // A copied *file* (e.g. Cmd-C on a screenshot in Finder) must be handled before
+                // falling through to `get_image`: see `macos::clipboard_file_url`'s doc comment
+                // — Finder also declares an Icon-Services placeholder bitmap under the image
+                // pasteboard types, which `get_image` can't tell apart from a real copied
+                // bitmap, so checking the file-URL type first and using the file's own path
+                // (rather than re-deriving image bytes from the pasteboard at all) sidesteps
+                // that placeholder entirely.
+                #[cfg(target_os = "macos")]
+                let file_path = crate::macos::clipboard_file_url();
+                #[cfg(not(target_os = "macos"))]
+                let file_path: Option<std::path::PathBuf> = None;
+
+                let pasted = if let Some(path) = file_path {
+                    Some(format!("'{}'", path.display()))
+                } else {
+                    let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+                    // A screenshot/copied image has no meaningful text representation to paste
+                    // into a pty — matching iTerm2/Warp/VS Code's terminal, write it to a temp
+                    // file and paste the path instead, so it can be handed to a CLI tool that
+                    // takes a file argument. `get_image` is tried first since a lot of image
+                    // sources (e.g. macOS screenshot-to-clipboard) don't also populate a text
+                    // representation for `get_text` to fall back on.
+                    match clipboard.get_image() {
+                        Ok(img) => save_clipboard_image(&img),
+                        Err(_) => clipboard.get_text().ok(),
+                    }
                 };
                 if let Some(text) = pasted {
                     if let Some(term) = self.active_term() {
-                        term.write(&text);
+                        term.paste(&text);
                     }
                 }
                 if let Some(w) = &self.window {
@@ -1240,33 +1260,6 @@ impl ApplicationHandler<AppEvent> for App {
                         occlusion_query_set: None,
                     });
 
-                    // Borders don't share glyphon's atlas (separate pipeline, its own vertex
-                    // buffer per call), so drawing them per tile in a loop like this is fine —
-                    // unlike the text below, there's nothing here for a later tile's draw call
-                    // to invalidate out from under an earlier one.
-                    for ((id, _, (tw, th), is_exited), &(tx, ty, _, _)) in
-                        frames.iter().zip(rects.iter())
-                    {
-                        let sx = (tx * scale).round() as f32;
-                        let sy = (ty * scale).round() as f32;
-                        let sw = (tw * scale).round() as f32;
-                        let sh = (th * scale).round() as f32;
-                        let is_active = self.active_id.as_deref() == Some(id.as_str());
-                        gpu.text.render_tile_border(
-                            &gpu.device,
-                            &mut pass,
-                            sx,
-                            sy,
-                            sw,
-                            sh,
-                            (1.5 * scale as f32).max(1.0),
-                            is_active,
-                            *is_exited,
-                            gpu.config.width,
-                            gpu.config.height,
-                        );
-                    }
-
                     // Every tile's text must be prepared and rendered together in a single
                     // glyphon `prepare`/`render`/`trim` cycle, not one cycle per tile — see
                     // `TextPipeline::render_all`'s doc comment for the real bug that caused
@@ -1303,6 +1296,35 @@ impl ApplicationHandler<AppEvent> for App {
                         gpu.config.width,
                         gpu.config.height,
                     );
+
+                    // Drawn last — the rounded-corner cleanup this does paints over whatever's
+                    // underneath at each corner (see `render_tile_border`'s doc comment), so it
+                    // has to run after this tile's own text/background/cursor are already on
+                    // screen for this frame, not before like a plain unrounded border could.
+                    let radius = (TILE_CORNER_RADIUS * scale) as f32;
+                    for ((id, _, (tw, th), is_exited), &(tx, ty, _, _)) in
+                        frames.iter().zip(rects.iter())
+                    {
+                        let sx = (tx * scale).round() as f32;
+                        let sy = (ty * scale).round() as f32;
+                        let sw = (tw * scale).round() as f32;
+                        let sh = (th * scale).round() as f32;
+                        let is_active = self.active_id.as_deref() == Some(id.as_str());
+                        gpu.text.render_tile_border(
+                            &gpu.device,
+                            &mut pass,
+                            sx,
+                            sy,
+                            sw,
+                            sh,
+                            (1.5 * scale as f32).max(1.0),
+                            radius,
+                            is_active,
+                            *is_exited,
+                            gpu.config.width,
+                            gpu.config.height,
+                        );
+                    }
                 }
                 gpu.queue.submit(Some(encoder.finish()));
                 surface_frame.present();
