@@ -18,7 +18,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, CursorStyle, Processor, StdSyncHandler,
@@ -408,6 +408,31 @@ impl TerminalSession {
         let _ = self.pty_writer.write_all(s.as_bytes());
     }
 
+    /// Like `write`, but for content that came from an OS paste (`AppEvent::Paste`) rather than
+    /// a keystroke. Wraps it in `ESC[200~ … ESC[201~` (bracketed paste) when the child program
+    /// has asked for that via DECSET `?2004` — `alacritty_terminal` already tracks that request
+    /// as `TermMode::BRACKETED_PASTE`, toggled automatically as the pty's own output is parsed,
+    /// so no extra state needs to live here.
+    ///
+    /// This isn't just cosmetic: readline/editor programs (vim, and notably interactive CLIs
+    /// like Claude Code) rely on the bracketing to tell a paste apart from typing at all — e.g.
+    /// Claude Code's own image-paste support recognizes a *pasted* file path and shows it as
+    /// `[Image #1]`, but without the `ESC[200~`/`ESC[201~` wrapper the same bytes arrive
+    /// indistinguishable from someone typing the path out character by character, so that
+    /// recognition never fires and the raw path is left sitting in the input line instead.
+    pub fn paste(&mut self, s: &str) {
+        let bracketed = self.term.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE);
+        if !bracketed {
+            self.write(s);
+            return;
+        }
+        // A literal end-marker inside the pasted text would otherwise let it prematurely
+        // terminate the bracket and have the remainder read back as ordinary keystrokes —
+        // stripped the same way real terminals (xterm, iTerm2) do.
+        let sanitized = s.replace("\x1b[201~", "");
+        self.write(&format!("\x1b[200~{sanitized}\x1b[201~"));
+    }
+
     /// Resizes both the terminal grid and the pty's own notion of its window size (the latter
     /// via `SIGWINCH`, delivered by the kernel once `on_resize` sets the pty's `winsize` —
     /// without it, programs like `vim`/`htop` that query the terminal size on startup or via
@@ -760,9 +785,12 @@ impl TextPipeline {
     /// neighbors. `active` picks a brighter accent color for whichever tile currently has
     /// keyboard focus; `exited` (Phase 5) overrides that with a dim red to flag a dead shell
     /// process, since otherwise a tile whose pty died just freezes with no visual difference
-    /// from a live idle one. `x`/`y`/`w`/`h`/`thickness` are physical pixels, matching the
-    /// tile's own scissor rect (the caller is expected to have already set that via
-    /// `RenderPass::set_scissor_rect`, so this never draws outside the tile).
+    /// from a live idle one. `radius` rounds the tile's corners (see `SelectionPipeline::
+    /// render_border`'s doc comment) — pass `0.0` for plain square corners. `x`/`y`/`w`/`h`/
+    /// `thickness`/`radius` are physical pixels. Must run after this tile's background/glyphs/
+    /// cursor are already drawn (see `RedrawRequested`'s draw order) — rounding works by
+    /// painting over whatever's underneath at each corner, same idea as the straight edges
+    /// painting over it along the sides.
     #[allow(clippy::too_many_arguments)]
     pub fn render_tile_border(
         &self,
@@ -773,13 +801,14 @@ impl TextPipeline {
         w: f32,
         h: f32,
         thickness: f32,
+        radius: f32,
         active: bool,
         exited: bool,
         viewport_w: u32,
         viewport_h: u32,
     ) {
         self.selection.render_border(
-            device, pass, x, y, w, h, thickness, active, exited, viewport_w, viewport_h,
+            device, pass, x, y, w, h, thickness, radius, active, exited, viewport_w, viewport_h,
         );
     }
 
@@ -1023,12 +1052,27 @@ impl TextPipeline {
 /// hundred at most), no need for instancing or a persistent vertex buffer.
 struct SelectionPipeline {
     pipeline: wgpu::RenderPipeline,
+    corner_pipeline: wgpu::RenderPipeline,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SelectionVertex {
     position: [f32; 2],
+    color: [f32; 4],
+}
+
+/// One corner-ring quad's vertex — see `render_corner_ring`'s doc comment for the technique.
+/// `frag_px`/`center_px` are physical pixels (not NDC): the fragment shader compares them
+/// directly, using `position` only to place the vertex on screen.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CornerVertex {
+    position: [f32; 2],
+    frag_px: [f32; 2],
+    center_px: [f32; 2],
+    inner_radius: f32,
+    outer_radius: f32,
     color: [f32; 4],
 }
 
@@ -1051,6 +1095,57 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return in.color;
+}
+"#;
+
+/// Paints `color` over the ring `inner_radius <= distance(frag, center) <= outer_radius`
+/// (both edges antialiased over ~1px), leaving everything else untouched (alpha 0) — see
+/// `render_corner_ring`'s doc comment for what this is used for. A single shape covers every
+/// case this app needs: a thin annulus draws a border stroke that actually curves through the
+/// corner instead of getting chopped off by a straight edge meeting a mask (the bug the
+/// straight-edges-plus-punch version of this had); `inner_radius: 0.0` makes it a filled disk;
+/// `outer_radius` pinned far past anything the quad can reach makes it "paint everything beyond
+/// `inner_radius`", i.e. a punch — used to clean up whatever's beyond the rounded silhouette
+/// (a background fill or glyph that happens to reach into the tile's square corner) back to the
+/// window's own background color. `frag_px`/`center_px` are physical pixels, not NDC — the
+/// fragment shader compares them directly; `position` only places the vertex on screen. Linear
+/// interpolation of `frag_px` across the quad is exact here (not just an approximation) since
+/// clip space is a plain orthographic 2D mapping, `w` is always 1.
+const CORNER_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) frag_px: vec2<f32>,
+    @location(2) center_px: vec2<f32>,
+    @location(3) inner_radius: f32,
+    @location(4) outer_radius: f32,
+    @location(5) color: vec4<f32>,
+};
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) frag_px: vec2<f32>,
+    @location(1) center_px: vec2<f32>,
+    @location(2) inner_radius: f32,
+    @location(3) outer_radius: f32,
+    @location(4) color: vec4<f32>,
+};
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.frag_px = in.frag_px;
+    out.center_px = in.center_px;
+    out.inner_radius = in.inner_radius;
+    out.outer_radius = in.outer_radius;
+    out.color = in.color;
+    return out;
+}
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let d = distance(in.frag_px, in.center_px);
+    let fade_in = smoothstep(in.inner_radius - 1.0, in.inner_radius + 1.0, d);
+    let fade_out = 1.0 - smoothstep(in.outer_radius - 1.0, in.outer_radius + 1.0, d);
+    let alpha = fade_in * fade_out;
+    return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
 "#;
 
@@ -1108,7 +1203,152 @@ impl SelectionPipeline {
             multiview: None,
             cache: None,
         });
-        Self { pipeline }
+
+        let corner_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("corner-shader"),
+            source: wgpu::ShaderSource::Wgsl(CORNER_SHADER.into()),
+        });
+        let corner_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("corner-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &corner_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<CornerVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                            shader_location: 2,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress,
+                            shader_location: 3,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress,
+                            shader_location: 4,
+                            format: wgpu::VertexFormat::Float32,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+                            shader_location: 5,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &corner_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self { pipeline, corner_pipeline }
+    }
+
+    /// Draws one filled ring (annulus) at each of a tile's four corners — see `CORNER_SHADER`'s
+    /// doc comment for the fill test itself (a plain disk or an outward "paint past
+    /// `inner_radius`" punch are both just different `inner_radius`/`outer_radius` values of the
+    /// same shape). `box_radius` sizes the small quad drawn at each corner (always this tile's
+    /// rounding radius, physical px) — kept as its own parameter separate from `inner_radius`/
+    /// `outer_radius` because the punch case passes an effectively-infinite `outer_radius`
+    /// (paint everything past `inner_radius`, unbounded) while still only needing geometry
+    /// covering the corner's own small square, not literally out to that radius.
+    ///
+    /// This exists as its own primitive (rather than only ever being one straight-edges-plus-
+    /// corner-punch helper) because a *thin* border stroke can't be rounded by punching a big
+    /// circle out of straight full-length edges the way a filled background can: right at the
+    /// corner, a border only a few px thick sits almost entirely *outside* a circle whose radius
+    /// is the rounding radius (tens of px), so punching that circle out erases most of the
+    /// stroke near the corner instead of curving it — confirmed exactly this way, it read as a
+    /// chipped/broken corner rather than a rounded one. A ring drawn at the stroke's own
+    /// thickness (`inner_radius = rounding_radius - stroke_thickness`, `outer_radius =
+    /// rounding_radius`) is what actually traces a curve; see `render_border`'s doc comment for
+    /// how the straight edges are shortened to hand off to this ring at each corner instead of
+    /// running into it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_corner_ring(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        box_radius: f32,
+        inner_radius: f32,
+        outer_radius: f32,
+        color: [f32; 4],
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        let r = box_radius.min(w / 2.0).min(h / 2.0).max(0.0);
+        if r < 0.5 {
+            return;
+        }
+        let to_ndc = |px: f32, py: f32| -> [f32; 2] {
+            [(px / viewport_w as f32) * 2.0 - 1.0, 1.0 - (py / viewport_h as f32) * 2.0]
+        };
+        // (quad's own top-left origin, arc center) for each of the 4 corners — the arc center
+        // is inset by `r` on both axes from the tile's actual corner point, toward the tile's
+        // interior.
+        let corners = [
+            (x, y, x + r, y + r),                 // top-left
+            (x + w - r, y, x + w - r, y + r),     // top-right
+            (x, y + h - r, x + r, y + h - r),     // bottom-left
+            (x + w - r, y + h - r, x + w - r, y + h - r), // bottom-right
+        ];
+        let mut vertices = Vec::with_capacity(24);
+        for &(qx, qy, cx, cy) in &corners {
+            let (x0, y0, x1, y1) = (qx, qy, qx + r, qy + r);
+            let mk = |px: f32, py: f32| CornerVertex {
+                position: to_ndc(px, py),
+                frag_px: [px, py],
+                center_px: [cx, cy],
+                inner_radius,
+                outer_radius,
+                color,
+            };
+            let (tl, tr, bl, br) = (mk(x0, y0), mk(x1, y0), mk(x0, y1), mk(x1, y1));
+            vertices.extend_from_slice(&[tl, bl, tr, tr, bl, br]);
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("corner-vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        pass.set_pipeline(&self.corner_pipeline);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..vertices.len() as u32, 0..1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1198,9 +1438,29 @@ impl SelectionPipeline {
         self.draw_rects(device, pass, &[rect], viewport_w, viewport_h);
     }
 
-    /// Draws a hollow rectangle outline (four thin filled quads, one per edge) around a tile —
-    /// used to visually separate sessions in the tiled grid, and to highlight whichever one
-    /// currently has keyboard focus (`active`). All pixel-space, physical pixels.
+    /// Draws a hollow rectangle outline around a tile — used to visually separate sessions in
+    /// the tiled grid, and to highlight whichever one currently has keyboard focus (`active`).
+    /// All pixel-space, physical pixels.
+    ///
+    /// The focused tile gets a wider soft glow band layered under a crisp bright core line
+    /// (`render_glow_border`) instead of just a plain, same-width line in a different color —
+    /// with several tiles open, a single thin line in a slightly different color was too easy
+    /// to lose track of at a glance.
+    ///
+    /// `radius` rounds the corners. This is *not* "draw the usual full-length straight edges,
+    /// then punch a circle out of the corner": a first attempt did exactly that, and it reads as
+    /// a chipped/broken corner rather than a rounded one — a thin stroke sits almost entirely
+    /// outside a circle whose radius is tens of px, so punching that circle erases most of the
+    /// stroke near the corner instead of curving it, and unevenly across the stroke's own
+    /// thickness (nothing like a clean arc). Instead each straight edge is shortened by `radius`
+    /// at both ends (`border_rects`), and a proper ring — `inner_radius = radius - thickness` to
+    /// `outer_radius = radius`, see `render_corner_ring` — fills in the curve at each corner, so
+    /// the stroke itself actually traces the rounding instead of being clipped by it. A final
+    /// "paint everything past `radius`" punch (`punch_corners`) cleans up whatever's beyond the
+    /// rounded silhouette in the tile's own square corner (background fill, a glyph) — since
+    /// tiles sit flush against each other with no gap (`tile_rects`), that's always this app's
+    /// fixed black background, at both the window's own outer corners and at a shared interior
+    /// corner where several tiles' own quarter-punches read together as one small rounded notch.
     #[allow(clippy::too_many_arguments)]
     fn render_border(
         &self,
@@ -1211,29 +1471,154 @@ impl SelectionPipeline {
         w: f32,
         h: f32,
         thickness: f32,
+        radius: f32,
         active: bool,
         exited: bool,
         viewport_w: u32,
         viewport_h: u32,
     ) {
-        let color = if exited {
-            [0.85, 0.3, 0.25, 0.8]
-        } else if active {
-            [0.35, 0.55, 1.0, 1.0]
-        } else {
-            [1.0, 1.0, 1.0, 0.3]
-        };
-        let rects = [
-            // top
-            (x, y, w, thickness, color),
-            // bottom
-            (x, y + h - thickness, w, thickness, color),
-            // left
-            (x, y, thickness, h, color),
-            // right
-            (x + w - thickness, y, thickness, h, color),
-        ];
+        let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+        if exited {
+            self.render_flat_border(
+                device, pass, x, y, w, h, r, thickness, [0.85, 0.3, 0.25, 0.8], viewport_w,
+                viewport_h,
+            );
+            return;
+        }
+        if active {
+            self.render_glow_border(device, pass, x, y, w, h, r, thickness, viewport_w, viewport_h);
+            return;
+        }
+        self.render_flat_border(
+            device, pass, x, y, w, h, r, thickness, [1.0, 1.0, 1.0, 0.3], viewport_w, viewport_h,
+        );
+    }
+
+    /// One flat-color rounded border: shortened straight edges plus the corner ring that
+    /// completes the curve, then the outer punch that cleans up each corner — see
+    /// `render_border`'s doc comment for why it takes all three to round a stroke properly.
+    #[allow(clippy::too_many_arguments)]
+    fn render_flat_border(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        thickness: f32,
+        color: [f32; 4],
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        let rects = Self::border_rects(x, y, w, h, thickness, r, color);
         self.draw_rects(device, pass, &rects, viewport_w, viewport_h);
+        if r < 0.5 {
+            return;
+        }
+        self.render_corner_ring(
+            device, pass, x, y, w, h, r, (r - thickness).max(0.0), r, color, viewport_w,
+            viewport_h,
+        );
+        self.punch_corners(device, pass, x, y, w, h, r, viewport_w, viewport_h);
+    }
+
+    /// The focused-tile treatment: a wide, low-alpha glow band with a crisp bright line on top
+    /// of it, both rounded — see `render_border`'s doc comment for why rounding a stroke needs
+    /// a ring at each corner rather than just a punch.
+    #[allow(clippy::too_many_arguments)]
+    fn render_glow_border(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        thickness: f32,
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        let glow_thickness = thickness * 3.5;
+        let glow_color = [0.4, 0.65, 1.0, 0.35];
+        let core_thickness = thickness * 1.5;
+        let core_color = [0.65, 0.85, 1.0, 1.0];
+
+        let glow = Self::border_rects(x, y, w, h, glow_thickness, r, glow_color);
+        self.draw_rects(device, pass, &glow, viewport_w, viewport_h);
+        let core = Self::border_rects(x, y, w, h, core_thickness, r, core_color);
+        self.draw_rects(device, pass, &core, viewport_w, viewport_h);
+
+        if r < 0.5 {
+            return;
+        }
+        self.render_corner_ring(
+            device, pass, x, y, w, h, r, (r - glow_thickness).max(0.0), r, glow_color,
+            viewport_w, viewport_h,
+        );
+        self.render_corner_ring(
+            device, pass, x, y, w, h, r, (r - core_thickness).max(0.0), r, core_color,
+            viewport_w, viewport_h,
+        );
+        self.punch_corners(device, pass, x, y, w, h, r, viewport_w, viewport_h);
+    }
+
+    /// Paints this app's fixed black window background over everything past `r` from each
+    /// corner's arc center — the cleanup step described in `render_border`'s doc comment. A
+    /// no-op when `r` is ~0 (rounding disabled).
+    #[allow(clippy::too_many_arguments)]
+    fn punch_corners(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        if r < 0.5 {
+            return;
+        }
+        const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+        // Comfortably beyond anything a corner's own small quad can reach (see
+        // `render_corner_ring`'s doc comment on `box_radius` vs. `outer_radius`) — stands in for
+        // "unbounded" so this ring becomes a plain "paint everything past `r`" punch.
+        const FAR: f32 = 1.0e6;
+        self.render_corner_ring(
+            device, pass, x, y, w, h, r, r, FAR, BACKGROUND, viewport_w, viewport_h,
+        );
+    }
+
+    /// The four straight edges of a tile's border, each shortened by `r` at both ends so a
+    /// `render_corner_ring` call can take over the curve there — see `render_border`'s doc
+    /// comment. `r` of `0.0` reduces this to the original full-length, square-cornered edges.
+    fn border_rects(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        thickness: f32,
+        r: f32,
+        color: [f32; 4],
+    ) -> [(f32, f32, f32, f32, [f32; 4]); 4] {
+        let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+        let span_w = (w - 2.0 * r).max(0.0);
+        let span_h = (h - 2.0 * r).max(0.0);
+        [
+            // top
+            (x + r, y, span_w, thickness, color),
+            // bottom
+            (x + r, y + h - thickness, span_w, thickness, color),
+            // left
+            (x, y + r, thickness, span_h, color),
+            // right
+            (x + w - thickness, y + r, thickness, span_h, color),
+        ]
     }
 
     fn draw_rects(
