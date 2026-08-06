@@ -10,6 +10,7 @@
 //! selection highlighting's, which isn't implemented — out of scope so far).
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, OnResize, WindowSize};
@@ -23,9 +24,12 @@ use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, CursorStyle, Processor, StdSyncHandler,
 };
 use glyphon::{
-    Attrs, Buffer, Cache, Color as TextColor, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    fontdb, Attrs, Buffer, Cache, Color as TextColor, ContentType, CustomGlyph, CustomGlyphId,
+    Family, Font, FontSystem, Metrics, RasterizeCustomGlyphRequest, RasterizedCustomGlyph,
+    Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
+use swash::scale::{Render, ScaleContext, Source, StrikeWith};
+use swash::zeno::Format;
 use wgpu::util::DeviceExt;
 use winit::event_loop::EventLoopProxy;
 
@@ -98,14 +102,39 @@ impl Dimensions for Dims {
 pub const CELL_W: f32 = 8.0;
 pub const CELL_H: f32 = 16.0;
 
-/// A snapshot of what to draw for one frame: the grid's text (with preedit and the cursor's
-/// glyph substitution already spliced in, same trick as before — simplest way to draw a
-/// cursor without a second render pass) broken into `spans` — consecutive runs of text
-/// sharing one foreground color, `None` meaning "the default" — plus the display-space cell
-/// coordinates currently under the selection, drawn as highlight rectangles by
-/// `SelectionPipeline` *underneath* the text in the same render pass.
+/// The terminal cursor's on-screen shape (from `CSI q`/DECSCUSR, or this app's default — see
+/// `TerminalSession::spawn`'s `default_cursor_style`). Drawn as a solid GPU rectangle (see
+/// `SelectionPipeline::render_cursor`), not a font glyph — an earlier version spliced a
+/// substitute character ('█'/'_'/'│') into the cell stream and let it render like any other
+/// glyph, which broke once glyph quads were sized to each character's own tight ink bounding
+/// box (see `TextPipeline::render_all`'s doc comment): Monaco's block-drawing glyphs aren't
+/// necessarily anchored to fill a full monospace cell, so the cursor could end up smaller than
+/// the cell or offset from where a cursor actually needs to sit. A plain rectangle has no such
+/// font-dependent sizing quirk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorKind {
+    Block,
+    Underline,
+    Beam,
+}
+
+/// A snapshot of what to draw for one frame: every non-blank cell's glyph (with preedit already
+/// spliced in) as `(row, col, char, fg color)` — `None` color meaning "the default" — plus the
+/// display-space cell currently under the cursor (if visible), the cells under the selection
+/// (drawn as highlight rectangles by `SelectionPipeline` *underneath* the text), and cells with
+/// a non-default background. Deliberately per-cell rather than coalesced into same-color runs:
+/// each cell is drawn as an independently-colored/-positioned custom glyph (see
+/// `TextPipeline`'s doc comment), so there's no shaping step left that would benefit from
+/// run-coalescing.
+#[derive(Clone)]
 pub struct Frame {
-    pub spans: Vec<(String, Option<(u8, u8, u8)>)>,
+    pub cells: Vec<(usize, usize, char, Option<(u8, u8, u8)>)>,
+    /// The cell the cursor currently occupies, if it's visible right now (blink phase,
+    /// scrolled-into-history, `CursorShape::Hidden`, etc. can all make this `None` — see
+    /// `snapshot`'s doc comment). That cell's real glyph is *not* also present in `cells` — the
+    /// cursor rectangle stands in for it, same net effect as the old glyph-substitution
+    /// approach this replaced.
+    pub cursor: Option<(usize, usize, CursorKind)>,
     pub selection_cells: Vec<(usize, usize)>,
     /// Cells with a non-default background color, drawn as solid (fully opaque) rectangles
     /// *underneath* the text and selection highlight — needed for anything that leans on
@@ -204,6 +233,12 @@ pub struct TerminalSession {
     pty_writer: std::fs::File,
     // Must stay alive: Pty's Drop kills the child shell (see module docs).
     _pty: tty::Pty,
+    // Bumped on anything that can change what `snapshot()` would return for this session
+    // (pty output, scroll, selection, resize) — lets `lib.rs` cache the last `Frame` per tile
+    // and skip re-walking the whole grid in `snapshot()` for tiles that haven't actually
+    // changed since last frame, the same way `TextPipeline::render_all` already skips
+    // re-shaping unchanged tiles. Doesn't need to be exact, just monotonic and cheap to read.
+    generation: Arc<AtomicU64>,
 }
 
 impl TerminalSession {
@@ -322,7 +357,9 @@ impl TerminalSession {
             PtyEventListener { pty_writer: listener_writer },
         )));
 
+        let generation = Arc::new(AtomicU64::new(0));
         let term_for_reader = term.clone();
+        let generation_for_reader = generation.clone();
         std::thread::spawn(move || {
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut buf = [0u8; 8192];
@@ -333,6 +370,7 @@ impl TerminalSession {
                         let mut term = term_for_reader.lock().unwrap();
                         processor.advance(&mut *term, &buf[..n]);
                         drop(term);
+                        generation_for_reader.fetch_add(1, Ordering::Relaxed);
                         // Only wake the render loop when there's actually new output to
                         // show, instead of redrawing (and re-shaping the whole grid) on a
                         // blind timer regardless of whether anything changed. Carries `id` so
@@ -356,10 +394,17 @@ impl TerminalSession {
             let _ = proxy.send_event(AppEvent::SessionExited(id));
         });
 
-        Ok(Self { term, pty_writer, _pty: pty })
+        Ok(Self { term, pty_writer, _pty: pty, generation })
     }
 
     pub fn write(&mut self, s: &str) {
+        // Typing while scrolled back into history should jump back to the live bottom, same
+        // convention every real terminal follows (iTerm2, Terminal.app, xterm) — otherwise the
+        // keystroke lands in the pty same as always, but the cursor stays scrolled out of view
+        // (by design, see `snapshot`'s doc comment on why a scrolled-back cursor is hidden),
+        // making it look like typing did nothing.
+        self.term.lock().unwrap().scroll_display(Scroll::Bottom);
+        self.generation.fetch_add(1, Ordering::Relaxed);
         let _ = self.pty_writer.write_all(s.as_bytes());
     }
 
@@ -370,6 +415,7 @@ impl TerminalSession {
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let dims = Dims { cols, lines: rows };
         self.term.lock().unwrap().resize(dims);
+        self.generation.fetch_add(1, Ordering::Relaxed);
         let window_size = WindowSize {
             num_lines: rows as u16,
             num_cols: cols as u16,
@@ -385,6 +431,14 @@ impl TerminalSession {
     /// the scrolled position, no separate scrollback buffer or rendering path needed.
     pub fn scroll(&mut self, delta: i32) {
         self.term.lock().unwrap().scroll_display(Scroll::Delta(delta));
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Monotonic counter, bumped on anything that can change what `snapshot()` returns for
+    /// this session. Cheap to read (single atomic load) — lets callers detect "nothing changed
+    /// since last time" without paying for an actual `snapshot()` grid walk to find out.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Starts a new selection at the given display-space cell (`row` is 0 at the top of what's
@@ -395,6 +449,8 @@ impl TerminalSession {
         let offset = term.grid().display_offset() as i32;
         let point = Point::new(Line(row - offset), Column(col));
         term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        drop(term);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Extends the in-progress selection (started via `start_selection`) to the given
@@ -406,10 +462,13 @@ impl TerminalSession {
         if let Some(selection) = term.selection.as_mut() {
             selection.update(point, Side::Left);
         }
+        drop(term);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn clear_selection(&mut self) {
         self.term.lock().unwrap().selection = None;
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn selection_to_string(&self) -> Option<String> {
@@ -453,20 +512,19 @@ impl TerminalSession {
         let preedit_chars: Vec<char> = preedit.chars().collect();
         let cursor_display_col = cursor_col + preedit_chars.len();
         let cursor_style = term.cursor_style();
-        let cursor_glyph = match cursor_style.shape {
-            CursorShape::Block | CursorShape::HollowBlock => '█',
-            CursorShape::Underline => '_',
-            CursorShape::Beam => '│',
-            CursorShape::Hidden => ' ',
+        let cursor_kind = match cursor_style.shape {
+            CursorShape::Block | CursorShape::HollowBlock => Some(CursorKind::Block),
+            CursorShape::Underline => Some(CursorKind::Underline),
+            CursorShape::Beam => Some(CursorKind::Beam),
+            CursorShape::Hidden => None,
         };
         let show_cursor =
-            !scrolled_back && (cursor_visible || !cursor_style.blinking) && cursor_style.shape != CursorShape::Hidden;
+            !scrolled_back && (cursor_visible || !cursor_style.blinking) && cursor_kind.is_some();
 
         let selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
 
-        let mut spans: Vec<(String, Option<(u8, u8, u8)>)> = Vec::new();
-        let mut cur_color: Option<(u8, u8, u8)> = None;
-        let mut cur_text = String::new();
+        let mut cells = Vec::new();
+        let mut cursor = None;
         let mut selection_cells = Vec::new();
         let mut background_cells = Vec::new();
         for (row_idx, row) in grid.display_iter().collect::<Vec<_>>().chunks(cols).enumerate() {
@@ -478,13 +536,21 @@ impl TerminalSession {
                     && col_idx < cursor_col + preedit_chars.len();
                 let is_cursor =
                     show_cursor && row_idx as i32 == cursor_line && col_idx == cursor_display_col;
-                // Preedit/cursor glyphs are UI overlays, not real terminal content — always
-                // drawn in the default color (and no background fill) rather than inheriting
-                // whatever the underlying cell's color happened to be.
-                let (ch, color) = if in_preedit {
-                    (preedit_chars[col_idx - cursor_col], None)
+                if in_preedit {
+                    // In-progress IME composition text is an overlay too, but real *content*
+                    // (unlike the cursor) — still drawn as a glyph, always in the default color
+                    // rather than inheriting whatever the underlying cell's color happened to
+                    // be.
+                    let ch = preedit_chars[col_idx - cursor_col];
+                    if ch != ' ' && ch != '\0' {
+                        cells.push((row_idx, col_idx, ch, None));
+                    }
                 } else if is_cursor {
-                    (cursor_glyph, None)
+                    // The cursor rectangle (drawn separately, see `CursorKind`) stands in for
+                    // this cell's glyph entirely — same net effect the old glyph-substitution
+                    // approach had, just not dependent on a font's own block/underline/beam
+                    // character design.
+                    cursor = Some((row_idx, col_idx, cursor_kind.expect("show_cursor implies Some")));
                 } else {
                     let mut fg = resolve_fg(cell.fg, cell.flags);
                     let mut bg = resolve_bg(cell.bg);
@@ -501,15 +567,12 @@ impl TerminalSession {
                     if let Some(bg) = bg {
                         background_cells.push((row_idx, col_idx, bg));
                     }
-                    (cell.c, fg)
-                };
-                if color != cur_color {
-                    if !cur_text.is_empty() {
-                        spans.push((std::mem::take(&mut cur_text), cur_color));
+                    // A blank cell draws nothing regardless of color — skip it rather than
+                    // handing a whitespace glyph through the rasterizer.
+                    if cell.c != ' ' && cell.c != '\0' {
+                        cells.push((row_idx, col_idx, cell.c, fg));
                     }
-                    cur_color = color;
                 }
-                cur_text.push(ch);
 
                 if let Some(range) = &selection_range {
                     if range.contains(cell.point) {
@@ -517,21 +580,14 @@ impl TerminalSession {
                     }
                 }
             }
-            cur_text.push('\n');
         }
-        if !cur_text.is_empty() {
-            spans.push((cur_text, cur_color));
-        }
-        Frame { spans, selection_cells, background_cells }
+        Frame { cells, cursor, selection_cells, background_cells }
     }
 }
 
 /// One tile's worth of input to `TextPipeline::render_all` — see that method's doc comment for
 /// why every tile must be batched into one call instead of one `render` call per tile.
 pub struct TileRender<'a> {
-    /// Session id — keys `TextPipeline`'s per-tile shaped-`Buffer` cache (see `render_all`'s
-    /// doc comment), so it must be stable across frames for the same tile.
-    pub id: &'a str,
     pub frame: &'a Frame,
     /// Top-left origin of this tile's *text* (already offset past the render margin),
     /// physical pixels.
@@ -546,10 +602,20 @@ pub struct TileRender<'a> {
     pub cell_h: f32,
 }
 
-/// What a tile's shaped `Buffer` in `TextPipeline::buffer_cache` was shaped *from* — if none of
-/// these changed since last frame, the cached `Buffer` is still valid and re-shaping (the
-/// expensive part, see `render_all`) can be skipped for that tile.
-type ShapeKey = (Vec<(String, Option<(u8, u8, u8)>)>, u32, u32, u32);
+/// One character rasterized once (via `swash`, see `TextPipeline::rasterize`) at one pixel
+/// size — an alpha-only mask, deliberately colorless; `render_all` applies the actual
+/// foreground color per glyph *instance* via `CustomGlyph::color`, not here, so the same
+/// character drawn in any number of different ANSI colors is still only ever rasterized once.
+struct CachedGlyph {
+    /// Indexes `TextPipeline::glyph_data` for the actual mask bytes.
+    id: CustomGlyphId,
+    width: u16,
+    height: u16,
+    /// Offset from the glyph's pen position to the top-left of its bitmap — swash's
+    /// `Placement::left`/`-top`, same convention cosmic-text's own swash-backed rendering uses.
+    bearing_left: f32,
+    bearing_top: f32,
+}
 
 pub struct TextPipeline {
     font_system: FontSystem,
@@ -558,10 +624,32 @@ pub struct TextPipeline {
     text_renderer: TextRenderer,
     viewport: Viewport,
     selection: SelectionPipeline,
-    /// Per-tile (keyed by session id) shaped-text cache — see `render_all`'s doc comment on why
-    /// this exists. Entries for tiles no longer on screen are pruned each call so a closed
-    /// session's `Buffer` doesn't linger forever.
-    buffer_cache: std::collections::HashMap<String, (ShapeKey, Buffer)>,
+    /// Permanently empty and never reshaped — `TextArea` requires a `buffer`, but all actual
+    /// glyph drawing here goes through `TextArea::custom_glyphs` instead (see `render_all`'s
+    /// doc comment), so this exists purely to satisfy the field.
+    empty_buffer: Buffer,
+    /// Resolved once — every glyph this app ever draws is looked up against these fonts in
+    /// order, so there's no reason to re-resolve family names on every rasterization. Index 0
+    /// is Monaco, the primary monospace face (and the one `measure_cell_width`/cell-metrics
+    /// calculations key off of); the rest are fallbacks tried only when Monaco lacks a glyph —
+    /// Nerd Font icons (prompt segment glyphs like folder/git icons), Apple Symbols (extended
+    /// box-drawing/misc symbols), and Apple Color Emoji, none of which Monaco covers. Without
+    /// this chain, `rasterize` returned `None` for any such character and the cell rendered as
+    /// a bare background-color rectangle with no glyph on top — exactly what shows up as
+    /// "broken" powerline/nerd-font prompt segments.
+    fonts: Vec<Arc<Font>>,
+    scale_cx: ScaleContext,
+    /// Keyed by (character, pixel font size as bits) — the size half only ever changes if
+    /// `scale_factor` does (the window moving to a different-DPI display), so in practice this
+    /// caches by character alone. `None` means this font has no glyph for that character
+    /// (space, `.notdef`, etc.) — cached too, so a missing-glyph lookup isn't retried forever.
+    glyph_cache: std::collections::HashMap<(char, u32), Option<CachedGlyph>>,
+    /// Raw alpha-mask bytes for each cached glyph, indexed by `CachedGlyph::id`. Read back by
+    /// the `rasterize_custom_glyph` callback `render_all` hands to glyphon, which glyphon calls
+    /// at most once per distinct (id, size) the first time its *own* GPU atlas needs it — this
+    /// Vec is just a cheap way to answer that without re-invoking `swash`.
+    glyph_data: Vec<Vec<u8>>,
+    next_glyph_id: CustomGlyphId,
 }
 
 impl TextPipeline {
@@ -572,7 +660,7 @@ impl TextPipeline {
         width: u32,
         height: u32,
     ) -> Self {
-        let font_system = FontSystem::new();
+        let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let mut viewport = Viewport::new(device, &cache);
@@ -581,6 +669,44 @@ impl TextPipeline {
         let text_renderer =
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let selection = SelectionPipeline::new(device, format);
+
+        let mut empty_buffer = Buffer::new(&mut font_system, Metrics::new(14.0, CELL_H));
+        empty_buffer.set_text(&mut font_system, "", &Attrs::new(), Shaping::Basic);
+        empty_buffer.shape_until_scroll(&mut font_system, false);
+
+        let monaco_id = font_system
+            .db()
+            .query(&fontdb::Query {
+                families: &[fontdb::Family::Name("Monaco")],
+                ..Default::default()
+            })
+            .expect("Monaco not found on this system");
+        let monaco = font_system.get_font(monaco_id).expect("resolved font id vanished from the cache");
+
+        // Fallback families tried, in order, only when Monaco has no glyph for a character.
+        // Any of these can legitimately be absent (they're not bundled with the OS), so
+        // resolution failures are skipped rather than treated as fatal. Deliberately excludes
+        // color-glyph fonts (e.g. Apple Color Emoji): `rasterize` below renders everything
+        // through a single-channel `Format::Alpha` pass, and a color/bitmap glyph run through
+        // that comes out as an opaque blob tinted by the cell's foreground color — a solid
+        // colored block, which is worse than the blank space a missing glyph used to leave.
+        let fallback_families = [
+            "Symbols Nerd Font Mono",
+            "MesloLGS Nerd Font Mono",
+            "Apple Symbols",
+        ];
+        let mut fonts = vec![monaco];
+        for family in fallback_families {
+            if let Some(id) = font_system.db().query(&fontdb::Query {
+                families: &[fontdb::Family::Name(family)],
+                ..Default::default()
+            }) {
+                if let Some(font) = font_system.get_font(id) {
+                    fonts.push(font);
+                }
+            }
+        }
+
         Self {
             font_system,
             swash_cache,
@@ -588,7 +714,12 @@ impl TextPipeline {
             text_renderer,
             viewport,
             selection,
-            buffer_cache: std::collections::HashMap::new(),
+            empty_buffer,
+            fonts,
+            scale_cx: ScaleContext::new(),
+            glyph_cache: std::collections::HashMap::new(),
+            glyph_data: Vec::new(),
+            next_glyph_id: 0,
         }
     }
 
@@ -652,11 +783,22 @@ impl TextPipeline {
         );
     }
 
-    /// Renders every currently-visible tile's text (left-aligned within its own origin) in one
-    /// pass, in a flat monochrome color (no per-cell ANSI colors — see the plan doc for why:
-    /// tried and explicitly rejected in favor of a flat black & white look matching iTerm2's
-    /// default monochrome profile). Selection highlight rectangles are drawn first so glyphs
-    /// render on top of them, matching how every other terminal composites selection.
+    /// Renders every currently-visible tile's text (left-aligned within its own origin), plus
+    /// its background fills and selection highlight underneath. Foreground text goes through
+    /// `TextArea::custom_glyphs` — a manually-positioned glyph per non-blank cell — instead of
+    /// cosmic-text's usual shaped-`Buffer` path (`t.buffer` below is always `self.empty_buffer`,
+    /// permanently empty): this app already knows every glyph's exact monospace-grid cell from
+    /// the terminal itself, so there's nothing shaping (line breaking, BiDi, per-run font
+    /// resolution) would add. This replaced an earlier version that ran each frame's colored
+    /// text through `cosmic_text::Buffer::set_rich_text` with one `Attrs` span per foreground-
+    /// color change: profiled at ~120ms/frame on heavily ANSI-colored content (~290 tiny
+    /// same-font color runs, e.g. syntax-highlighted output), because cosmic-text 0.14's
+    /// `Shaping::Basic` path re-resolves the font's charmap/metrics from scratch for *every*
+    /// run rather than once per call. Routing through `custom_glyphs` instead means each
+    /// distinct *character* — not each colored run of one — is rasterized via `swash` at most
+    /// once ever (see `glyph_for`/`glyph_cache`) and reused at any size/color/count of on-screen
+    /// occurrences; color is applied per glyph *instance* at draw time via `CustomGlyph::color`,
+    /// fully decoupled from rasterization.
     ///
     /// All `tiles` **must** be prepared and rendered together in a single `prepare()`/
     /// `render()`/`trim()` cycle, not one cycle per tile (an earlier version of this code did
@@ -708,97 +850,96 @@ impl TextPipeline {
                     viewport_h,
                 );
             }
+            if let Some((row, col, kind)) = t.frame.cursor {
+                self.selection.render_cursor(
+                    device, pass, row, col, kind, t.left, t.top, t.cell_w, t.cell_h, viewport_w,
+                    viewport_h,
+                );
+            }
         }
 
-        let metrics = Metrics::new(14.0 * scale_factor, CELL_H * scale_factor);
-        // The generic Monospace family resolves to whatever the system default is (Menlo/SF
-        // Mono on macOS), which is missing about half of the Vietnamese precomposed Latin
-        // block (confirmed earlier this session via direct fontconfig inspection) — e.g. "ắ"
-        // (U+1EAF) renders as a tofu box. Monaco, also bundled with macOS, has full coverage
-        // (confirmed 0/90 missing).
-        let base_attrs = Attrs::new().family(Family::Name("Monaco"));
-        // iTerm2's default profile: light gray foreground (not pure white — easier on the
-        // eyes against pure black than full-contrast white) — used for any span whose color
-        // is `None` (the terminal's default, untouched-by-ANSI-codes text color).
-        const DEFAULT_FG: TextColor = TextColor::rgb(208, 208, 208);
-        let mut default_attrs = base_attrs.clone();
-        default_attrs.color_opt = Some(DEFAULT_FG);
+        // iTerm2's default profile: light gray foreground (not pure white — easier on the eyes
+        // against pure black than full-contrast white) — used for any cell whose color is
+        // `None` (the terminal's default, untouched-by-ANSI-codes text color).
+        const DEFAULT_FG_RGB: (u8, u8, u8) = (208, 208, 208);
+        let font_size_px = 14.0 * scale_factor;
 
-        // Drop cached buffers for tiles no longer on screen (closed sessions) so the cache
-        // doesn't grow without bound.
-        let live_ids: std::collections::HashSet<&str> = tiles.iter().map(|t| t.id).collect();
-        self.buffer_cache.retain(|id, _| live_ids.contains(id.as_str()));
+        // Ascent/descent of this app's primary font (Monaco), in pixels at the current size —
+        // resolved fresh each call (one cheap `metrics()` call, not per-glyph) since it only
+        // actually changes if `scale_factor` does (the window moving to a different-DPI
+        // display). Cell layout stays keyed off Monaco alone even when a glyph is drawn from a
+        // fallback font, so row/column spacing never shifts based on which characters appear.
+        let font_ref = self.fonts[0].as_swash();
+        let m = font_ref.metrics(&[]);
+        let units_per_em = m.units_per_em as f32;
+        let ascent_px = m.ascent / units_per_em * font_size_px;
+        let descent_px = m.descent / units_per_em * font_size_px;
 
-        // Re-shaping every tile's text on every call, even for tiles whose content didn't
-        // change since the last frame, was the actual CPU cost behind visible typing lag once
-        // more than one session was tiled: typing (or any output) in *one* tile forced a
-        // redraw, and a redraw re-shaped *all* tiles' text — including ones sitting there
-        // unchanged. Cache the shaped `Buffer` per tile (keyed by session id) and only re-shape
-        // when its content, scale, or the viewport size actually changed.
+        let mut tile_glyphs: Vec<Vec<CustomGlyph>> = Vec::with_capacity(tiles.len());
         for t in tiles {
-            let key: ShapeKey =
-                (t.frame.spans.clone(), scale_factor.to_bits(), viewport_w, viewport_h);
-            let needs_reshape = self
-                .buffer_cache
-                .get(t.id)
-                .map(|(cached_key, _)| cached_key != &key)
-                .unwrap_or(true);
-            if !needs_reshape {
-                continue;
+            // Matches cosmic-text's own line layout (the `centering_offset` term in its
+            // `buffer.rs`): center the font's ascent+descent box within the cell height rather
+            // than assuming they're equal, so this lines up with how text was positioned before
+            // shaping was routed around.
+            let centering_offset = (t.cell_h - (ascent_px + descent_px)) / 2.0;
+            let mut glyphs = Vec::with_capacity(t.frame.cells.len());
+            for &(row, col, ch, color) in &t.frame.cells {
+                let Some(g) = self.glyph_for(ch, font_size_px) else { continue };
+                // Relative to this tile's `TextArea.left`/`top` (set below to `t.left`/`t.top`)
+                // — glyphon adds those itself when placing each `CustomGlyph`
+                // (`text_area.left + glyph.left * text_area.scale`, see glyphon's
+                // `text_render.rs`). Including `t.left`/`t.top` here too used to double-count
+                // them: every glyph landed at `2 * t.left` instead of `t.left`, which (since
+                // `t.left` is `SIDEBAR_WIDTH` plus a small margin, not some tiny offset) showed
+                // up as a large, constant rightward shift of all *text* specifically — while
+                // the background-color quads (a separate, hand-rolled wgpu pipeline that adds
+                // `t.left` exactly once) stayed correctly positioned, which is why the colored
+                // prompt segments always lined up right after the sidebar but the text drawn
+                // over them didn't.
+                let pen_x = col as f32 * t.cell_w;
+                let baseline_y = row as f32 * t.cell_h + centering_offset + ascent_px;
+                let (r, gr, b) = color.unwrap_or(DEFAULT_FG_RGB);
+                glyphs.push(CustomGlyph {
+                    id: g.id,
+                    left: pen_x + g.bearing_left,
+                    top: baseline_y - g.bearing_top,
+                    width: g.width as f32,
+                    height: g.height as f32,
+                    color: Some(TextColor::rgb(r, gr, b)),
+                    snap_to_physical_pixel: true,
+                    metadata: 0,
+                });
             }
-            let mut buffer = Buffer::new(&mut self.font_system, metrics);
-            buffer.set_size(&mut self.font_system, Some(viewport_w as f32), Some(viewport_h as f32));
-            let spans: Vec<(&str, Attrs)> = t
-                .frame
-                .spans
-                .iter()
-                .map(|(text, color)| {
-                    let mut attrs = base_attrs.clone();
-                    attrs.color_opt =
-                        Some(color.map_or(DEFAULT_FG, |(r, g, b)| TextColor::rgb(r, g, b)));
-                    (text.as_str(), attrs)
-                })
-                .collect();
-            buffer.set_rich_text(
-                &mut self.font_system,
-                spans,
-                &default_attrs,
-                // Basic is far cheaper than Advanced (skips full BiDi/complex-script
-                // analysis) and is enough for a terminal grid — precomposed Vietnamese/Latin
-                // diacritics etc. still render correctly, they just don't need script
-                // reordering.
-                Shaping::Basic,
-                None,
-            );
-            buffer.shape_until_scroll(&mut self.font_system, false);
-            self.buffer_cache.insert(t.id.to_string(), (key, buffer));
+            tile_glyphs.push(glyphs);
         }
 
         let text_areas: Vec<TextArea> = tiles
             .iter()
-            .map(|t| {
+            .zip(tile_glyphs.iter())
+            .map(|(t, glyphs)| {
                 let (cl, ct, cr, cb) = t.clip;
-                let buffer = &self
-                    .buffer_cache
-                    .get(t.id)
-                    .expect("just shaped or already cached above")
-                    .1;
                 TextArea {
-                    buffer,
+                    buffer: &self.empty_buffer,
                     left: t.left,
                     top: t.top,
                     scale: 1.0,
                     bounds: TextBounds { left: cl, top: ct, right: cr, bottom: cb },
-                    // iTerm2's default profile: light gray foreground (not pure white —
-                    // easier on the eyes against pure black than full-contrast white).
-                    default_color: TextColor::rgb(208, 208, 208),
-                    custom_glyphs: &[],
+                    default_color: TextColor::rgb(
+                        DEFAULT_FG_RGB.0,
+                        DEFAULT_FG_RGB.1,
+                        DEFAULT_FG_RGB.2,
+                    ),
+                    custom_glyphs: glyphs,
                 }
             })
             .collect();
 
+        // Borrowed ahead of the call below so the closure only captures this one field, not
+        // `self` as a whole — `self.text_renderer`/`&mut self.font_system`/`&mut self.atlas` are
+        // borrowed separately as the call's other arguments.
+        let glyph_data = &self.glyph_data;
         self.text_renderer
-            .prepare(
+            .prepare_with_custom(
                 device,
                 queue,
                 &mut self.font_system,
@@ -806,10 +947,71 @@ impl TextPipeline {
                 &self.viewport,
                 text_areas,
                 &mut self.swash_cache,
+                |req: RasterizeCustomGlyphRequest| {
+                    glyph_data.get(req.id as usize).map(|data| RasterizedCustomGlyph {
+                        data: data.clone(),
+                        content_type: ContentType::Mask,
+                    })
+                },
             )
             .unwrap();
         self.text_renderer.render(&self.atlas, &self.viewport, pass).unwrap();
         self.atlas.trim();
+    }
+
+    /// Looks up (rasterizing and permanently caching on first use) the glyph for one character
+    /// at one pixel size. `None` means this font has no usable glyph for it (space, `.notdef`,
+    /// a codepoint outside Monaco's coverage, etc.) — cached too, so a missing glyph isn't
+    /// re-attempted every time it's encountered again.
+    fn glyph_for(&mut self, ch: char, font_size_px: f32) -> Option<&CachedGlyph> {
+        let key = (ch, font_size_px.to_bits());
+        if !self.glyph_cache.contains_key(&key) {
+            let entry = self.rasterize(ch, font_size_px);
+            self.glyph_cache.insert(key, entry);
+        }
+        self.glyph_cache.get(&key).unwrap().as_ref()
+    }
+
+    /// Same recipe cosmic-text's own `swash`-backed rendering uses internally (source order,
+    /// `Format::Alpha`, hinting on) — kept identical so glyphs this app draws via
+    /// `custom_glyphs` look the same as if they'd gone through cosmic-text's normal path.
+    ///
+    /// Tries each font in `self.fonts` in order (Monaco first, then the Nerd Font/Symbols/Emoji
+    /// fallbacks) and rasterizes from the first one that actually has a glyph for `ch`. Monaco
+    /// alone has no coverage for prompt icon glyphs (Nerd Font private-use codepoints), many box
+    /// drawing/misc symbols, or emoji — previously any of those fell straight to `None` here,
+    /// which left the cell's background color painted with nothing drawn on top of it (visible
+    /// as flat, icon-less colored blocks in things like powerlevel10k/starship prompts).
+    fn rasterize(&mut self, ch: char, font_size_px: f32) -> Option<CachedGlyph> {
+        let (font_ref, glyph_id) = self.fonts.iter().find_map(|font| {
+            let font_ref = font.as_swash();
+            let glyph_id = font_ref.charmap().map(ch);
+            (glyph_id != 0).then_some((font_ref, glyph_id))
+        })?;
+        let mut scaler = self.scale_cx.builder(font_ref).size(font_size_px).hint(true).build();
+        let image = Render::new(&[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(StrikeWith::BestFit),
+            Source::Outline,
+        ])
+        .format(Format::Alpha)
+        .render(&mut scaler, glyph_id)?;
+        if image.placement.width == 0 || image.placement.height == 0 {
+            return None;
+        }
+        let id = self.next_glyph_id;
+        self.next_glyph_id = self.next_glyph_id.checked_add(1).expect(
+            "more distinct (char, size) glyphs drawn in one run than fit in a u16 id — \
+             should be practically unreachable for real terminal content",
+        );
+        self.glyph_data.push(image.data);
+        Some(CachedGlyph {
+            id,
+            width: image.placement.width as u16,
+            height: image.placement.height as u16,
+            bearing_left: image.placement.left as f32,
+            bearing_top: image.placement.top as f32,
+        })
     }
 }
 
@@ -958,6 +1160,42 @@ impl SelectionPipeline {
             })
             .collect();
         self.draw_rects(device, pass, &rects, viewport_w, viewport_h);
+    }
+
+    /// Draws the terminal cursor as a solid shape — see `CursorKind`'s doc comment for why this
+    /// isn't a font glyph. Same light-gray-on-black default foreground the cursor glyph used to
+    /// be drawn in.
+    #[allow(clippy::too_many_arguments)]
+    fn render_cursor(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        row: usize,
+        col: usize,
+        kind: CursorKind,
+        left: f32,
+        top: f32,
+        cell_w: f32,
+        cell_h: f32,
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        // Same light-gray-on-black default foreground the cursor glyph used to be drawn in.
+        let color = [208.0 / 255.0, 208.0 / 255.0, 208.0 / 255.0, 1.0];
+        let x = left + col as f32 * cell_w;
+        let y = top + row as f32 * cell_h;
+        let rect = match kind {
+            CursorKind::Block => (x, y, cell_w, cell_h, color),
+            CursorKind::Underline => {
+                let thickness = (cell_h * 0.12).max(1.0);
+                (x, y + cell_h - thickness, cell_w, thickness, color)
+            }
+            CursorKind::Beam => {
+                let thickness = (cell_w * 0.15).max(1.0);
+                (x, y, thickness, cell_h, color)
+            }
+        };
+        self.draw_rects(device, pass, &[rect], viewport_w, viewport_h);
     }
 
     /// Draws a hollow rectangle outline (four thin filled quads, one per edge) around a tile —

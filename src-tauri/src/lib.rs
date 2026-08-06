@@ -17,12 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use db::Db;
-use terminal::{TerminalSession, TextPipeline};
+use terminal::{Frame, TerminalSession, TextPipeline};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
-use wry::dpi::{LogicalPosition, LogicalSize};
+use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
@@ -68,15 +68,19 @@ type Activity = Arc<Mutex<HashMap<String, u64>>>;
 /// `AppEvent::SessionExited` arrives.
 type Exited = Arc<Mutex<HashSet<String>>>;
 
-/// One tile's change-detection key for `App.last_frames` — id, text spans (with color),
-/// selected cells, background-colored cells, and exited state. `RedrawRequested` skips a tile
-/// entirely when none of these changed since the last frame. Exited state has to be in here
-/// too, not just content: a session that dies while its cursor happens to be in its "blink off"
-/// phase leaves `spans` unchanged (the cursor glyph was already absent), so without this the
-/// dead-tile border color would never actually get drawn until something else forced a redraw.
+/// One tile's change-detection key for `App.last_frames` — id, per-cell glyphs (with color),
+/// cursor cell/shape, selected cells, background-colored cells, and exited state.
+/// `RedrawRequested` skips a tile entirely when none of these changed since the last frame.
+/// Exited state has to be in here too, not just content: a session that dies while its cursor
+/// happens to be in its "blink off" phase leaves both `cells` and `cursor` unchanged, so
+/// without this the dead-tile border color would never actually get drawn until something else
+/// forced a redraw. Cursor blink itself relies on `cursor` here: it toggles `cursor` between
+/// `Some`/`None` each phase (see `TerminalSession::snapshot`), which is what actually makes the
+/// blink visible frame-to-frame.
 type FrameKey = (
     String,
-    Vec<(String, Option<(u8, u8, u8)>)>,
+    Vec<(usize, usize, char, Option<(u8, u8, u8)>)>,
+    Option<(usize, usize, terminal::CursorKind)>,
     Vec<(usize, usize)>,
     Vec<(usize, usize, (u8, u8, u8))>,
     bool,
@@ -270,6 +274,17 @@ struct App {
     // haven't changed, since redrawing unconditionally was pegging the CPU (see the plan
     // doc's Phase 1b findings).
     last_frames: Vec<FrameKey>,
+    // Session id -> (generation at last snapshot, that snapshot's Frame). `RedrawRequested`
+    // used to call `TerminalSession::snapshot` (an O(visible cells) grid walk) for *every*
+    // tile on *every* redraw, even tiles whose content hadn't changed — fine while redraws were
+    // rare, but scrolling (see `TerminalSession::scroll`'s doc comment on the fractional-pixel
+    // fix) now legitimately triggers a redraw on every line crossed, so with several tiles open
+    // that meant re-walking every other tile's grid too on each line scrolled in just one of
+    // them. Reusing the cached Frame for any inactive tile whose `generation()` hasn't moved
+    // skips that work — mirrors `TextPipeline::render_all`'s existing shape-buffer cache. The
+    // active tile is always re-snapshotted fresh (never read from here) since only it can show
+    // a blinking cursor/IME preedit, neither of which bumps `generation()`.
+    frame_cache: HashMap<String, (u64, Frame)>,
     cursor_pos: (f64, f64),
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
     // it's committed) for `active_id`'s session — not sent to the pty, just overlaid at the
@@ -294,6 +309,13 @@ struct App {
     // so dragging past a tile's edge keeps extending that tile's selection rather than
     // switching tiles mid-drag.
     selecting_tile: Option<String>,
+    // Leftover fractional pixel-scroll distance carried between `MouseWheel` events. A single
+    // trackpad callback's `PixelDelta` is often just a few px — smaller than `CELL_H` — so
+    // converting it to whole lines and discarding the remainder every time made slow, deliberate
+    // scrolling (e.g. reading back through a long pasted prompt) feel unresponsive; only fast
+    // flicks ever crossed a full line. Accumulating here lets several small events add up to a
+    // line instead of each being individually rounded away.
+    scroll_remainder: f64,
     // Cursor blink phase, toggled on a timer in `about_to_wait` — see `TerminalSession::
     // snapshot`'s doc comment for why a small periodic wakeup here is fine even though this
     // app is otherwise fully event-driven.
@@ -347,6 +369,7 @@ impl App {
             terms: Vec::new(),
             active_id: None,
             last_frames: Vec::new(),
+            frame_cache: HashMap::new(),
             cursor_pos: (0.0, 0.0),
             preedit: String::new(),
             #[cfg(target_os = "macos")]
@@ -354,6 +377,7 @@ impl App {
             #[cfg(not(target_os = "macos"))]
             modifiers: winit::keyboard::ModifiersState::empty(),
             selecting_tile: None,
+            scroll_remainder: 0.0,
             cursor_visible: true,
             next_blink: Instant::now() + BLINK_INTERVAL,
             cell_w: terminal::CELL_W as f64,
@@ -420,9 +444,15 @@ impl App {
         let scale = window.scale_factor();
         let size = window.inner_size();
         let width = if self.webview_full { size.width as f64 / scale } else { SIDEBAR_WIDTH };
+        // Explicit physical pixels, not `Logical*` — the sidebar was rendering as only a thin
+        // sliver of its intended `SIDEBAR_WIDTH`, cut off well short of its actual React
+        // layout (confirmed correct independently: the same page loaded in a plain browser
+        // renders the full-width panel fine), which pointed at wry applying the logical→
+        // physical conversion inconsistently with `winit`'s own `scale_factor()` on this
+        // build. Passing already-scaled physical values sidesteps that conversion entirely.
         Rect {
-            position: LogicalPosition::new(0.0, 0.0).into(),
-            size: LogicalSize::new(width, size.height as f64 / scale).into(),
+            position: PhysicalPosition::new(0.0, 0.0).into(),
+            size: PhysicalSize::new(width * scale, size.height as f64).into(),
         }
     }
 
@@ -539,6 +569,37 @@ impl ApplicationHandler<AppEvent> for App {
             })
             .build_as_child(&*window)
             .expect("failed to build sidebar webview");
+
+        // The sidebar webview and this app's wgpu terminal surface share the same window, and
+        // on this wgpu version the surface's Metal layer composites in front of child NSViews
+        // regardless of AppKit's normal (most-recently-added-subview-wins) ordering — a known
+        // wgpu/wry interaction on macOS (https://github.com/DioxusLabs/dioxus/issues/3727,
+        // https://github.com/tauri-apps/wry/issues/1335). Explicitly re-inserting the webview's
+        // own NSView at the top of its superview's subview stack forces it back in front.
+        // `webview.webview()` returns wry's *own* `objc2` binding of the view (wry and this
+        // crate pin different `objc2` versions, per Cargo.lock — Retained<T> isn't the same
+        // type across them), so this goes through a raw pointer cast rather than wry's typed
+        // `Retained<WryWebView>` API: `Deref` still gets us `&WryWebView`, and reinterpreting
+        // that reference's address as `&objc2_app_kit::NSView` (this crate's own version) is
+        // valid because both bindings ultimately describe the exact same Objective-C object —
+        // the Rust wrapper type is version-specific, the underlying `id` is not.
+        #[cfg(target_os = "macos")]
+        {
+            use wry::WebViewExtMacOS;
+            let wk_webview = webview.webview();
+            let webview_ns_view: &objc2_app_kit::NSView =
+                unsafe { &*((&*wk_webview) as *const _ as *const objc2_app_kit::NSView) };
+            if let Some(superview) = unsafe { webview_ns_view.superview() } {
+                unsafe {
+                    superview.addSubview_positioned_relativeTo(
+                        webview_ns_view,
+                        objc2_app_kit::NSWindowOrderingMode::NSWindowAbove,
+                        None,
+                    );
+                }
+            }
+        }
+
         *self.webview.borrow_mut() = Some(webview);
 
         // --- reconnect a live pty-backed terminal for every session already saved in the db
@@ -558,6 +619,18 @@ impl ApplicationHandler<AppEvent> for App {
             .into_iter()
             .filter(|m| std::path::Path::new(&m.cwd).is_dir())
             .collect();
+        // Nothing to reconnect — either a genuinely fresh install, or every saved session's
+        // folder got filtered out above, or the "Reopen previous sessions?" prompt in `run()`
+        // was answered "No" (which clears the table outright). Whatever the reason, landing on
+        // a window with zero tiles and no on-screen way to open one (the sidebar's "new
+        // session" button is the only other entry point, and only takes effect once a session
+        // already exists to click into) is a dead end — spawn one default session so there's
+        // always at least something live to look at.
+        if metas.is_empty() {
+            if let Ok(info) = commands::create_session(&self.db, None, None) {
+                metas.push_back(info.meta);
+            }
+        }
         if let Some(first) = metas.pop_front() {
             self.spawn_session(&window, first.id, &first.cwd, &first.shell);
         }
@@ -683,6 +756,10 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::SpawnSession { id, cwd, shell } => {
                 let Some(window) = self.window.clone() else { return };
                 self.terms.retain(|(tid, _)| *tid != id);
+                // The respawned session starts its own generation counter back at 0 — drop any
+                // cached frame for this id so a coincidental generation match against the old
+                // (dead) session's last frame can never serve stale content for the new one.
+                self.frame_cache.remove(&id);
                 // `spawn_session` sizes the new session for the tile it will actually end up
                 // in *before* spawning it, rather than spawning at the old (pre-insert)
                 // layout's size and correcting afterward — a shell reads its column count once
@@ -832,7 +909,10 @@ impl ApplicationHandler<AppEvent> for App {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
                     MouseScrollDelta::PixelDelta(pos) => {
-                        (pos.y / terminal::CELL_H as f64).round() as i32
+                        self.scroll_remainder += pos.y;
+                        let lines = (self.scroll_remainder / terminal::CELL_H as f64).trunc() as i32;
+                        self.scroll_remainder -= lines as f64 * terminal::CELL_H as f64;
+                        lines
                     }
                 };
                 if lines == 0 {
@@ -864,6 +944,36 @@ impl ApplicationHandler<AppEvent> for App {
                     // programs like `vim`/`htop` redraw correctly) in sync with the window —
                     // previously hardcoded to 120x40 regardless of actual window size.
                     self.refit_all_tiles(&window);
+                }
+            }
+            // Dragging the window to a display with a different scale factor (this machine
+            // routinely has both: a 1x external monitor and the 2x built-in Retina panel) used
+            // to be a complete no-op here — every scale-dependent value this app computes
+            // (`window.scale_factor()`, read fresh in a dozen places) only ever gets re-read in
+            // response to *some* event actually firing, and this is the one macOS fires for
+            // "the window's DPI changed, logical size may be identical" (unlike `Resized`,
+            // which fires for a *pixel* size change — the two don't always coincide). Left
+            // unhandled, cell measurements, the gpu surface config, and the sidebar webview's
+            // bounds all kept whatever scale was correct for the monitor the window was
+            // *created* on, silently wrong everywhere after a drag to the other display. Not
+            // touching `inner_size_writer` accepts the OS-suggested new size (the default
+            // anyway) — this just forces the same reconfiguration `Resized` does, using the
+            // fresh scale, immediately rather than hoping a coincidental resize triggers it.
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(window) = self.window.clone() {
+                    let size = window.inner_size();
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.config.width = size.width.max(1);
+                        gpu.config.height = size.height.max(1);
+                        gpu.surface.configure(&gpu.device, &gpu.config);
+                        gpu.text.resize(&gpu.queue, gpu.config.width, gpu.config.height);
+                    }
+                    let rect = self.webview_rect(&window);
+                    if let Some(wv) = self.webview.borrow().as_ref() {
+                        let _ = wv.set_bounds(rect);
+                    }
+                    self.refit_all_tiles(&window);
+                    window.request_redraw();
                 }
             }
             // On macOS, terminal keyboard/IME input no longer flows through winit's own
@@ -1014,6 +1124,11 @@ impl ApplicationHandler<AppEvent> for App {
                 let scale = window.scale_factor();
                 let rects = tile_rects(window, self.terms.len());
 
+                // Drop cached frames for tiles no longer open (closed sessions) so the cache
+                // doesn't grow without bound across a long-running app.
+                let live_ids: HashSet<&str> = self.terms.iter().map(|(id, _)| id.as_str()).collect();
+                self.frame_cache.retain(|id, _| live_ids.contains(id.as_str()));
+
                 let mut frames = Vec::with_capacity(self.terms.len());
                 for ((id, term), &(tx, ty, tw, th)) in self.terms.iter().zip(rects.iter()) {
                     // Only actually read inside the `#[cfg(target_os = "macos")]` accessibility
@@ -1030,7 +1145,26 @@ impl ApplicationHandler<AppEvent> for App {
                     // is listening on the other end of it to blink for.
                     let preedit = if is_active { self.preedit.as_str() } else { "" };
                     let cursor_visible = is_active && self.cursor_visible && !is_exited;
-                    let tframe = term.snapshot(preedit, cursor_visible);
+                    // Active tile always gets a fresh snapshot — it's the only one that can be
+                    // showing a blinking cursor or in-progress IME preedit, and neither bumps
+                    // `generation()`. Inactive tiles reuse the cached Frame whenever their
+                    // generation hasn't moved, skipping the grid walk entirely (see
+                    // `frame_cache`'s doc comment).
+                    let gen = term.generation();
+                    let tframe = if !is_active {
+                        match self.frame_cache.get(id) {
+                            Some((cached_gen, cached)) if *cached_gen == gen => cached.clone(),
+                            _ => {
+                                let f = term.snapshot(preedit, cursor_visible);
+                                self.frame_cache.insert(id.clone(), (gen, f.clone()));
+                                f
+                            }
+                        }
+                    } else {
+                        let f = term.snapshot(preedit, cursor_visible);
+                        self.frame_cache.insert(id.clone(), (gen, f.clone()));
+                        f
+                    };
                     frames.push((id.clone(), tframe, (tw, th), is_exited));
 
                     // Tell the OS where the active tile's text caret actually is on screen —
@@ -1066,7 +1200,8 @@ impl ApplicationHandler<AppEvent> for App {
                     .map(|(id, f, _, is_exited)| {
                         (
                             id.clone(),
-                            f.spans.clone(),
+                            f.cells.clone(),
+                            f.cursor,
                             f.selection_cells.clone(),
                             f.background_cells.clone(),
                             *is_exited,
@@ -1143,15 +1278,15 @@ impl ApplicationHandler<AppEvent> for App {
                     let tile_renders: Vec<terminal::TileRender> = frames
                         .iter()
                         .zip(rects.iter())
-                        .map(|((id, tframe, _, _), &(tx, ty, tw, th))| {
+                        .map(|((_, tframe, _, _), &(tx, ty, tw, th))| {
                             let sx = (tx * scale).round() as i32;
                             let sy = (ty * scale).round() as i32;
                             let sw = (tw * scale).round() as i32;
                             let sh = (th * scale).round() as i32;
+                            let tile_left = sx as f32 + TEXT_LEFT_MARGIN as f32 * scale as f32;
                             terminal::TileRender {
-                                id: id.as_str(),
                                 frame: tframe,
-                                left: sx as f32 + TEXT_LEFT_MARGIN as f32 * scale as f32,
+                                left: tile_left,
                                 top: sy as f32 + TEXT_TOP_MARGIN as f32 * scale as f32,
                                 clip: (sx, sy, sx + sw, sy + sh),
                                 cell_w: cell_w_px,
