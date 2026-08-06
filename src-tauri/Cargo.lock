@@ -5386,6 +5386,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "swash",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
