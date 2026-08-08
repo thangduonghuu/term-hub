@@ -73,9 +73,10 @@ declare_class!(
                 let flags = event.modifierFlags();
                 if flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand) {
                     if let Some(chars) = event.charactersIgnoringModifiers() {
-                        // New/close/next/prev-session shortcuts, matching iTerm2's bindings
-                        // (this app already presents itself as `TERM_PROGRAM=iTerm.app` — see
-                        // `TerminalSession::spawn`'s doc comment). `charactersIgnoringModifiers`
+                        // New/close/next/prev-session shortcuts, matching iTerm2's bindings —
+                        // a familiarity choice for anyone coming from iTerm2, unrelated to
+                        // `TerminalSession::spawn`'s own `TERM_PROGRAM` value (which reports
+                        // this app's real identity, not iTerm2's). `charactersIgnoringModifiers`
                         // still applies Shift (only Cmd/Ctrl/Option are ignored), so Cmd+Shift+]
                         // arrives here as "}", not "]" — checked below accordingly.
                         match chars.to_string().as_str() {
@@ -186,6 +187,36 @@ declare_class!(
 
         #[method(keyUp:)]
         fn key_up(&self, _event: &NSEvent) {}
+
+        // Push-to-talk dictation, held on right Option alone. Not a Cmd-anything combo (an
+        // earlier version of this tried Cmd+M): AppKit has a confirmed real quirk where
+        // `keyUp:` is never delivered for a regular key pressed while Command is held — Cmd+key
+        // is treated as a potential menu-bar key equivalent, and the OS swallows that key's
+        // release even with no actual menu wired up. That made "release Cmd+M to stop" silently
+        // never fire — recording just kept going after the keys were let go. A modifier key's
+        // *own* press/release, in contrast, is reported through this entirely separate
+        // `flagsChanged:` method regardless of what else is held, so tracking Option's own
+        // transitions here isn't subject to that bug at all. Right Option specifically (over
+        // left) so it can't collide with anything the app already treats as a plain "Option is
+        // held" signal — nothing currently does, but this keeps holding *left* Option (were
+        // that ever bound to something) unaffected. `keyCode` identifies *which* physical
+        // modifier key changed (0x3D is the standard Mac virtual keycode for right Option,
+        // distinct from left Option's 0x3A); `modifierFlags` reports whether the Option family
+        // is now up or down. Approximates "is right Option specifically down" as "is the Option
+        // flag set at all" rather than tracking left/right independently — the gap (both
+        // Options held at once) is an edge case not worth the extra state for.
+        #[method(flagsChanged:)]
+        fn flags_changed(&self, event: &NSEvent) {
+            unsafe {
+                if event.keyCode() != 0x3D {
+                    return;
+                }
+                let held = event.modifierFlags().contains(NSEventModifierFlags::NSEventModifierFlagOption);
+                let app_event =
+                    if held { AppEvent::VoiceInputStart } else { AppEvent::VoiceInputStop };
+                let _ = self.ivars().proxy.send_event(app_event);
+            }
+        }
 
         // Just enough of the classic (pre-10.10, string-keyed) NSAccessibility protocol —
         // still the one custom `NSView`s implement — to answer "where is the text caret on
