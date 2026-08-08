@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { BarChart3, Copy, ExternalLink, FolderOpen, FolderPlus, Plus, Settings, X } from "lucide-react";
+import { BarChart3, Copy, ExternalLink, FolderOpen, FolderPlus, Mic, Plus, Settings, X } from "lucide-react";
 import type { SessionInfo } from "../lib/api";
 import { folderName } from "../lib/path";
 import { LumenPromo } from "./LumenPromo";
@@ -8,6 +8,7 @@ interface Props {
   sessions: SessionInfo[];
   activeId: string | null;
   recentlyActive: Set<string>;
+  voiceRecording: boolean;
   exitedIds: Set<string>;
   onNew: () => void;
   onClose: (id: string) => void;
@@ -27,6 +28,7 @@ export function Sidebar({
   sessions,
   activeId,
   recentlyActive,
+  voiceRecording,
   exitedIds,
   onNew,
   onClose,
@@ -89,6 +91,11 @@ export function Sidebar({
       <div className="sidebar-header">
         <span>Sessions</span>
         <div className="sidebar-header-actions">
+          {voiceRecording && (
+            <span className="mic-recording-indicator" title="Dictating… (release right Option to stop)">
+              <Mic size={15} />
+            </span>
+          )}
           <button className="usage-toggle-btn" onClick={onOpenUsage} title="Token usage">
             <BarChart3 size={15} />
           </button>

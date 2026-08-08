@@ -24,6 +24,8 @@ function App() {
   const [showQuickOpen, setShowQuickOpen] = useState(false);
   const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
   const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voiceRecording, setVoiceRecording] = useState(false);
 
   useEffect(() => {
     api.listSessions().then(setSessions);
@@ -165,12 +167,46 @@ function App() {
     return () => window.removeEventListener("termhub:close-overlays", onDismiss);
   }, []);
 
+  // Cmd+Shift+V dictation (see `speech.rs`) failing — denied mic/speech permission, no
+  // recognizer available, etc. — is detected natively in Rust, which has no UI of its own to
+  // show it in, so it's forwarded here the same way `termhub:shortcut` is. Auto-dismisses so a
+  // stale permission error doesn't linger forever over the sidebar.
+  useEffect(() => {
+    function onVoiceError(e: Event) {
+      setVoiceError((e as CustomEvent<string>).detail);
+    }
+    window.addEventListener("termhub:voice-error", onVoiceError);
+    return () => window.removeEventListener("termhub:voice-error", onVoiceError);
+  }, []);
+
+  useEffect(() => {
+    if (!voiceError) return;
+    const timer = setTimeout(() => setVoiceError(null), 6000);
+    return () => clearTimeout(timer);
+  }, [voiceError]);
+
+  // Push-to-talk (Cmd+Shift+V, held) — pushed rather than polled so the sidebar's mic icon
+  // lights up/off the instant the key is pressed/released, not on the next poll tick.
+  useEffect(() => {
+    function onVoiceState(e: Event) {
+      setVoiceRecording((e as CustomEvent<boolean>).detail);
+    }
+    window.addEventListener("termhub:voice-state", onVoiceState);
+    return () => window.removeEventListener("termhub:voice-state", onVoiceState);
+  }, []);
+
   return (
     <div className="app-shell">
+      {voiceError && (
+        <div className="voice-error-banner" onClick={() => setVoiceError(null)}>
+          {voiceError}
+        </div>
+      )}
       <Sidebar
         sessions={sessions}
         activeId={activeId}
         recentlyActive={recentlyActive}
+        voiceRecording={voiceRecording}
         exitedIds={exitedIds}
         onNew={handleNew}
         onClose={handleClose}

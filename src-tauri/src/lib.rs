@@ -7,6 +7,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_input_view;
 mod session;
+#[cfg(target_os = "macos")]
+mod speech;
 mod terminal;
 mod usage;
 
@@ -246,6 +248,45 @@ pub enum AppEvent {
     // `SpawnSession`/`CloseSession` originate from IPC commands, just in the opposite
     // direction. One of "new-session"/"close-session"/"next-session"/"prev-session".
     KeyboardShortcut(&'static str),
+    // Sent by `macos_input_view::TerminalInputView`'s `flagsChanged:` the moment right Option is
+    // physically pressed down — push-to-talk, matching how a physical walkie-talkie button
+    // works: starts dictating into whichever session is `active_id`. See that method's doc
+    // comment for why a bare modifier key (not a Cmd combo — an earlier version of this tried
+    // Cmd+M) is the only reliable way to do this on macOS. `VoiceInputStop` (sent by the same
+    // handler once right Option comes back up) is what actually ends it. Routed through `App`
+    // (rather than handled by the sidebar's own React state, unlike the session-management
+    // shortcuts above) because recording is native mic/engine state that only `App` has any
+    // business owning — see `speech.rs`'s module doc comment.
+    #[cfg(target_os = "macos")]
+    VoiceInputStart,
+    // Sent by `flagsChanged:` when right Option comes back up — ends whatever recording
+    // `VoiceInputStart` began. A no-op if nothing is currently recording (shouldn't normally
+    // happen for a single physical key, but harmless either way).
+    #[cfg(target_os = "macos")]
+    VoiceInputStop,
+    // Sent by `speech::start` when it had to kick off the system's speech-recognition
+    // permission prompt instead of starting to record immediately (first use only) — carries
+    // whether the user granted it, so `App` knows whether to retry starting the recording it was
+    // asked for or give up and tell the user why.
+    #[cfg(target_os = "macos")]
+    VoiceAuthResult(bool),
+    // Sent every time `speech.rs`'s recognition result handler fires with a non-empty result —
+    // possibly many times per recording as the recognized text is refined. `is_final` marks the
+    // one call that represents the complete, settled transcript for this recording (arrives
+    // after `speech::stop` ends the audio, once the recognizer finishes processing whatever was
+    // still buffered) — only that one actually gets written into the terminal; every earlier one
+    // is just shown live as a preview (reusing the same preedit overlay IME composition uses).
+    #[cfg(target_os = "macos")]
+    VoiceTranscript { text: String, is_final: bool },
+    // Sent once a recording is fully done one way or another: normally right after the final
+    // `VoiceTranscript` (itself following a `VoiceInputStop`), but also on its own if the
+    // recognizer errored out before ever producing a final result (network hiccup, Apple's
+    // ~1-minute recognition cap, denied mid-flight, etc.) — the `Some(message)` case is the only
+    // path that can end a recording without a matching `VoiceInputStop` from the user, so `App`
+    // has to treat this, not just the key release, as the authority on whether it's still
+    // holding a live `VoiceSession`.
+    #[cfg(target_os = "macos")]
+    VoiceEnded(Option<String>),
 }
 
 struct GpuState<'a> {
@@ -360,6 +401,22 @@ struct App {
     // Widening the webview only while the modal is actually open keeps the click-passthrough
     // behavior intact the rest of the time.
     webview_full: bool,
+    // The live mic/recognizer state for an in-progress dictation (push-to-talk — `AppEvent::
+    // VoiceInputStart`/`VoiceInputStop`). `Some` only while audio is actually being captured —
+    // `stop_voice` takes this (calling `speech::stop`) the moment the key is released, which is
+    // *before* the final transcript has actually arrived, so this alone can't be used to route
+    // that final result; see `voice_target` for that.
+    #[cfg(target_os = "macos")]
+    voice: Option<speech::VoiceSession>,
+    // Which session the current (or just-stopped-but-still-finishing) dictation targets —
+    // distinct from `voice` because it has to outlive `speech::stop` taking `voice`: the
+    // recognizer keeps delivering results asynchronously for a bit after capture stops, and the
+    // final one (`AppEvent::VoiceTranscript { is_final: true, .. }`) needs to land in the same
+    // tile dictation started in even if focus moved elsewhere in between — not just whatever tile
+    // happens to be `active_id` when that final result shows up. Cleared only once the whole
+    // recognition lifecycle ends (`AppEvent::VoiceEnded`).
+    #[cfg(target_os = "macos")]
+    voice_target: Option<String>,
 }
 
 impl App {
@@ -390,6 +447,10 @@ impl App {
             activity,
             exited,
             webview_full: false,
+            #[cfg(target_os = "macos")]
+            voice: None,
+            #[cfg(target_os = "macos")]
+            voice_target: None,
         }
     }
 
@@ -426,6 +487,82 @@ impl App {
     fn active_term(&mut self) -> Option<&mut TerminalSession> {
         let id = self.active_id.clone()?;
         self.terms.iter_mut().find(|(tid, _)| *tid == id).map(|(_, t)| t)
+    }
+
+    /// Handles `AppEvent::VoiceInputStart` (right Option pressed down) — starts dictating
+    /// into the focused tile, and re-enters itself (see `AppEvent::VoiceAuthResult`) once a
+    /// first-use permission prompt resolves. A no-op if a recording is already in progress
+    /// (shouldn't normally happen for a single physical key, but harmless either way: this only
+    /// ever starts capture, never restarts it out from under an existing session).
+    /// Committing the recognized text happens later, in `user_event`'s `AppEvent::
+    /// VoiceTranscript` handling, once the final transcript actually arrives.
+    #[cfg(target_os = "macos")]
+    fn start_voice(&mut self) {
+        if self.voice.is_some() {
+            return;
+        }
+        let Some(id) = self.active_id.clone() else { return };
+        if self.is_exited(&id) {
+            return;
+        }
+        match speech::start(self.proxy.clone()) {
+            Ok(Some(session)) => {
+                self.voice = Some(session);
+                self.voice_target = Some(id);
+                self.reset_blink();
+                self.report_voice_state(true);
+            }
+            // Authorization prompt is up; `AppEvent::VoiceAuthResult` calls back into this once
+            // the user answers it. By the time that lands right Option has often already been
+            // released (answering the system dialog takes a mouse click), so there's nothing to
+            // reconcile here — just start capture as if the key were still held; a stray
+            // `VoiceInputStop` will end it immediately if it really was released, and if the
+            // user's still holding it this just starts capture like normal.
+            Ok(None) => {}
+            Err(message) => self.report_voice_error(message),
+        }
+    }
+
+    /// Handles `AppEvent::VoiceInputStop` (right Option released) — ends the current
+    /// recording if there is one. A no-op otherwise (see `AppEvent::VoiceInputStop`'s doc
+    /// comment for why that's expected, not just defensive).
+    #[cfg(target_os = "macos")]
+    fn stop_voice(&mut self) {
+        let Some(session) = self.voice.take() else { return };
+        speech::stop(session);
+        self.preedit.clear();
+        self.report_voice_state(false);
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Surfaces a dictation failure to the user via the same sidebar toast/banner path other
+    /// native errors in this app use, rather than only ever logging to stderr where nobody
+    /// running the packaged `.app` would ever see it.
+    #[cfg(target_os = "macos")]
+    fn report_voice_error(&self, message: String) {
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let payload = serde_json::to_string(&message).unwrap_or_else(|_| "\"\"".to_string());
+            let script = format!(
+                "window.dispatchEvent(new CustomEvent('termhub:voice-error', {{ detail: {payload} }}))"
+            );
+            let _ = wv.evaluate_script(&script);
+        }
+    }
+
+    /// Tells the sidebar whether a dictation is currently in progress, so it can light up its
+    /// one mic icon — pushed immediately on every start/stop rather than polled (unlike the
+    /// activity dot/exited badge) since push-to-talk needs to feel instant, not laggy by
+    /// however long a poll interval would add.
+    #[cfg(target_os = "macos")]
+    fn report_voice_state(&self, recording: bool) {
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let script = format!(
+                "window.dispatchEvent(new CustomEvent('termhub:voice-state', {{ detail: {recording} }}))"
+            );
+            let _ = wv.evaluate_script(&script);
+        }
     }
 
     /// Tells the frontend to close any open overlay (usage dashboard, settings, quick-open) —
@@ -768,6 +905,69 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(term) = self.active_term() {
                         term.paste(&text);
                     }
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceInputStart => self.start_voice(),
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceInputStop => self.stop_voice(),
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceAuthResult(authorized) => {
+                // Authorization was requested mid-`start_voice` (first use only) — nothing was
+                // recording yet in that call, so if it's now granted, try again to actually
+                // start. If denied, there's nothing recording to clean up either; just surface
+                // why to the sidebar.
+                if authorized {
+                    self.start_voice();
+                } else {
+                    self.report_voice_error(
+                        "Speech recognition access was denied — enable it in System Settings › \
+                         Privacy & Security › Speech Recognition to use dictation."
+                            .to_string(),
+                    );
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceTranscript { text, is_final } => {
+                let Some(id) = self.voice_target.clone() else { return };
+                if is_final {
+                    self.preedit.clear();
+                    if !text.is_empty() {
+                        if let Some((_, term)) = self.terms.iter_mut().find(|(tid, _)| *tid == id) {
+                            term.paste(&text);
+                        }
+                    }
+                } else if self.active_id.as_deref() == Some(id.as_str()) {
+                    // Only the actively-focused tile renders `preedit` at all (see the
+                    // `RedrawRequested` snapshot call below) — updating it while dictating into a
+                    // tile that's since lost focus would just be invisible, silently-stale state.
+                    self.preedit = text;
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceEnded(error) => {
+                // The recognition task itself is done (naturally, or because it errored out).
+                // `voice` is normally already `None` here (the user's own `VoiceInputStop`
+                // already took it, via `speech::stop`) — the `take()` (and matching
+                // `report_voice_state(false)`, since `stop_voice` never ran to send its own)
+                // only does real work on the error path, where the recognizer gave up on its
+                // own (network hiccup, Apple's ~1-minute recognition cap, etc.) while still
+                // actively capturing, leaving the engine/tap running with nothing left
+                // listening for its output and the sidebar's mic icon stuck lit.
+                if let Some(session) = self.voice.take() {
+                    speech::stop(session);
+                    self.report_voice_state(false);
+                }
+                self.voice_target = None;
+                self.preedit.clear();
+                if let Some(message) = error {
+                    self.report_voice_error(message);
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();

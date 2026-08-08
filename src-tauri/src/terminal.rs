@@ -270,29 +270,17 @@ impl TerminalSession {
         // choice, and `truecolor` is accurate for this app (`resolve_fg` does render 24-bit
         // `Color::Spec` values exactly, not just palette-approximated).
         //
-        // `TERM_PROGRAM` is deliberately claimed as `iTerm.app`, not some unique "TermHub"
-        // identity — confirmed via `~/.kiro/settings/cli.json`, kiro-cli's shell integration
-        // only activates for a small allowlist of recognized terminals (`integrations.iterm`,
-        // `integrations.terminal`, `integrations.vscode`), keyed off exactly this variable; an
-        // unrecognized value means it silently no-ops instead of wrapping the shell for its
-        // inline-suggestion feature. This is the well-precedented way less-common terminals
-        // get compatibility with tools that gate features on `$TERM_PROGRAM` rather than
-        // actual capability detection — not unique to this app or this integration.
+        // `TERM_PROGRAM` reports this app's own real identity rather than spoofing `iTerm.app`
+        // (an earlier version of this code did, purely so kiro-cli's shell integration — which
+        // only activates for a small allowlist of recognized terminals keyed off exactly this
+        // variable — would treat a TermHub session as compatible enough to wrap for its
+        // inline-suggestion feature). `TermHub` isn't in that allowlist, so that integration no
+        // longer activates in any TermHub session; a real fix would mean getting TermHub added
+        // to kiro-cli's own allowlist, not lying about what terminal this is.
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        env.insert("TERM_PROGRAM".to_string(), "iTerm.app".to_string());
-        // `TERM_PROGRAM` alone isn't enough: kiro-cli-term (its inline-suggestion pty wrapper)
-        // also reads `ITERM_SESSION_ID` — real iTerm2 sets one per-pane (`w<N>t<N>p<N>:<UUID>`)
-        // and tools in this lineage (fig/figterm-derived) key their per-pane suggestion IPC
-        // socket off it. Every real iTerm2 pane has this set; a from-scratch TermHub session
-        // never did, which reads as "not really iTerm2" no matter what `TERM_PROGRAM` claims,
-        // and the tool silently no-ops rather than erroring. One synthetic UUID per spawned
-        // session here mirrors what a real pane would already have.
-        env.insert(
-            "ITERM_SESSION_ID".to_string(),
-            format!("w0t0p0:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
-        );
+        env.insert("TERM_PROGRAM".to_string(), "TermHub".to_string());
         // `tty::Options.env` only *adds/overrides* vars, it can't remove an inherited one —
         // but setting these to an empty string has the same effect for every shell-script
         // `-z "$VAR"` check that matters here (though *not* necessarily for a compiled
