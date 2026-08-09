@@ -34,6 +34,8 @@ pub static PRIMARY_SCREEN_HEIGHT_BITS: AtomicU64 = AtomicU64::new(0);
 pub fn install_input_view(
     window: &winit::window::Window,
     proxy: EventLoopProxy<AppEvent>,
+    ptt_keycode: u16,
+    shortcuts: Vec<(String, crate::commands::KeyBinding)>,
 ) -> Option<Retained<TerminalInputView>> {
     let handle = window.window_handle().ok()?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return None };
@@ -41,7 +43,7 @@ pub fn install_input_view(
     unsafe {
         let ns_view = handle.ns_view.as_ptr().cast::<objc2_app_kit::NSView>();
         let ns_view: &objc2_app_kit::NSView = &*ns_view;
-        let input_view = TerminalInputView::new(mtm, proxy);
+        let input_view = TerminalInputView::new(mtm, proxy, ptt_keycode, shortcuts);
         ns_view.addSubview(&input_view);
         focus_input_view(&input_view);
         Some(input_view)

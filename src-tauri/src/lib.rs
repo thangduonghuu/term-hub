@@ -287,6 +287,19 @@ pub enum AppEvent {
     // holding a live `VoiceSession`.
     #[cfg(target_os = "macos")]
     VoiceEnded(Option<String>),
+    // Sent by `ipc.rs`'s `set_voice_ptt_keycode` command when the user picks a different
+    // push-to-talk key in Settings — forwarded straight to the live `TerminalInputView` (see
+    // `TerminalInputView::set_ptt_keycode`) so the change takes effect immediately, without
+    // needing the app restarted to pick up what's now saved in the db.
+    #[cfg(target_os = "macos")]
+    SetVoicePttKeycode(u16),
+    // Sent by `ipc.rs`'s `set_shortcut`/`reset_shortcut` commands whenever a native keyboard
+    // shortcut (Copy, Paste, New/Close/Next/Prev session, Open folder) is changed in Settings —
+    // the complete, current set of effective bindings (db overrides merged with built-in
+    // defaults — see `commands::get_shortcuts`), forwarded to the live `TerminalInputView` (see
+    // `TerminalInputView::set_shortcuts`) so the change takes effect immediately.
+    #[cfg(target_os = "macos")]
+    SetShortcuts(Vec<(String, commands::KeyBinding)>),
 }
 
 struct GpuState<'a> {
@@ -322,7 +335,7 @@ struct App {
     // Session id -> (generation at last snapshot, that snapshot's Frame). `RedrawRequested`
     // used to call `TerminalSession::snapshot` (an O(visible cells) grid walk) for *every*
     // tile on *every* redraw, even tiles whose content hadn't changed — fine while redraws were
-    // rare, but scrolling (see `TerminalSession::scroll`'s doc comment on the fractional-pixel
+    // rare, but scrolling (see `TerminalSession::wheel`'s doc comment on the fractional-pixel
     // fix) now legitimately triggers a redraw on every line crossed, so with several tiles open
     // that meant re-walking every other tile's grid too on each line scrolled in just one of
     // them. Reusing the cached Frame for any inactive tile whose `generation()` hasn't moved
@@ -784,7 +797,15 @@ impl ApplicationHandler<AppEvent> for App {
         // start, not through winit's own (disabled above) machinery.
         #[cfg(target_os = "macos")]
         {
-            self.input_view = macos::install_input_view(&window, self.proxy.clone());
+            let ptt_keycode = commands::get_voice_ptt_keycode(&self.db)
+                .ok()
+                .flatten()
+                .unwrap_or(macos_input_view::DEFAULT_PTT_KEYCODE);
+            let shortcuts = commands::get_shortcuts(&self.db)
+                .map(|list| list.into_iter().map(|(id, _, binding)| (id, binding)).collect())
+                .unwrap_or_default();
+            self.input_view =
+                macos::install_input_view(&window, self.proxy.clone(), ptt_keycode, shortcuts);
         }
 
         self.gpu = Some(GpuState { surface, device, queue, config, text });
@@ -973,6 +994,18 @@ impl ApplicationHandler<AppEvent> for App {
                     w.request_redraw();
                 }
             }
+            #[cfg(target_os = "macos")]
+            AppEvent::SetVoicePttKeycode(keycode) => {
+                if let Some(view) = &self.input_view {
+                    view.set_ptt_keycode(keycode);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::SetShortcuts(bindings) => {
+                if let Some(view) = &self.input_view {
+                    view.set_shortcuts(bindings);
+                }
+            }
             AppEvent::SpawnSession { id, cwd, shell } => {
                 let Some(window) = self.window.clone() else { return };
                 self.terms.retain(|(tid, _)| *tid != id);
@@ -1124,7 +1157,7 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Positive `lines` scrolls further back into scrollback history (matches
                 // `alacritty_terminal::grid::Scroll::Delta`'s convention — see
-                // `TerminalSession::scroll`'s doc comment). Scrolling always targets whichever
+                // `TerminalSession::wheel`'s doc comment). Scrolling always targets whichever
                 // tile is under the cursor, not necessarily the focused one.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
@@ -1144,7 +1177,16 @@ impl ApplicationHandler<AppEvent> for App {
                 let logical_y = self.cursor_pos.1 / scale;
                 let rects = tile_rects(&window, self.terms.len());
                 if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
-                    self.terms[idx].1.scroll(lines);
+                    let (tx, ty, _, _) = rects[idx];
+                    let (col, row) = point_to_cell_in_tile(
+                        scale,
+                        tx,
+                        ty,
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        self.cell_w,
+                    );
+                    self.terms[idx].1.wheel(lines, col, row);
                     window.request_redraw();
                 }
             }
