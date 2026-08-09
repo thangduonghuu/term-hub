@@ -92,7 +92,10 @@ export function Sidebar({
         <span>Sessions</span>
         <div className="sidebar-header-actions">
           {voiceRecording && (
-            <span className="mic-recording-indicator" title="Dictating… (release right Option to stop)">
+            <span
+              className="mic-recording-indicator"
+              title="Dictating… (release the push-to-talk key, set in Settings, to stop)"
+            >
               <Mic size={15} />
             </span>
           )}

@@ -438,12 +438,47 @@ impl TerminalSession {
         self._pty.on_resize(window_size);
     }
 
-    /// Scrolls the viewport by `delta` lines (positive = toward history/up, negative = toward
-    /// the live prompt/down) — a thin wrapper since `alacritty_terminal`'s `Grid` already
-    /// tracks scrollback and `display_iter()` (used by `snapshot`) automatically renders from
-    /// the scrolled position, no separate scrollback buffer or rendering path needed.
-    pub fn scroll(&mut self, delta: i32) {
-        self.term.lock().unwrap().scroll_display(Scroll::Delta(delta));
+    /// Routes a wheel-scroll event to whichever of three destinations the running program has
+    /// asked for, mirroring the same three-way priority real terminals (xterm, Alacritty,
+    /// iTerm2) use:
+    ///
+    /// 1. Mouse tracking active (`?1000`/`?1002`/`?1003` — e.g. Claude Code's own transcript
+    ///    view, `htop`, `fzf --mouse`): these programs live on the alt screen with no
+    ///    scrollback of their own and explicitly opted into receiving raw wheel events, so
+    ///    each notch is reported as an SGR button-64/65 click (`CSI < btn ; col ; row M`) per
+    ///    the `?1006` extension they also enable. Without this, wheel input simply vanishes —
+    ///    there's no local scrollback to fall back to (see case 3) because the alt screen
+    ///    carries none, which is exactly the "can't scroll in Claude Code" symptom this fixes.
+    /// 2. No mouse tracking, but still on the alt screen (e.g. plain `less`, `vim`): translated
+    ///    to Up/Down keypresses, which is how these programs page through content when they
+    ///    haven't asked for mouse events either.
+    /// 3. Otherwise (a plain shell prompt): scrolls `termhub`'s own scrollback locally — the
+    ///    original behavior, still correct here since the primary screen's grid is the one
+    ///    that actually holds history.
+    ///
+    /// `delta` is signed lines (positive = toward history/up, matching `Scroll::Delta`'s
+    /// convention); `col`/`row` are the 0-based cell the pointer is over, only used by the
+    /// mouse-report path.
+    pub fn wheel(&mut self, delta: i32, col: usize, row: i32) {
+        let mode = *self.term.lock().unwrap().mode();
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            let btn: u8 = if delta > 0 { 64 } else { 65 };
+            let report = format!("\x1b[<{btn};{};{}M", col + 1, row.max(0) + 1);
+            let mut bytes = Vec::with_capacity(report.len() * delta.unsigned_abs() as usize);
+            for _ in 0..delta.unsigned_abs() {
+                bytes.extend_from_slice(report.as_bytes());
+            }
+            let _ = self.pty_writer.write_all(&bytes);
+        } else if mode.contains(TermMode::ALT_SCREEN) {
+            let seq: &[u8] = if delta > 0 { b"\x1b[A" } else { b"\x1b[B" };
+            let mut bytes = Vec::with_capacity(seq.len() * delta.unsigned_abs() as usize);
+            for _ in 0..delta.unsigned_abs() {
+                bytes.extend_from_slice(seq);
+            }
+            let _ = self.pty_writer.write_all(&bytes);
+        } else {
+            self.term.lock().unwrap().scroll_display(Scroll::Delta(delta));
+        }
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 

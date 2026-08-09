@@ -163,6 +163,60 @@ fn handle(
         }
         "clear_anthropic_api_key" => commands::clear_anthropic_api_key(db).and_then(to_value),
         "check_claude_limits" => commands::check_claude_limits(db).and_then(to_value),
+        // Empty on non-macOS (dictation isn't implemented there yet) — the Settings panel uses
+        // an empty list as its signal to hide the whole "Voice dictation" section, the same way
+        // it already hides "External terminal" when `list_terminal_apps` comes back empty.
+        #[cfg(target_os = "macos")]
+        "get_voice_ptt_key_options" => to_value(crate::macos_input_view::PTT_KEY_OPTIONS.to_vec()),
+        #[cfg(not(target_os = "macos"))]
+        "get_voice_ptt_key_options" => to_value(Vec::<(u16, &str)>::new()),
+        "get_voice_ptt_keycode" => commands::get_voice_ptt_keycode(db).and_then(to_value),
+        // Also pushed straight to the already-live `TerminalInputView` (rather than only
+        // persisted to the db) so a change in Settings takes effect immediately — that native
+        // view was already constructed with whatever keycode was configured at startup (see
+        // `App::resumed`) and has no other way to learn it changed mid-session.
+        "set_voice_ptt_keycode" => {
+            let keycode: u16 = arg(&args, "keycode").ok_or("missing keycode")?;
+            commands::set_voice_ptt_keycode(db, keycode).and_then(to_value)?;
+            #[cfg(target_os = "macos")]
+            let _ = proxy.send_event(AppEvent::SetVoicePttKeycode(keycode));
+            to_value(())
+        }
+        "get_shortcuts" => commands::get_shortcuts(db).and_then(to_value),
+        // Both mutations reload and push the *complete* effective set afterward (rather than
+        // patching just the one changed entry) — the live `TerminalInputView` otherwise has no
+        // other way to learn a Settings change happened mid-session (same reasoning as
+        // `set_voice_ptt_keycode` above), and reloading the whole thing from the db is simpler
+        // and just as cheap as patching given there are only a handful of these.
+        "set_shortcut" => {
+            let action: String = arg(&args, "action").ok_or("missing action")?;
+            let binding: commands::KeyBinding = arg(&args, "binding").ok_or("missing binding")?;
+            commands::set_shortcut(db, &action, binding)?;
+            push_shortcuts(db, proxy);
+            to_value(())
+        }
+        "reset_shortcut" => {
+            let action: String = arg(&args, "action").ok_or("missing action")?;
+            commands::reset_shortcut(db, &action)?;
+            push_shortcuts(db, proxy);
+            to_value(())
+        }
         _ => Err(format!("unknown command: {cmd}")),
     }
 }
+
+/// Reloads every shortcut's effective binding from the db and forwards it to the live
+/// `TerminalInputView` — see `set_shortcut`/`reset_shortcut` above. Errors reloading are
+/// swallowed (not surfaced as this command's own failure): the db write those callers made
+/// already succeeded by this point, so failing the whole IPC call over a reload issue would
+/// misreport a save that actually worked — the native view just keeps whatever it already had
+/// until a later successful reload (e.g. the next change, or app restart) catches it up.
+#[cfg(target_os = "macos")]
+fn push_shortcuts(db: &Db, proxy: &EventLoopProxy<AppEvent>) {
+    if let Ok(shortcuts) = commands::get_shortcuts(db) {
+        let bindings = shortcuts.into_iter().map(|(id, _, binding)| (id, binding)).collect();
+        let _ = proxy.send_event(AppEvent::SetShortcuts(bindings));
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn push_shortcuts(_db: &Db, _proxy: &EventLoopProxy<AppEvent>) {}

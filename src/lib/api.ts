@@ -8,6 +8,16 @@ export interface SessionInfo {
   created_at: number;
 }
 
+// Mirrors `commands::KeyBinding` in Rust — a raw macOS virtual keycode plus which modifiers
+// must be held, not a character (so it's immune to Shift changing what a key produces).
+export interface KeyBinding {
+  cmd: boolean;
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  keycode: number;
+}
+
 export interface SessionUsage {
   session_id: string | null;
   session_name: string;
@@ -86,4 +96,20 @@ export const api = {
   setAnthropicApiKey: (key: string) => invoke<void>("set_anthropic_api_key", { key }),
   clearAnthropicApiKey: () => invoke<void>("clear_anthropic_api_key"),
   checkClaudeLimits: () => invoke<ClaudeLimits>("check_claude_limits"),
+  // Push-to-talk key for voice dictation (see speech.rs) — a raw macOS virtual keycode, one of
+  // the curated `[keycode, label]` pairs `getVoicePttKeyOptions` returns (empty on platforms
+  // that don't support dictation yet, which is also this section's signal to hide itself in
+  // Settings). `getVoicePttKeycode` is null until the user has ever changed it from the
+  // built-in default.
+  getVoicePttKeyOptions: () => invoke<[number, string][]>("get_voice_ptt_key_options"),
+  getVoicePttKeycode: () => invoke<number | null>("get_voice_ptt_keycode"),
+  setVoicePttKeycode: (keycode: number) => invoke<void>("set_voice_ptt_keycode", { keycode }),
+  // Every user-customizable native keyboard shortcut (Copy, Paste, New/Close/Next/Prev
+  // session, Open folder) as `[action id, display label, effective binding]` — the effective
+  // binding is already the db override merged with the built-in default (see
+  // `commands::get_shortcuts`), so there's always exactly one entry per action, never "unset".
+  getShortcuts: () => invoke<[string, string, KeyBinding][]>("get_shortcuts"),
+  setShortcut: (action: string, binding: KeyBinding) =>
+    invoke<void>("set_shortcut", { action, binding }),
+  resetShortcut: (action: string) => invoke<void>("reset_shortcut", { action }),
 };
