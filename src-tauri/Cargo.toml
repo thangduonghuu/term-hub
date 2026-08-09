@@ -42,6 +42,26 @@ rfd = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSAccessibilityConstants", "NSScreen"] }
-objc2-foundation = "0.2"
+objc2-app-kit = { version = "0.2", features = ["NSAccessibilityConstants", "NSScreen", "NSPasteboard"] }
+objc2-foundation = { version = "0.2", features = ["NSURL", "NSString"] }
+objc2-speech = { version = "0.3", default-features = false, features = [
+    "std", "block2", "SFSpeechRecognizer", "SFSpeechRecognitionRequest", "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTask", "SFTranscription", "SFTranscriptionSegment", "SFErrors",
+    "objc2-avf-audio",
+] }
+objc2-avf-audio = { version = "0.3", default-features = false, features = [
+    "std", "block2", "AVAudioEngine", "AVAudioNode", "AVAudioIONode", "AVAudioFormat",
+    "AVAudioBuffer", "AVAudioTypes", "AVAudioTime",
+] }
+# `objc2-speech`/`objc2-avf-audio` 0.3 are built against objc2 0.6 (Retained/Allocated/etc. from
+# that version), a full major bump from the `objc2 = "0.5"` this crate otherwise uses for its own
+# AppKit interop (macos.rs/macos_input_view.rs) — Cargo happily resolves both simultaneously
+# since 0.x versions with different minors are semver-incompatible anyway, but that means the two
+# `Retained<T>` types are NOT interchangeable, so `speech.rs` (which only talks to the Speech/
+# AVFAudio APIs) sticks to this renamed import rather than the plain `objc2` used everywhere else.
+objc2-speech-runtime = { package = "objc2", version = "0.6", default-features = false, features = ["std"] }
+objc2-speech-foundation = { package = "objc2-foundation", version = "0.3", default-features = false, features = [
+    "std", "NSError", "NSString",
+] }
+block2 = "0.6"
 

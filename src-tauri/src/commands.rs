@@ -1,9 +1,101 @@
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::Db;
 use crate::external_terminal;
 use crate::session::{default_cwd, default_shell, SessionInfo, SessionMeta};
 use crate::usage::UsageSummary;
+
+/// A single native keyboard shortcut: which modifiers must be held, plus a raw macOS virtual
+/// keycode (`NSEvent::keyCode()`) identifying the physical key — not a character, so this is
+/// immune to layout/Shift changing what character a key produces (the previous, pre-
+/// customization version of this app matched on `charactersIgnoringModifiers()` instead, which
+/// worked but meant Cmd+Shift+`]` had to be special-cased as matching the character `}`).
+/// `Copy`/`RootFolder` (and voice-dictation's PTT key — module doc) are handled with dedicated
+/// `NSEvent` paths since they're one-shot/hold rather than "trigger an app action", but every
+/// other shortcut in `SHORTCUT_ACTIONS` below is dispatched generically off exactly this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyBinding {
+    pub cmd: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub keycode: u16,
+}
+
+/// Every user-customizable native keyboard shortcut this app has, as `(action id, display
+/// label, built-in default)` — single source of truth for Settings' "Keyboard Shortcuts" list
+/// and for `TerminalInputView::key_down`'s dispatch (see `macos_input_view.rs`), which looks an
+/// incoming keystroke up against whatever's currently bound to each of these ids rather than
+/// hardcoding key comparisons per action. macOS virtual keycodes below are the standard,
+/// stable, layout-position-based Mac constants (same ones already used elsewhere in this app
+/// for Escape/Delete/Home/End/Page Up/Down) — not ASCII, not affected by Shift.
+pub const SHORTCUT_ACTIONS: &[(&str, &str, KeyBinding)] = &[
+    ("copy", "Copy", KeyBinding { cmd: true, ctrl: false, shift: false, alt: false, keycode: 0x08 }), // C
+    ("paste", "Paste", KeyBinding { cmd: true, ctrl: false, shift: false, alt: false, keycode: 0x09 }), // V
+    (
+        "new_session",
+        "New session",
+        KeyBinding { cmd: true, ctrl: false, shift: false, alt: false, keycode: 0x11 }, // T
+    ),
+    (
+        "close_session",
+        "Close session",
+        KeyBinding { cmd: true, ctrl: false, shift: false, alt: false, keycode: 0x0D }, // W
+    ),
+    (
+        "next_session",
+        "Next session",
+        KeyBinding { cmd: true, ctrl: false, shift: true, alt: false, keycode: 0x1E }, // ]
+    ),
+    (
+        "prev_session",
+        "Previous session",
+        KeyBinding { cmd: true, ctrl: false, shift: true, alt: false, keycode: 0x21 }, // [
+    ),
+    (
+        "open_folder",
+        "Open folder",
+        KeyBinding { cmd: false, ctrl: true, shift: false, alt: false, keycode: 0x0F }, // R
+    ),
+];
+
+fn shortcut_setting_key(action: &str) -> String {
+    format!("keybind_{action}")
+}
+
+/// Every customizable shortcut's *effective* binding right now — the db override if the user's
+/// ever changed it, otherwise `SHORTCUT_ACTIONS`' built-in default. Always returns exactly one
+/// entry per `SHORTCUT_ACTIONS` entry, in the same order, so the frontend never has to separately
+/// reason about "unset" — everything already has some binding.
+pub fn get_shortcuts(db: &Db) -> Result<Vec<(String, String, KeyBinding)>, String> {
+    SHORTCUT_ACTIONS
+        .iter()
+        .map(|&(id, label, default)| {
+            let stored = db.get_setting(&shortcut_setting_key(id)).map_err(|e| e.to_string())?;
+            let binding = stored
+                .and_then(|s| serde_json::from_str::<KeyBinding>(&s).ok())
+                .unwrap_or(default);
+            Ok((id.to_string(), label.to_string(), binding))
+        })
+        .collect()
+}
+
+pub fn set_shortcut(db: &Db, action: &str, binding: KeyBinding) -> Result<(), String> {
+    if !SHORTCUT_ACTIONS.iter().any(|&(id, _, _)| id == action) {
+        return Err(format!("unknown shortcut action: {action}"));
+    }
+    let json = serde_json::to_string(&binding).map_err(|e| e.to_string())?;
+    db.set_setting(&shortcut_setting_key(action), &json).map_err(|e| e.to_string())
+}
+
+/// Reverts one shortcut back to its `SHORTCUT_ACTIONS` default by removing the db override —
+/// mirrors `clear_default_shell`'s "delete rather than write the default back" approach, so a
+/// later change to what the built-in default *is* doesn't get masked by an old row that happens
+/// to hold the previous default's value.
+pub fn reset_shortcut(db: &Db, action: &str) -> Result<(), String> {
+    db.delete_setting(&shortcut_setting_key(action)).map_err(|e| e.to_string())
+}
 
 pub fn get_default_cwd() -> String {
     default_cwd()
@@ -114,6 +206,26 @@ pub fn set_default_shell(db: &Db, shell: &str) -> Result<(), String> {
 
 pub fn clear_default_shell(db: &Db) -> Result<(), String> {
     db.delete_setting(DEFAULT_SHELL_SETTING).map_err(|e| e.to_string())
+}
+
+const VOICE_PTT_KEYCODE_SETTING: &str = "voice_ptt_keycode";
+
+/// The configured push-to-talk key for voice dictation (see `speech.rs`) — a raw macOS virtual
+/// keycode (`NSEvent::keyCode`) for one of a curated set of modifier keys the Settings panel
+/// offers (right Option, left Option, right Shift, etc.), stored as its decimal string form.
+/// `None` if never set, in which case the caller falls back to the built-in default (right
+/// Option — see `macos_input_view::DEFAULT_PTT_KEYCODE`). Deliberately restricted to modifier
+/// keys at the UI layer: those are the only physical keys whose press/release AppKit reports
+/// reliably regardless of what else is held (see `TerminalInputView::flags_changed`'s doc
+/// comment for the confirmed real bug — held Cmd swallowing a combo'd key's `keyUp:` — that
+/// ruled out anything else).
+pub fn get_voice_ptt_keycode(db: &Db) -> Result<Option<u16>, String> {
+    let raw = db.get_setting(VOICE_PTT_KEYCODE_SETTING).map_err(|e| e.to_string())?;
+    Ok(raw.and_then(|s| s.parse().ok()))
+}
+
+pub fn set_voice_ptt_keycode(db: &Db, keycode: u16) -> Result<(), String> {
+    db.set_setting(VOICE_PTT_KEYCODE_SETTING, &keycode.to_string()).map_err(|e| e.to_string())
 }
 
 const LUMEN_PROMPT_SEEN_SETTING: &str = "lumen_prompt_seen";

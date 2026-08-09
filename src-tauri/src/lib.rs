@@ -7,6 +7,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_input_view;
 mod session;
+#[cfg(target_os = "macos")]
+mod speech;
 mod terminal;
 mod usage;
 
@@ -97,6 +99,10 @@ const RECONNECT_STAGGER: Duration = Duration::from_millis(1500);
 // keeps the margin tweakable in one place without a stale-cache field to remember to update.
 const TEXT_LEFT_MARGIN: f64 = 8.0;
 const TEXT_TOP_MARGIN: f64 = 4.0;
+// Logical px; scaled to physical px the same way border thickness is. Clamped per-tile against
+// half the tile's own width/height (see `render_rounded_corners`) so this stays sane once
+// enough sessions are open that tiles shrink well below this.
+const TILE_CORNER_RADIUS: f64 = 10.0;
 
 /// Logical-space (x, y, width, height) rectangles — one per currently-open session, in the
 /// same order as `App.terms` — tiling them across the window's terminal area (everything
@@ -242,6 +248,58 @@ pub enum AppEvent {
     // `SpawnSession`/`CloseSession` originate from IPC commands, just in the opposite
     // direction. One of "new-session"/"close-session"/"next-session"/"prev-session".
     KeyboardShortcut(&'static str),
+    // Sent by `macos_input_view::TerminalInputView`'s `flagsChanged:` the moment right Option is
+    // physically pressed down — push-to-talk, matching how a physical walkie-talkie button
+    // works: starts dictating into whichever session is `active_id`. See that method's doc
+    // comment for why a bare modifier key (not a Cmd combo — an earlier version of this tried
+    // Cmd+M) is the only reliable way to do this on macOS. `VoiceInputStop` (sent by the same
+    // handler once right Option comes back up) is what actually ends it. Routed through `App`
+    // (rather than handled by the sidebar's own React state, unlike the session-management
+    // shortcuts above) because recording is native mic/engine state that only `App` has any
+    // business owning — see `speech.rs`'s module doc comment.
+    #[cfg(target_os = "macos")]
+    VoiceInputStart,
+    // Sent by `flagsChanged:` when right Option comes back up — ends whatever recording
+    // `VoiceInputStart` began. A no-op if nothing is currently recording (shouldn't normally
+    // happen for a single physical key, but harmless either way).
+    #[cfg(target_os = "macos")]
+    VoiceInputStop,
+    // Sent by `speech::start` when it had to kick off the system's speech-recognition
+    // permission prompt instead of starting to record immediately (first use only) — carries
+    // whether the user granted it, so `App` knows whether to retry starting the recording it was
+    // asked for or give up and tell the user why.
+    #[cfg(target_os = "macos")]
+    VoiceAuthResult(bool),
+    // Sent every time `speech.rs`'s recognition result handler fires with a non-empty result —
+    // possibly many times per recording as the recognized text is refined. `is_final` marks the
+    // one call that represents the complete, settled transcript for this recording (arrives
+    // after `speech::stop` ends the audio, once the recognizer finishes processing whatever was
+    // still buffered) — only that one actually gets written into the terminal; every earlier one
+    // is just shown live as a preview (reusing the same preedit overlay IME composition uses).
+    #[cfg(target_os = "macos")]
+    VoiceTranscript { text: String, is_final: bool },
+    // Sent once a recording is fully done one way or another: normally right after the final
+    // `VoiceTranscript` (itself following a `VoiceInputStop`), but also on its own if the
+    // recognizer errored out before ever producing a final result (network hiccup, Apple's
+    // ~1-minute recognition cap, denied mid-flight, etc.) — the `Some(message)` case is the only
+    // path that can end a recording without a matching `VoiceInputStop` from the user, so `App`
+    // has to treat this, not just the key release, as the authority on whether it's still
+    // holding a live `VoiceSession`.
+    #[cfg(target_os = "macos")]
+    VoiceEnded(Option<String>),
+    // Sent by `ipc.rs`'s `set_voice_ptt_keycode` command when the user picks a different
+    // push-to-talk key in Settings — forwarded straight to the live `TerminalInputView` (see
+    // `TerminalInputView::set_ptt_keycode`) so the change takes effect immediately, without
+    // needing the app restarted to pick up what's now saved in the db.
+    #[cfg(target_os = "macos")]
+    SetVoicePttKeycode(u16),
+    // Sent by `ipc.rs`'s `set_shortcut`/`reset_shortcut` commands whenever a native keyboard
+    // shortcut (Copy, Paste, New/Close/Next/Prev session, Open folder) is changed in Settings —
+    // the complete, current set of effective bindings (db overrides merged with built-in
+    // defaults — see `commands::get_shortcuts`), forwarded to the live `TerminalInputView` (see
+    // `TerminalInputView::set_shortcuts`) so the change takes effect immediately.
+    #[cfg(target_os = "macos")]
+    SetShortcuts(Vec<(String, commands::KeyBinding)>),
 }
 
 struct GpuState<'a> {
@@ -277,7 +335,7 @@ struct App {
     // Session id -> (generation at last snapshot, that snapshot's Frame). `RedrawRequested`
     // used to call `TerminalSession::snapshot` (an O(visible cells) grid walk) for *every*
     // tile on *every* redraw, even tiles whose content hadn't changed — fine while redraws were
-    // rare, but scrolling (see `TerminalSession::scroll`'s doc comment on the fractional-pixel
+    // rare, but scrolling (see `TerminalSession::wheel`'s doc comment on the fractional-pixel
     // fix) now legitimately triggers a redraw on every line crossed, so with several tiles open
     // that meant re-walking every other tile's grid too on each line scrolled in just one of
     // them. Reusing the cached Frame for any inactive tile whose `generation()` hasn't moved
@@ -356,6 +414,22 @@ struct App {
     // Widening the webview only while the modal is actually open keeps the click-passthrough
     // behavior intact the rest of the time.
     webview_full: bool,
+    // The live mic/recognizer state for an in-progress dictation (push-to-talk — `AppEvent::
+    // VoiceInputStart`/`VoiceInputStop`). `Some` only while audio is actually being captured —
+    // `stop_voice` takes this (calling `speech::stop`) the moment the key is released, which is
+    // *before* the final transcript has actually arrived, so this alone can't be used to route
+    // that final result; see `voice_target` for that.
+    #[cfg(target_os = "macos")]
+    voice: Option<speech::VoiceSession>,
+    // Which session the current (or just-stopped-but-still-finishing) dictation targets —
+    // distinct from `voice` because it has to outlive `speech::stop` taking `voice`: the
+    // recognizer keeps delivering results asynchronously for a bit after capture stops, and the
+    // final one (`AppEvent::VoiceTranscript { is_final: true, .. }`) needs to land in the same
+    // tile dictation started in even if focus moved elsewhere in between — not just whatever tile
+    // happens to be `active_id` when that final result shows up. Cleared only once the whole
+    // recognition lifecycle ends (`AppEvent::VoiceEnded`).
+    #[cfg(target_os = "macos")]
+    voice_target: Option<String>,
 }
 
 impl App {
@@ -386,6 +460,10 @@ impl App {
             activity,
             exited,
             webview_full: false,
+            #[cfg(target_os = "macos")]
+            voice: None,
+            #[cfg(target_os = "macos")]
+            voice_target: None,
         }
     }
 
@@ -422,6 +500,82 @@ impl App {
     fn active_term(&mut self) -> Option<&mut TerminalSession> {
         let id = self.active_id.clone()?;
         self.terms.iter_mut().find(|(tid, _)| *tid == id).map(|(_, t)| t)
+    }
+
+    /// Handles `AppEvent::VoiceInputStart` (right Option pressed down) — starts dictating
+    /// into the focused tile, and re-enters itself (see `AppEvent::VoiceAuthResult`) once a
+    /// first-use permission prompt resolves. A no-op if a recording is already in progress
+    /// (shouldn't normally happen for a single physical key, but harmless either way: this only
+    /// ever starts capture, never restarts it out from under an existing session).
+    /// Committing the recognized text happens later, in `user_event`'s `AppEvent::
+    /// VoiceTranscript` handling, once the final transcript actually arrives.
+    #[cfg(target_os = "macos")]
+    fn start_voice(&mut self) {
+        if self.voice.is_some() {
+            return;
+        }
+        let Some(id) = self.active_id.clone() else { return };
+        if self.is_exited(&id) {
+            return;
+        }
+        match speech::start(self.proxy.clone()) {
+            Ok(Some(session)) => {
+                self.voice = Some(session);
+                self.voice_target = Some(id);
+                self.reset_blink();
+                self.report_voice_state(true);
+            }
+            // Authorization prompt is up; `AppEvent::VoiceAuthResult` calls back into this once
+            // the user answers it. By the time that lands right Option has often already been
+            // released (answering the system dialog takes a mouse click), so there's nothing to
+            // reconcile here — just start capture as if the key were still held; a stray
+            // `VoiceInputStop` will end it immediately if it really was released, and if the
+            // user's still holding it this just starts capture like normal.
+            Ok(None) => {}
+            Err(message) => self.report_voice_error(message),
+        }
+    }
+
+    /// Handles `AppEvent::VoiceInputStop` (right Option released) — ends the current
+    /// recording if there is one. A no-op otherwise (see `AppEvent::VoiceInputStop`'s doc
+    /// comment for why that's expected, not just defensive).
+    #[cfg(target_os = "macos")]
+    fn stop_voice(&mut self) {
+        let Some(session) = self.voice.take() else { return };
+        speech::stop(session);
+        self.preedit.clear();
+        self.report_voice_state(false);
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Surfaces a dictation failure to the user via the same sidebar toast/banner path other
+    /// native errors in this app use, rather than only ever logging to stderr where nobody
+    /// running the packaged `.app` would ever see it.
+    #[cfg(target_os = "macos")]
+    fn report_voice_error(&self, message: String) {
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let payload = serde_json::to_string(&message).unwrap_or_else(|_| "\"\"".to_string());
+            let script = format!(
+                "window.dispatchEvent(new CustomEvent('termhub:voice-error', {{ detail: {payload} }}))"
+            );
+            let _ = wv.evaluate_script(&script);
+        }
+    }
+
+    /// Tells the sidebar whether a dictation is currently in progress, so it can light up its
+    /// one mic icon — pushed immediately on every start/stop rather than polled (unlike the
+    /// activity dot/exited badge) since push-to-talk needs to feel instant, not laggy by
+    /// however long a poll interval would add.
+    #[cfg(target_os = "macos")]
+    fn report_voice_state(&self, recording: bool) {
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let script = format!(
+                "window.dispatchEvent(new CustomEvent('termhub:voice-state', {{ detail: {recording} }}))"
+            );
+            let _ = wv.evaluate_script(&script);
+        }
     }
 
     /// Tells the frontend to close any open overlay (usage dashboard, settings, quick-open) —
@@ -643,7 +797,15 @@ impl ApplicationHandler<AppEvent> for App {
         // start, not through winit's own (disabled above) machinery.
         #[cfg(target_os = "macos")]
         {
-            self.input_view = macos::install_input_view(&window, self.proxy.clone());
+            let ptt_keycode = commands::get_voice_ptt_keycode(&self.db)
+                .ok()
+                .flatten()
+                .unwrap_or(macos_input_view::DEFAULT_PTT_KEYCODE);
+            let shortcuts = commands::get_shortcuts(&self.db)
+                .map(|list| list.into_iter().map(|(id, _, binding)| (id, binding)).collect())
+                .unwrap_or_default();
+            self.input_view =
+                macos::install_input_view(&window, self.proxy.clone(), ptt_keycode, shortcuts);
         }
 
         self.gpu = Some(GpuState { surface, device, queue, config, text });
@@ -733,24 +895,115 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Paste => {
                 self.reset_blink();
-                let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
-                // A screenshot/copied image has no meaningful text representation to paste
-                // into a pty — matching iTerm2/Warp/VS Code's terminal, write it to a temp
-                // file and paste the path instead, so it can be handed to a CLI tool that
-                // takes a file argument. `get_image` is tried first since a lot of image
-                // sources (e.g. macOS screenshot-to-clipboard) don't also populate a text
-                // representation for `get_text` to fall back on.
-                let pasted = match clipboard.get_image() {
-                    Ok(img) => save_clipboard_image(&img),
-                    Err(_) => clipboard.get_text().ok(),
+                // A copied *file* (e.g. Cmd-C on a screenshot in Finder) must be handled before
+                // falling through to `get_image`: see `macos::clipboard_file_url`'s doc comment
+                // — Finder also declares an Icon-Services placeholder bitmap under the image
+                // pasteboard types, which `get_image` can't tell apart from a real copied
+                // bitmap, so checking the file-URL type first and using the file's own path
+                // (rather than re-deriving image bytes from the pasteboard at all) sidesteps
+                // that placeholder entirely.
+                #[cfg(target_os = "macos")]
+                let file_path = crate::macos::clipboard_file_url();
+                #[cfg(not(target_os = "macos"))]
+                let file_path: Option<std::path::PathBuf> = None;
+
+                let pasted = if let Some(path) = file_path {
+                    Some(format!("'{}'", path.display()))
+                } else {
+                    let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+                    // A screenshot/copied image has no meaningful text representation to paste
+                    // into a pty — matching iTerm2/Warp/VS Code's terminal, write it to a temp
+                    // file and paste the path instead, so it can be handed to a CLI tool that
+                    // takes a file argument. `get_image` is tried first since a lot of image
+                    // sources (e.g. macOS screenshot-to-clipboard) don't also populate a text
+                    // representation for `get_text` to fall back on.
+                    match clipboard.get_image() {
+                        Ok(img) => save_clipboard_image(&img),
+                        Err(_) => clipboard.get_text().ok(),
+                    }
                 };
                 if let Some(text) = pasted {
                     if let Some(term) = self.active_term() {
-                        term.write(&text);
+                        term.paste(&text);
                     }
                 }
                 if let Some(w) = &self.window {
                     w.request_redraw();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceInputStart => self.start_voice(),
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceInputStop => self.stop_voice(),
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceAuthResult(authorized) => {
+                // Authorization was requested mid-`start_voice` (first use only) — nothing was
+                // recording yet in that call, so if it's now granted, try again to actually
+                // start. If denied, there's nothing recording to clean up either; just surface
+                // why to the sidebar.
+                if authorized {
+                    self.start_voice();
+                } else {
+                    self.report_voice_error(
+                        "Speech recognition access was denied — enable it in System Settings › \
+                         Privacy & Security › Speech Recognition to use dictation."
+                            .to_string(),
+                    );
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceTranscript { text, is_final } => {
+                let Some(id) = self.voice_target.clone() else { return };
+                if is_final {
+                    self.preedit.clear();
+                    if !text.is_empty() {
+                        if let Some((_, term)) = self.terms.iter_mut().find(|(tid, _)| *tid == id) {
+                            term.paste(&text);
+                        }
+                    }
+                } else if self.active_id.as_deref() == Some(id.as_str()) {
+                    // Only the actively-focused tile renders `preedit` at all (see the
+                    // `RedrawRequested` snapshot call below) — updating it while dictating into a
+                    // tile that's since lost focus would just be invisible, silently-stale state.
+                    self.preedit = text;
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::VoiceEnded(error) => {
+                // The recognition task itself is done (naturally, or because it errored out).
+                // `voice` is normally already `None` here (the user's own `VoiceInputStop`
+                // already took it, via `speech::stop`) — the `take()` (and matching
+                // `report_voice_state(false)`, since `stop_voice` never ran to send its own)
+                // only does real work on the error path, where the recognizer gave up on its
+                // own (network hiccup, Apple's ~1-minute recognition cap, etc.) while still
+                // actively capturing, leaving the engine/tap running with nothing left
+                // listening for its output and the sidebar's mic icon stuck lit.
+                if let Some(session) = self.voice.take() {
+                    speech::stop(session);
+                    self.report_voice_state(false);
+                }
+                self.voice_target = None;
+                self.preedit.clear();
+                if let Some(message) = error {
+                    self.report_voice_error(message);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::SetVoicePttKeycode(keycode) => {
+                if let Some(view) = &self.input_view {
+                    view.set_ptt_keycode(keycode);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            AppEvent::SetShortcuts(bindings) => {
+                if let Some(view) = &self.input_view {
+                    view.set_shortcuts(bindings);
                 }
             }
             AppEvent::SpawnSession { id, cwd, shell } => {
@@ -904,7 +1157,7 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Positive `lines` scrolls further back into scrollback history (matches
                 // `alacritty_terminal::grid::Scroll::Delta`'s convention — see
-                // `TerminalSession::scroll`'s doc comment). Scrolling always targets whichever
+                // `TerminalSession::wheel`'s doc comment). Scrolling always targets whichever
                 // tile is under the cursor, not necessarily the focused one.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
@@ -924,7 +1177,16 @@ impl ApplicationHandler<AppEvent> for App {
                 let logical_y = self.cursor_pos.1 / scale;
                 let rects = tile_rects(&window, self.terms.len());
                 if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
-                    self.terms[idx].1.scroll(lines);
+                    let (tx, ty, _, _) = rects[idx];
+                    let (col, row) = point_to_cell_in_tile(
+                        scale,
+                        tx,
+                        ty,
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        self.cell_w,
+                    );
+                    self.terms[idx].1.wheel(lines, col, row);
                     window.request_redraw();
                 }
             }
@@ -1240,33 +1502,6 @@ impl ApplicationHandler<AppEvent> for App {
                         occlusion_query_set: None,
                     });
 
-                    // Borders don't share glyphon's atlas (separate pipeline, its own vertex
-                    // buffer per call), so drawing them per tile in a loop like this is fine —
-                    // unlike the text below, there's nothing here for a later tile's draw call
-                    // to invalidate out from under an earlier one.
-                    for ((id, _, (tw, th), is_exited), &(tx, ty, _, _)) in
-                        frames.iter().zip(rects.iter())
-                    {
-                        let sx = (tx * scale).round() as f32;
-                        let sy = (ty * scale).round() as f32;
-                        let sw = (tw * scale).round() as f32;
-                        let sh = (th * scale).round() as f32;
-                        let is_active = self.active_id.as_deref() == Some(id.as_str());
-                        gpu.text.render_tile_border(
-                            &gpu.device,
-                            &mut pass,
-                            sx,
-                            sy,
-                            sw,
-                            sh,
-                            (1.5 * scale as f32).max(1.0),
-                            is_active,
-                            *is_exited,
-                            gpu.config.width,
-                            gpu.config.height,
-                        );
-                    }
-
                     // Every tile's text must be prepared and rendered together in a single
                     // glyphon `prepare`/`render`/`trim` cycle, not one cycle per tile — see
                     // `TextPipeline::render_all`'s doc comment for the real bug that caused
@@ -1303,6 +1538,35 @@ impl ApplicationHandler<AppEvent> for App {
                         gpu.config.width,
                         gpu.config.height,
                     );
+
+                    // Drawn last — the rounded-corner cleanup this does paints over whatever's
+                    // underneath at each corner (see `render_tile_border`'s doc comment), so it
+                    // has to run after this tile's own text/background/cursor are already on
+                    // screen for this frame, not before like a plain unrounded border could.
+                    let radius = (TILE_CORNER_RADIUS * scale) as f32;
+                    for ((id, _, (tw, th), is_exited), &(tx, ty, _, _)) in
+                        frames.iter().zip(rects.iter())
+                    {
+                        let sx = (tx * scale).round() as f32;
+                        let sy = (ty * scale).round() as f32;
+                        let sw = (tw * scale).round() as f32;
+                        let sh = (th * scale).round() as f32;
+                        let is_active = self.active_id.as_deref() == Some(id.as_str());
+                        gpu.text.render_tile_border(
+                            &gpu.device,
+                            &mut pass,
+                            sx,
+                            sy,
+                            sw,
+                            sh,
+                            (1.5 * scale as f32).max(1.0),
+                            radius,
+                            is_active,
+                            *is_exited,
+                            gpu.config.width,
+                            gpu.config.height,
+                        );
+                    }
                 }
                 gpu.queue.submit(Some(encoder.finish()));
                 surface_frame.present();

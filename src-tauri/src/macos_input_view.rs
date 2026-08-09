@@ -29,6 +29,7 @@ use objc2_foundation::{
 };
 use winit::event_loop::EventLoopProxy;
 
+use crate::commands::KeyBinding;
 use crate::AppEvent;
 
 pub struct TerminalInputViewIvars {
@@ -40,6 +41,59 @@ pub struct TerminalInputViewIvars {
     // purely to answer `AXBoundsForRangeParameterizedAttribute` queries — see the doc comment
     // on the accessibility methods below for why those matter at all.
     caret_rect: Cell<NSRect>,
+    // Which physical modifier key's `flagsChanged:` transitions count as push-to-talk for voice
+    // dictation (see `flags_changed`'s doc comment) — user-configurable in Settings, read from
+    // the db and passed in at construction (`App::resumed`), updated live via `set_ptt_keycode`
+    // if changed while running (`AppEvent::SetVoicePttKeycode`).
+    ptt_keycode: Cell<u16>,
+    // Every user-customizable native shortcut's current effective binding (action id ->
+    // `KeyBinding`) — see `commands::SHORTCUT_ACTIONS` for the fixed set of ids this can
+    // contain and `key_down`'s dispatch loop for how an incoming keystroke is matched against
+    // these. Read from the db and passed in at construction, updated live via `set_shortcuts`
+    // if changed while running (`AppEvent::SetShortcuts`).
+    shortcuts: RefCell<Vec<(String, KeyBinding)>>,
+}
+
+/// Right Option (`kVK_RightOption`) — the built-in push-to-talk key for voice dictation before
+/// the user picks something else in Settings. Chosen as the default over any Cmd-anything combo
+/// for the reason `flags_changed` explains: a bare modifier key is the only physical key whose
+/// hold AppKit reports reliably, and over left Option (or Left/Right Shift/Control) because
+/// right Option specifically isn't a key this keyboard layout/app binds to anything else, and
+/// most people's left hand rests near Cmd/Option/Ctrl already for other shortcuts — right Option
+/// is comfortably reachable with the other hand while still typing.
+pub const DEFAULT_PTT_KEYCODE: u16 = 0x3D;
+
+/// Curated set of physical keys the Settings panel offers for push-to-talk (`ipc.rs`'s
+/// `get_voice_ptt_key_options` exposes this list as-is to the frontend, so this is the single
+/// source of truth for both what's selectable and how each option is labeled). Deliberately
+/// restricted to modifier keys — see `flags_changed`'s doc comment for why those are the only
+/// physical keys AppKit reports hold/release for reliably. Left Command and left Shift are
+/// excluded even though they're technically modifier keys too: both are already heavily used in
+/// this app's own Cmd-combo shortcuts (Cmd+C/T/W, Cmd+Shift+]/[ above), so picking either as the
+/// push-to-talk key would mean every one of those shortcuts also starts a recording the instant
+/// the modifier goes down, before the letter even arrives.
+pub const PTT_KEY_OPTIONS: &[(u16, &str)] = &[
+    (0x3D, "Right Option"),
+    (0x3A, "Left Option"),
+    (0x3C, "Right Shift"),
+    (0x3E, "Right Control"),
+    (0x3B, "Left Control"),
+    (0x36, "Right Command"),
+];
+
+/// Maps a push-to-talk `keyCode` (one of `PTT_KEY_OPTIONS`, though this doesn't itself enforce
+/// that — an unrecognized keycode just can't be a push-to-talk key, `flags_changed` never fires
+/// for anything but an actual modifier key transition anyway) to the specific
+/// `NSEventModifierFlags` bit whose state says whether that key's whole left-or-right family is
+/// currently held.
+fn ptt_modifier_flag(keycode: u16) -> Option<NSEventModifierFlags> {
+    match keycode {
+        0x36 => Some(NSEventModifierFlags::NSEventModifierFlagCommand),
+        0x3C => Some(NSEventModifierFlags::NSEventModifierFlagShift),
+        0x3A | 0x3D => Some(NSEventModifierFlags::NSEventModifierFlagOption),
+        0x3B | 0x3E => Some(NSEventModifierFlags::NSEventModifierFlagControl),
+        _ => None,
+    }
 }
 
 declare_class!(
@@ -63,62 +117,53 @@ declare_class!(
 
         #[method(keyDown:)]
         fn key_down(&self, event: &NSEvent) {
-            // Cmd+C/Cmd+V don't reach `doCommandBySelector:`'s `copy:`/`paste:` via
-            // `interpretKeyEvents:` below — that path only covers AppKit's standard *text*
-            // key-binding table (arrows, Ctrl-combos, etc.); Cmd-modified shortcuts are
-            // conventionally resolved as Edit-menu key equivalents instead, which never
-            // fire without an actual menu bar wired up (this app doesn't have one). Handle
-            // them directly here instead of depending on that machinery.
             unsafe {
                 let flags = event.modifierFlags();
-                if flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand) {
-                    if let Some(chars) = event.charactersIgnoringModifiers() {
-                        // New/close/next/prev-session shortcuts, matching iTerm2's bindings
-                        // (this app already presents itself as `TERM_PROGRAM=iTerm.app` — see
-                        // `TerminalSession::spawn`'s doc comment). `charactersIgnoringModifiers`
-                        // still applies Shift (only Cmd/Ctrl/Option are ignored), so Cmd+Shift+]
-                        // arrives here as "}", not "]" — checked below accordingly.
-                        match chars.to_string().as_str() {
-                            "c" => {
-                                let _ = self.ivars().proxy.send_event(AppEvent::Copy);
-                                return;
-                            }
-                            "v" => {
-                                let _ = self.ivars().proxy.send_event(AppEvent::Paste);
-                                return;
-                            }
-                            "t" => {
-                                let _ = self
-                                    .ivars()
-                                    .proxy
-                                    .send_event(AppEvent::KeyboardShortcut("new-session"));
-                                return;
-                            }
-                            "w" => {
-                                let _ = self
-                                    .ivars()
-                                    .proxy
-                                    .send_event(AppEvent::KeyboardShortcut("close-session"));
-                                return;
-                            }
-                            "}" => {
-                                let _ = self
-                                    .ivars()
-                                    .proxy
-                                    .send_event(AppEvent::KeyboardShortcut("next-session"));
-                                return;
-                            }
-                            "{" => {
-                                let _ = self
-                                    .ivars()
-                                    .proxy
-                                    .send_event(AppEvent::KeyboardShortcut("prev-session"));
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                } else if flags.contains(NSEventModifierFlags::NSEventModifierFlagControl) {
+                let cmd = flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
+                let ctrl = flags.contains(NSEventModifierFlags::NSEventModifierFlagControl);
+                let shift = flags.contains(NSEventModifierFlags::NSEventModifierFlagShift);
+                let alt = flags.contains(NSEventModifierFlags::NSEventModifierFlagOption);
+                let keycode = event.keyCode();
+
+                // User-customizable shortcuts (Copy, Paste, New/Close/Next/Prev session, Open
+                // folder — see `commands::SHORTCUT_ACTIONS`), matched generically against
+                // whatever's currently bound to each rather than hardcoded per-action key
+                // comparisons, so Settings can rebind any of them to anything. None of these
+                // reach `doCommandBySelector:`'s `copy:`/`paste:` (or anything else) via
+                // `interpretKeyEvents:` below on their own — that path only covers AppKit's
+                // standard *text* key-binding table (arrows, Ctrl-combos, etc.); Cmd-modified
+                // combos in particular are conventionally resolved as Edit-menu key equivalents
+                // instead, which never fire without an actual menu bar wired up (this app
+                // doesn't have one) — so these are handled directly here rather than depending
+                // on that machinery. Matched by raw `keyCode`, not `charactersIgnoringModifiers`
+                // (an earlier, pre-customization version of this used that instead): immune to
+                // Shift changing what character a key produces, which otherwise means e.g.
+                // Cmd+Shift+`]` has to be special-cased as matching the character `}` rather
+                // than just matching the physical `]` key with Shift held.
+                let matched_action = self.ivars().shortcuts.borrow().iter().find_map(|(id, b)| {
+                    (b.cmd == cmd && b.ctrl == ctrl && b.shift == shift && b.alt == alt && b.keycode == keycode)
+                        .then(|| id.clone())
+                });
+                if let Some(action) = matched_action {
+                    let app_event = match action.as_str() {
+                        "copy" => AppEvent::Copy,
+                        "paste" => AppEvent::Paste,
+                        "new_session" => AppEvent::KeyboardShortcut("new-session"),
+                        "close_session" => AppEvent::KeyboardShortcut("close-session"),
+                        "next_session" => AppEvent::KeyboardShortcut("next-session"),
+                        "prev_session" => AppEvent::KeyboardShortcut("prev-session"),
+                        "open_folder" => AppEvent::KeyboardShortcut("open-folder"),
+                        // Unreachable in practice — `shortcuts` only ever holds ids from
+                        // `commands::SHORTCUT_ACTIONS`, all covered above — but a stale/corrupt
+                        // db row is exactly the kind of "shouldn't happen but isn't fatal if it
+                        // does" case worth falling through gracefully on rather than panicking.
+                        _ => return,
+                    };
+                    let _ = self.ivars().proxy.send_event(app_event);
+                    return;
+                }
+
+                if ctrl {
                     // Ctrl+letter (Ctrl+C to interrupt, Ctrl+D for EOF, Ctrl+Z to suspend,
                     // Ctrl+L to clear, Ctrl+U/A/E for shell readline editing, etc.) must
                     // reach the pty as the raw C0 control byte the shell expects —
@@ -130,22 +175,15 @@ declare_class!(
                     // instead of ever reaching `insertText:`/`doCommandBySelector:` with
                     // something we'd forward — breaking the shell's own (also emacs-style)
                     // readline shortcuts. Bypass that table entirely and send the byte
-                    // ourselves.
-                    //
-                    // Ctrl+R is the one deliberate exception: it's bound app-wide to Open
-                    // Folder (see README/goal-doc — chosen over Cmd+O per explicit user
-                    // preference), so it no longer reaches the pty at all. Readline's
-                    // reverse-i-search (what Ctrl+R used to do here, same bucket as Ctrl+U/A/E
-                    // above) is unreachable in every session as a result — a known, accepted
+                    // ourselves. Whatever's bound to "open_folder" (Ctrl+R by default) already
+                    // returned above before reaching here, so this never double-handles it —
+                    // Ctrl+R only ever falls through to here (and so reaches the shell as a raw
+                    // byte, same as any other Ctrl+letter) once the user's rebound Open Folder
+                    // to something else. Readline's reverse-i-search (what Ctrl+R would
+                    // otherwise do here, same bucket as Ctrl+U/A/E above) stays unreachable
+                    // while Open Folder keeps the default binding — a known, accepted
                     // regression, not an oversight.
                     if let Some(chars) = event.charactersIgnoringModifiers() {
-                        if chars.to_string() == "r" {
-                            let _ = self
-                                .ivars()
-                                .proxy
-                                .send_event(AppEvent::KeyboardShortcut("open-folder"));
-                            return;
-                        }
                         if let Some(c) = chars.to_string().chars().next() {
                             if let Some(byte) = crate::control_byte(c) {
                                 let _ = self.ivars().proxy.send_event(AppEvent::KeyByte(byte));
@@ -186,6 +224,38 @@ declare_class!(
 
         #[method(keyUp:)]
         fn key_up(&self, _event: &NSEvent) {}
+
+        // Push-to-talk dictation, held on a single modifier key (`ptt_keycode`, user-
+        // configurable in Settings — right Option by default). Deliberately never a Cmd-
+        // anything combo (an earlier version of this tried Cmd+M): AppKit has a confirmed real
+        // quirk where `keyUp:` is never delivered for a regular key pressed while Command is
+        // held — Cmd+key is treated as a potential menu-bar key equivalent, and the OS swallows
+        // that key's release even with no actual menu wired up. That made "release Cmd+M to
+        // stop" silently never fire — recording just kept going after the keys were let go. A
+        // modifier key's *own* press/release, in contrast, is reported through this entirely
+        // separate `flagsChanged:` method regardless of what else is held, so tracking it here
+        // isn't subject to that bug at all — this is why Settings only offers modifier keys as
+        // push-to-talk options, not arbitrary letters. `keyCode` identifies *which* physical
+        // modifier key changed; `ptt_modifier_flag` maps that back to the specific
+        // `NSEventModifierFlags` bit whose current state (in `modifierFlags`) says whether it's
+        // now up or down. Approximates "is *this side's* key specifically down" as "is that
+        // flag's family (e.g. Option, either side) set at all" rather than tracking left/right
+        // independently — the gap (both keys of the same family held at once) is an edge case
+        // not worth the extra state for.
+        #[method(flagsChanged:)]
+        fn flags_changed(&self, event: &NSEvent) {
+            unsafe {
+                let ptt_keycode = self.ivars().ptt_keycode.get();
+                if event.keyCode() != ptt_keycode {
+                    return;
+                }
+                let Some(flag) = ptt_modifier_flag(ptt_keycode) else { return };
+                let held = event.modifierFlags().contains(flag);
+                let app_event =
+                    if held { AppEvent::VoiceInputStart } else { AppEvent::VoiceInputStop };
+                let _ = self.ivars().proxy.send_event(app_event);
+            }
+        }
 
         // Just enough of the classic (pre-10.10, string-keyed) NSAccessibility protocol —
         // still the one custom `NSView`s implement — to answer "where is the text caret on
@@ -424,13 +494,34 @@ fn ns_object_to_string(obj: &AnyObject) -> String {
 }
 
 impl TerminalInputView {
-    pub fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<AppEvent>) -> Retained<Self> {
+    pub fn new(
+        mtm: MainThreadMarker,
+        proxy: EventLoopProxy<AppEvent>,
+        ptt_keycode: u16,
+        shortcuts: Vec<(String, KeyBinding)>,
+    ) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(TerminalInputViewIvars {
             proxy,
             marked_text: RefCell::new(String::new()),
             caret_rect: Cell::new(NSRect::ZERO),
+            ptt_keycode: Cell::new(ptt_keycode),
+            shortcuts: RefCell::new(shortcuts),
         });
         unsafe { msg_send_id![super(this), initWithFrame: NSRect::ZERO] }
+    }
+
+    /// Changes which physical modifier key's hold counts as push-to-talk, effective
+    /// immediately — called from `lib.rs` in response to `AppEvent::SetVoicePttKeycode` when
+    /// the user picks a different key in Settings while the app is already running.
+    pub fn set_ptt_keycode(&self, keycode: u16) {
+        self.ivars().ptt_keycode.set(keycode);
+    }
+
+    /// Replaces the complete set of native keyboard shortcut bindings, effective immediately —
+    /// called from `lib.rs` in response to `AppEvent::SetShortcuts` when any shortcut is
+    /// changed or reset in Settings while the app is already running.
+    pub fn set_shortcuts(&self, shortcuts: Vec<(String, KeyBinding)>) {
+        *self.ivars().shortcuts.borrow_mut() = shortcuts;
     }
 
     /// Updates where the terminal's cursor currently is, in AppKit screen coordinates (origin
