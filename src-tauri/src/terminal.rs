@@ -691,7 +691,7 @@ pub struct TextPipeline {
     /// `scale_factor` does (the window moving to a different-DPI display), so in practice this
     /// caches by character alone. `None` means this font has no glyph for that character
     /// (space, `.notdef`, etc.) — cached too, so a missing-glyph lookup isn't retried forever.
-    glyph_cache: std::collections::HashMap<(char, u32), Option<CachedGlyph>>,
+    glyph_cache: std::collections::HashMap<(char, u32, u32, u32), Option<CachedGlyph>>,
     /// Raw alpha-mask bytes for each cached glyph, indexed by `CachedGlyph::id`. Read back by
     /// the `rasterize_custom_glyph` callback `render_all` hands to glyphon, which glyphon calls
     /// at most once per distinct (id, size) the first time its *own* GPU atlas needs it — this
@@ -936,7 +936,7 @@ impl TextPipeline {
             let centering_offset = (t.cell_h - (ascent_px + descent_px)) / 2.0;
             let mut glyphs = Vec::with_capacity(t.frame.cells.len());
             for &(row, col, ch, color) in &t.frame.cells {
-                let Some(g) = self.glyph_for(ch, font_size_px) else { continue };
+                let Some(g) = self.glyph_for(ch, font_size_px, t.cell_w, t.cell_h) else { continue };
                 // Relative to this tile's `TextArea.left`/`top` (set below to `t.left`/`t.top`)
                 // — glyphon adds those itself when placing each `CustomGlyph`
                 // (`text_area.left + glyph.left * text_area.scale`, see glyphon's
@@ -950,11 +950,20 @@ impl TextPipeline {
                 // over them didn't.
                 let pen_x = col as f32 * t.cell_w;
                 let baseline_y = row as f32 * t.cell_h + centering_offset + ascent_px;
+                // `fills_cell` glyphs (box-drawing/block-elements, Nerd Font icons) were already
+                // rasterized to exactly `t.cell_w`x`t.cell_h` in `rasterize` — placed at the
+                // cell's own top-left corner rather than baseline-relative like ordinary text,
+                // so they tile edge-to-edge instead of overlapping or gapping neighboring cells.
+                let (left, top) = if fills_cell(ch) {
+                    (pen_x, row as f32 * t.cell_h)
+                } else {
+                    (pen_x + g.bearing_left, baseline_y - g.bearing_top)
+                };
                 let (r, gr, b) = color.unwrap_or(DEFAULT_FG_RGB);
                 glyphs.push(CustomGlyph {
                     id: g.id,
-                    left: pen_x + g.bearing_left,
-                    top: baseline_y - g.bearing_top,
+                    left,
+                    top,
                     width: g.width as f32,
                     height: g.height as f32,
                     color: Some(TextColor::rgb(r, gr, b)),
@@ -1015,10 +1024,20 @@ impl TextPipeline {
     /// at one pixel size. `None` means this font has no usable glyph for it (space, `.notdef`,
     /// a codepoint outside Monaco's coverage, etc.) — cached too, so a missing glyph isn't
     /// re-attempted every time it's encountered again.
-    fn glyph_for(&mut self, ch: char, font_size_px: f32) -> Option<&CachedGlyph> {
-        let key = (ch, font_size_px.to_bits());
+    ///
+    /// `cell_w_px`/`cell_h_px` only matter for `fills_cell` glyphs, which are rasterized at
+    /// exactly that size rather than their font-native size — folded into the cache key for
+    /// those so a later resize (which changes cell pixel dimensions) re-rasterizes them instead
+    /// of reusing a stale-sized bitmap. Ordinary glyphs key on `(0, 0)` regardless of cell size,
+    /// same cache behavior as before this distinction existed.
+    fn glyph_for(&mut self, ch: char, font_size_px: f32, cell_w_px: f32, cell_h_px: f32) -> Option<&CachedGlyph> {
+        let key = if fills_cell(ch) {
+            (ch, font_size_px.to_bits(), cell_w_px.to_bits(), cell_h_px.to_bits())
+        } else {
+            (ch, font_size_px.to_bits(), 0, 0)
+        };
         if !self.glyph_cache.contains_key(&key) {
-            let entry = self.rasterize(ch, font_size_px);
+            let entry = self.rasterize(ch, font_size_px, cell_w_px, cell_h_px);
             self.glyph_cache.insert(key, entry);
         }
         self.glyph_cache.get(&key).unwrap().as_ref()
@@ -1034,7 +1053,7 @@ impl TextPipeline {
     /// drawing/misc symbols, or emoji — previously any of those fell straight to `None` here,
     /// which left the cell's background color painted with nothing drawn on top of it (visible
     /// as flat, icon-less colored blocks in things like powerlevel10k/starship prompts).
-    fn rasterize(&mut self, ch: char, font_size_px: f32) -> Option<CachedGlyph> {
+    fn rasterize(&mut self, ch: char, font_size_px: f32, cell_w_px: f32, cell_h_px: f32) -> Option<CachedGlyph> {
         let (font_ref, glyph_id) = self.fonts.iter().find_map(|font| {
             let font_ref = font.as_swash();
             let glyph_id = font_ref.charmap().map(ch);
@@ -1056,6 +1075,24 @@ impl TextPipeline {
             "more distinct (char, size) glyphs drawn in one run than fit in a u16 id — \
              should be practically unreachable for real terminal content",
         );
+        // Box-drawing/block-element and Nerd Font icon glyphs are meant to tile exactly across a
+        // cell (see `fills_cell`), but the font's own outline for them isn't guaranteed to match
+        // this app's measured cell size — resample the rasterized mask to the cell's exact pixel
+        // box instead of keeping it at whatever size the font naturally produced. `render_all`
+        // positions these at the cell's top-left corner (not baseline-relative), so the bearings
+        // are zeroed here rather than left at the font's (now-meaningless) originals.
+        if fills_cell(ch) {
+            let (dst_w, dst_h) = (cell_w_px.round().max(1.0) as u16, cell_h_px.round().max(1.0) as u16);
+            let data = resize_alpha(
+                &image.data,
+                image.placement.width as u16,
+                image.placement.height as u16,
+                dst_w,
+                dst_h,
+            );
+            self.glyph_data.push(data);
+            return Some(CachedGlyph { id, width: dst_w, height: dst_h, bearing_left: 0.0, bearing_top: 0.0 });
+        }
         self.glyph_data.push(image.data);
         Some(CachedGlyph {
             id,
@@ -1065,6 +1102,52 @@ impl TextPipeline {
             bearing_top: image.placement.top as f32,
         })
     }
+}
+
+/// Characters designed to tile seamlessly, edge-to-edge, across a terminal cell — box-drawing
+/// and block-element glyphs (ASCII-art banners like LazyVim's startup logo lean on these) and
+/// Nerd Font icon glyphs (file/git/prompt icons) — whose own font-native ink bounding box isn't
+/// guaranteed to exactly fill a monospace cell (Monaco's block glyphs specifically don't, see
+/// the cursor-rendering doc comment above `CursorKind`). Drawn at the cell's exact pixel box
+/// (see `rasterize`/`render_all`) instead of at their natural font size/bearing, unlike ordinary
+/// text where small inter-glyph gaps are normal.
+fn fills_cell(ch: char) -> bool {
+    matches!(ch as u32,
+        0x2500..=0x259F // Box Drawing, Block Elements
+        | 0xE000..=0xF8FF // Private Use Area — most Nerd Font icon sets live here
+        | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD // Supplementary PUA-A/B — newer Nerd Font glyphs
+    )
+}
+
+/// Bilinearly resamples a single-channel (alpha mask) glyph bitmap to `(dst_w, dst_h)` — see
+/// `fills_cell`/`rasterize` for why some glyphs need this instead of their native raster size.
+fn resize_alpha(src: &[u8], src_w: u16, src_h: u16, dst_w: u16, dst_h: u16) -> Vec<u8> {
+    let (src_w, src_h, dst_w, dst_h) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
+    if src_w == dst_w && src_h == dst_h {
+        return src.to_vec();
+    }
+    let at = |x: isize, y: isize| -> f32 {
+        let x = x.clamp(0, src_w as isize - 1) as usize;
+        let y = y.clamp(0, src_h as isize - 1) as usize;
+        src[y * src_w + x] as f32
+    };
+    let mut out = vec![0u8; dst_w * dst_h];
+    for dy in 0..dst_h {
+        let sy = ((dy as f32 + 0.5) * src_h as f32 / dst_h as f32) - 0.5;
+        let y0 = sy.floor();
+        let fy = sy - y0;
+        let y0 = y0 as isize;
+        for dx in 0..dst_w {
+            let sx = ((dx as f32 + 0.5) * src_w as f32 / dst_w as f32) - 0.5;
+            let x0 = sx.floor();
+            let fx = sx - x0;
+            let x0 = x0 as isize;
+            let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+            let bottom = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+            out[dy * dst_w + dx] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+        }
+    }
+    out
 }
 
 /// A minimal solid-quad wgpu pipeline for the selection highlight — glyphon only draws text,

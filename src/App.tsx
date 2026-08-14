@@ -96,6 +96,15 @@ function App() {
     setActiveId(created.id);
   }
 
+  // Sidebar's "Resume Claude" button — `--continue` (not `--resume`, which needs an interactive
+  // picker) since it needs no session id: it just resumes the most recent conversation for the
+  // session's own cwd, which is exactly what's already unique about each TermHub session. Also
+  // focuses the session so the resumed conversation is what the user's looking at.
+  function handleResumeClaude(session: SessionInfo) {
+    handleSelect(session.id);
+    api.sendToSession(session.id, "claude --continue\r");
+  }
+
   // Phase 3: every session has a live tiled terminal on the Rust side (see lib.rs's
   // `App.terms`) — clicking it in the sidebar both highlights it here and hands it real
   // keyboard focus over there.
@@ -213,6 +222,7 @@ function App() {
         onRename={handleRename}
         onSelect={handleSelect}
         onDuplicate={handleDuplicate}
+        onResumeClaude={handleResumeClaude}
         onNewInFolder={handleNewInFolder}
         onOpenFolder={handleOpenFolder}
         onOpenExternal={handleOpenExternal}

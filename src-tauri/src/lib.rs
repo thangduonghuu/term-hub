@@ -231,6 +231,12 @@ pub enum AppEvent {
     SpawnSession { id: String, cwd: String, shell: String },
     CloseSession { id: String },
     FocusSession(String),
+    // Sent by `ipc.rs`'s `send_to_session` command — the sidebar's per-session "Resume Claude"
+    // button (sends `claude --continue\r`), rather than something the currently-focused tile's
+    // own keyboard input already covers. Unlike keyboard/paste events (which always target
+    // `active_id`), this names its session explicitly since the sidebar can trigger it for any
+    // session, not just the focused one.
+    SendToSession { id: String, text: String },
     // Sent by a session's pty reader thread (terminal.rs) once its `read()` loop ends — the
     // shell process is gone. Phase 5: marks the tile dead in `App.exited` instead of leaving
     // its last frame frozen on screen with no visual difference from a live idle session.
@@ -1056,6 +1062,14 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(view) = &self.input_view {
                         macos::focus_input_view(view);
                     }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
+            AppEvent::SendToSession { id, text } => {
+                if let Some((_, term)) = self.terms.iter_mut().find(|(tid, _)| *tid == id) {
+                    term.write(&text);
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
