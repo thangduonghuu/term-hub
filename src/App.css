@@ -193,6 +193,8 @@ body {
 
 .session-item.active {
   background: #34424f;
+  font-weight: 600;
+  box-shadow: inset 2px 0 0 #58a6ff;
 }
 
 .session-name {

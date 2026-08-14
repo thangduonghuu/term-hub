@@ -130,6 +130,14 @@ fn handle(
             let _ = proxy.send_event(AppEvent::FocusSession(id));
             to_value(())
         }
+        // Sidebar's per-session "Resume Claude" button — writes straight to that session's pty,
+        // same as a keystroke would, regardless of which tile currently has keyboard focus.
+        "send_to_session" => {
+            let id: String = arg(&args, "id").ok_or("missing id")?;
+            let text: String = arg(&args, "text").ok_or("missing text")?;
+            let _ = proxy.send_event(AppEvent::SendToSession { id, text });
+            to_value(())
+        }
         "get_activity" => {
             let map = activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
             to_value(map.clone())

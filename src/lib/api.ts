@@ -59,6 +59,9 @@ export const api = {
     invoke<void>("rename_session", { id, name }),
   closeSession: (id: string) => invoke<void>("close_session", { id }),
   focusSession: (id: string) => invoke<void>("focus_session", { id }),
+  // Writes straight to a session's pty, regardless of which tile currently has keyboard focus —
+  // used by the sidebar's "Resume Claude" button (`claude --continue\r`).
+  sendToSession: (id: string, text: string) => invoke<void>("send_to_session", { id, text }),
   // Session id -> unix-epoch ms of its last pty output, for the sidebar's activity dot.
   getActivity: () => invoke<Record<string, number>>("get_activity"),
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
