@@ -19,7 +19,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::commands;
 use crate::db::Db;
-use crate::{Activity, AppEvent, Exited};
+use crate::{ActiveSession, Activity, AppEvent, Exited};
 
 #[derive(Deserialize)]
 struct IpcRequest {
@@ -34,6 +34,7 @@ pub fn spawn_dispatch(
     db: Arc<Db>,
     activity: Activity,
     exited: Exited,
+    active: ActiveSession,
     proxy: EventLoopProxy<AppEvent>,
     raw: &str,
 ) {
@@ -42,7 +43,7 @@ pub fn spawn_dispatch(
     };
     let proxy_for_handle = proxy.clone();
     std::thread::spawn(move || {
-        let result = handle(&db, &activity, &exited, &proxy_for_handle, &req.cmd, req.args);
+        let result = handle(&db, &activity, &exited, &active, &proxy_for_handle, &req.cmd, req.args);
         let payload = match result {
             Ok(data) => serde_json::json!({"ok": true, "data": data}),
             Err(error) => serde_json::json!({"ok": false, "error": error}),
@@ -66,6 +67,7 @@ fn handle(
     db: &Db,
     activity: &Activity,
     exited: &Exited,
+    active: &ActiveSession,
     proxy: &EventLoopProxy<AppEvent>,
     cmd: &str,
     args: Value,
@@ -138,6 +140,12 @@ fn handle(
             let _ = proxy.send_event(AppEvent::SendToSession { id, text });
             to_value(())
         }
+        // One-shot: the frontend calls this once on mount to seed its `activeId` state with
+        // whichever tile `App::resumed` picked at startup — see `ActiveSession`'s doc comment.
+        "get_active_session" => {
+            let id = active.lock().map_err(|_| "active lock poisoned".to_string())?;
+            to_value(id.clone())
+        }
         "get_activity" => {
             let map = activity.lock().map_err(|_| "activity lock poisoned".to_string())?;
             to_value(map.clone())
@@ -163,6 +171,17 @@ fn handle(
             commands::set_default_shell(db, &shell).and_then(to_value)
         }
         "clear_default_shell" => commands::clear_default_shell(db).and_then(to_value),
+        "get_accent_color" => commands::get_accent_color(db).and_then(to_value),
+        // Also pushed straight to the live `App` (rather than only persisted to the db) so the
+        // native active-tile border repaints immediately — same reasoning as
+        // `set_voice_ptt_keycode` above.
+        "set_accent_color" => {
+            let color: String = arg(&args, "color").ok_or("missing color")?;
+            commands::set_accent_color(db, &color)?;
+            let rgb = commands::parse_hex_color(&color).ok_or("invalid color")?;
+            let _ = proxy.send_event(AppEvent::SetAccentColor(rgb));
+            to_value(())
+        }
         "get_usage_summary" => commands::get_usage_summary(db).and_then(to_value),
         "has_anthropic_api_key" => commands::has_anthropic_api_key(db).and_then(to_value),
         "set_anthropic_api_key" => {

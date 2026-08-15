@@ -29,6 +29,16 @@ function App() {
 
   useEffect(() => {
     api.listSessions().then(setSessions);
+    // Seeds the sidebar's highlight with whichever tile `App::resumed` picked as active on the
+    // Rust side at startup — `handleSelect` etc. keep this in sync from here on, but nothing
+    // else tells this app what Rust started with.
+    api.getActiveSession().then(setActiveId);
+    // Seeds `--accent-color` (App.css's fallback covers the initial paint before this resolves)
+    // from whatever's saved in the db — `SettingsPanel` sets this same property live when the
+    // user picks a different color in Settings > Appearance.
+    api.getAccentColor().then((color) => {
+      if (color) document.documentElement.style.setProperty("--accent-color", color);
+    });
   }, []);
 
   // Both the usage dashboard and settings are centered-overlay modals rendered inside the
@@ -162,6 +172,18 @@ function App() {
     window.addEventListener("termhub:shortcut", onShortcut);
     return () => window.removeEventListener("termhub:shortcut", onShortcut);
   }, [sessions, activeId]);
+
+  // Clicking a terminal tile directly (rather than selecting it from the sidebar) changes
+  // `active_id` on the Rust side without going through `handleSelect` — see the `MouseInput`
+  // handler in lib.rs, which dispatches this event so the sidebar's highlight follows. Just
+  // mirrors the state here; no need to call `api.focusSession` back, the tile already has focus.
+  useEffect(() => {
+    function onSessionFocused(e: Event) {
+      setActiveId((e as CustomEvent<string>).detail);
+    }
+    window.addEventListener("termhub:session-focused", onSessionFocused);
+    return () => window.removeEventListener("termhub:session-focused", onSessionFocused);
+  }, []);
 
   // Dismiss any open overlay when the window loses focus (Cmd+Tab away, clicking another app,
   // etc.) or Escape is pressed — see `dismiss_overlays` in lib.rs, which fires this for both.
