@@ -70,6 +70,15 @@ type Activity = Arc<Mutex<HashMap<String, u64>>>;
 /// `AppEvent::SessionExited` arrives.
 type Exited = Arc<Mutex<HashSet<String>>>;
 
+/// The currently-focused tile's session id, shared with `ipc.rs`'s `get_active_session`
+/// command — a one-shot snapshot the frontend pulls once on mount to seed its own `activeId`
+/// state with whichever tile `App::resumed` picked at startup (`self.terms.first()`), which the
+/// frontend has no other way to learn (unlike sidebar-driven focus changes, where the frontend
+/// already sets its own state before ever asking Rust). Not a live mirror of `active_id` after
+/// that: later changes reach the frontend via the `termhub:session-focused` push event instead
+/// (see `App::report_active_session`), so nothing re-reads this afterward.
+type ActiveSession = Arc<Mutex<Option<String>>>;
+
 /// One tile's change-detection key for `App.last_frames` — id, per-cell glyphs (with color),
 /// cursor cell/shape, selected cells, background-colored cells, and exited state.
 /// `RedrawRequested` skips a tile entirely when none of these changed since the last frame.
@@ -247,6 +256,13 @@ pub enum AppEvent {
     // being full-window-sized always). The frontend is responsible for only reporting "closed"
     // once *every* modal it owns is closed, since this is a single shared flag, not a count.
     SetOverlayOpen(bool),
+    // Sent by `ipc.rs`'s `set_accent_color` command when the user picks a different accent
+    // color in Settings — updates `App.accent_color` (see its doc comment) so the native
+    // active-tile border repaints with it immediately, without needing the app restarted to
+    // pick up what's now saved in the db. Already-validated `#rrggbb` RGB floats, not the raw
+    // hex string — `commands::set_accent_color` parses and rejects a malformed value before
+    // this is ever sent.
+    SetAccentColor([f32; 3]),
     // Sent by `macos_input_view::key_down` for the new/close/next/prev-session shortcuts
     // (Cmd+T/Cmd+W/Cmd+Shift+]/Cmd+Shift+[). Session bookkeeping (the `sessions` list,
     // `activeId`) lives in the sidebar's React state, not here in `App`, so this is forwarded
@@ -409,6 +425,9 @@ struct App {
     // `get_exited_sessions` command (Phase 5) — see `Exited`'s doc comment. The tile stays in
     // `terms` (so its scrollback is still visible) but is rendered dead until respawned.
     exited: Exited,
+    // See `ActiveSession`'s doc comment — written once at the end of `resumed()`, read once by
+    // `ipc.rs`'s `get_active_session`.
+    active: ActiveSession,
     // Whether the sidebar webview should currently cover the *whole* window instead of just
     // the `SIDEBAR_WIDTH` strip — true while the usage dashboard modal is open. The modal is
     // React content rendered inside that same webview with CSS expecting to center itself over
@@ -420,6 +439,14 @@ struct App {
     // Widening the webview only while the modal is actually open keeps the click-passthrough
     // behavior intact the rest of the time.
     webview_full: bool,
+    // The active-tile border color (`terminal.rs`'s `render_tile_border`), shared with the
+    // sidebar's own `--accent-color` CSS variable so both sides of the UI agree — set once at
+    // startup from whatever's saved in the db (`commands::get_accent_color`, falling back to
+    // `commands::DEFAULT_ACCENT_COLOR`), then live-updated by `AppEvent::SetAccentColor` when
+    // the user picks a different one in Settings. Kept as plain RGB floats (not a hex string)
+    // since that's what `render_tile_border` needs every frame — parsed once here rather than
+    // re-parsed per frame.
+    accent_color: [f32; 3],
     // The live mic/recognizer state for an in-progress dictation (push-to-talk — `AppEvent::
     // VoiceInputStart`/`VoiceInputStop`). `Some` only while audio is actually being captured —
     // `stop_voice` takes this (calling `speech::stop`) the moment the key is released, which is
@@ -439,7 +466,21 @@ struct App {
 }
 
 impl App {
-    fn new(db: Arc<Db>, proxy: EventLoopProxy<AppEvent>, activity: Activity, exited: Exited) -> Self {
+    fn new(
+        db: Arc<Db>,
+        proxy: EventLoopProxy<AppEvent>,
+        activity: Activity,
+        exited: Exited,
+        active: ActiveSession,
+    ) -> Self {
+        let accent_color = commands::get_accent_color(&db)
+            .ok()
+            .flatten()
+            .and_then(|hex| commands::parse_hex_color(&hex))
+            .unwrap_or_else(|| {
+                commands::parse_hex_color(commands::DEFAULT_ACCENT_COLOR)
+                    .expect("DEFAULT_ACCENT_COLOR is a valid hex color")
+            });
         Self {
             db,
             proxy,
@@ -465,7 +506,9 @@ impl App {
             next_reconnect: Instant::now(),
             activity,
             exited,
+            active,
             webview_full: false,
+            accent_color,
             #[cfg(target_os = "macos")]
             voice: None,
             #[cfg(target_os = "macos")]
@@ -584,6 +627,26 @@ impl App {
         }
     }
 
+    /// Tells the sidebar which tile actually has focus, for whenever `active_id` changes on the
+    /// Rust side without the sidebar driving it (a tile clicked directly, or the fallback pick
+    /// after closing the active session) — see the `MouseInput` handler and
+    /// `AppEvent::CloseSession` below. Sidebar-driven changes (`AppEvent::FocusSession`, sidebar
+    /// clicks) don't need this: the frontend already set its own `activeId` before ever asking
+    /// Rust. `id` is always a `Uuid::new_v4()` string (`commands::create_session`) or `None`,
+    /// never user input, so this doesn't need JSON-escaping.
+    fn report_active_session(&self, id: Option<&str>) {
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let detail = match id {
+                Some(id) => format!("'{id}'"),
+                None => "null".to_string(),
+            };
+            let script = format!(
+                "window.dispatchEvent(new CustomEvent('termhub:session-focused', {{ detail: {detail} }}))"
+            );
+            let _ = wv.evaluate_script(&script);
+        }
+    }
+
     /// Tells the frontend to close any open overlay (usage dashboard, settings, quick-open) —
     /// fired both when the window loses focus (see `WindowEvent::Focused`) and when Escape is
     /// pressed while one is open (see the `KeyControl`/non-macOS `KeyboardInput` handling
@@ -697,6 +760,7 @@ impl ApplicationHandler<AppEvent> for App {
         let proxy_for_ipc = self.proxy.clone();
         let activity_for_ipc = self.activity.clone();
         let exited_for_ipc = self.exited.clone();
+        let active_for_ipc = self.active.clone();
         let webview = WebViewBuilder::new().with_bounds(rect).with_transparent(true);
         #[cfg(debug_assertions)]
         let webview = webview.with_url(dev_server_url());
@@ -723,6 +787,7 @@ impl ApplicationHandler<AppEvent> for App {
                     db_for_ipc.clone(),
                     activity_for_ipc.clone(),
                     exited_for_ipc.clone(),
+                    active_for_ipc.clone(),
                     proxy_for_ipc.clone(),
                     msg.body(),
                 );
@@ -797,6 +862,11 @@ impl ApplicationHandler<AppEvent> for App {
         self.pending_reconnects = metas;
         self.next_reconnect = Instant::now() + RECONNECT_STAGGER;
         self.active_id = self.terms.first().map(|(id, _)| id.clone());
+        // Seeds `ipc.rs`'s `get_active_session` for the frontend's initial mount fetch — see
+        // `ActiveSession`'s doc comment for why this is a one-shot pull instead of a push.
+        if let Ok(mut active) = self.active.lock() {
+            *active = self.active_id.clone();
+        }
 
         // Install the custom NSTextInputClient view and hand it first responder immediately
         // so terminal keyboard input goes through it (and its correct IME handling) from the
@@ -1049,6 +1119,10 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 if self.active_id.as_deref() == Some(id.as_str()) {
                     self.active_id = self.terms.first().map(|(tid, _)| tid.clone());
+                    // The frontend's `handleClose` optimistically sets `activeId` to `null`
+                    // when it closes whatever it thinks is active — right whenever there's no
+                    // fallback tile, but wrong when another tile picks up focus here instead.
+                    self.report_active_session(self.active_id.as_deref());
                 }
                 if let Some(window) = self.window.clone() {
                     self.refit_all_tiles(&window);
@@ -1089,6 +1163,12 @@ impl ApplicationHandler<AppEvent> for App {
                 let rect = self.webview_rect(&window);
                 if let Some(wv) = self.webview.borrow().as_ref() {
                     let _ = wv.set_bounds(rect);
+                }
+            }
+            AppEvent::SetAccentColor(rgb) => {
+                self.accent_color = rgb;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
             }
             AppEvent::KeyboardShortcut(name) => {
@@ -1145,6 +1225,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
                     let id = self.terms[idx].0.clone();
                     self.active_id = Some(id.clone());
+                    self.report_active_session(Some(&id));
                     // Clicking a dead tile (Phase 5) revives it instead of starting a text
                     // selection on its frozen last frame.
                     if !self.respawn_active_if_exited() {
@@ -1577,6 +1658,7 @@ impl ApplicationHandler<AppEvent> for App {
                             radius,
                             is_active,
                             *is_exited,
+                            [self.accent_color[0], self.accent_color[1], self.accent_color[2], 1.0],
                             gpu.config.width,
                             gpu.config.height,
                         );
@@ -1695,6 +1777,7 @@ pub fn run() {
 
     let activity: Activity = Arc::new(Mutex::new(HashMap::new()));
     let exited: Exited = Arc::new(Mutex::new(HashSet::new()));
-    let mut app = App::new(db, proxy, activity, exited);
+    let active: ActiveSession = Arc::new(Mutex::new(None));
+    let mut app = App::new(db, proxy, activity, exited, active);
     event_loop.run_app(&mut app).expect("event loop error");
 }

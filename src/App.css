@@ -2,6 +2,14 @@
   box-sizing: border-box;
 }
 
+:root {
+  /* User-configurable via Settings > Appearance — App.tsx sets this inline from
+     `api.getAccentColor()`/`setAccentColor()` on mount and on change. The `#d8a657` here is
+     just the initial-paint fallback for before that JS runs; `commands::DEFAULT_ACCENT_COLOR`
+     in the Rust backend is the actual source of truth for the default. */
+  --accent-color: #d8a657;
+}
+
 html,
 body,
 #root {
@@ -182,6 +190,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
+  border: 1.5px solid transparent;
   border-radius: 6px;
   cursor: pointer;
   font-size: 13px;
@@ -194,7 +203,7 @@ body {
 .session-item.active {
   background: #34424f;
   font-weight: 600;
-  box-shadow: inset 2px 0 0 #58a6ff;
+  border-color: var(--accent-color);
 }
 
 .session-name {
@@ -712,6 +721,12 @@ body {
   font-size: 12px;
 }
 
+.claude-key-input-row input[type="color"] {
+  flex: none;
+  width: 40px;
+  padding: 2px;
+}
+
 .claude-key-input-row button,
 .claude-key-active-row button {
   background: #2e2e2e;
@@ -912,7 +927,8 @@ body {
 }
 
 .quickopen-input:focus {
-  box-shadow: inset 0 0 0 2px #d8a657;
+  border: 1.5px solid var(--accent-color);
+  border-radius: 10px;
 }
 
 .quickopen-list {

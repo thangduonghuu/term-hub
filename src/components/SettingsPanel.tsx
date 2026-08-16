@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
-import { Keyboard, Mic, RotateCcw, TerminalSquare, X } from "lucide-react";
+import { Keyboard, Mic, Palette, RotateCcw, TerminalSquare, X } from "lucide-react";
 import { api, type KeyBinding } from "../lib/api";
+
+// Matches `commands::DEFAULT_ACCENT_COLOR` in the Rust backend — this is only the fallback
+// shown before `getAccentColor()` resolves and the value a "Reset to default" click sends,
+// not a second source of truth (the db is that).
+const DEFAULT_ACCENT_COLOR = "#d8a657";
 
 interface Props {
   onClose: () => void;
@@ -64,6 +69,7 @@ function formatBinding(b: KeyBinding): string {
 // way, so adding a new settings category only means adding one entry here plus one `{activeSection === "..." && ...}` block.
 const SECTIONS = [
   { id: "general", label: "General", icon: TerminalSquare },
+  { id: "appearance", label: "Appearance", icon: Palette },
   { id: "keyboard", label: "Keyboard Shortcuts", icon: Keyboard },
   { id: "voice", label: "Voice Dictation", icon: Mic },
 ] as const;
@@ -84,6 +90,8 @@ export function SettingsPanel({ onClose }: Props) {
   const [shortcuts, setShortcuts] = useState<[string, string, KeyBinding][]>([]);
   const [recordingAction, setRecordingAction] = useState<string | null>(null);
   const [shortcutCaptureError, setShortcutCaptureError] = useState<string | null>(null);
+  const [accentColor, setAccentColor] = useState(DEFAULT_ACCENT_COLOR);
+  const [accentSaved, setAccentSaved] = useState(false);
 
   useEffect(() => {
     api.getDefaultShell().then((s) => setShell(s ?? ""));
@@ -92,6 +100,7 @@ export function SettingsPanel({ onClose }: Props) {
     api.getVoicePttKeyOptions().then(setPttOptions);
     api.getVoicePttKeycode().then(setPttKeycode);
     api.getShortcuts().then(setShortcuts);
+    api.getAccentColor().then((c) => setAccentColor(c ?? DEFAULT_ACCENT_COLOR));
   }, []);
 
   // While "recording" (after clicking Change), capture the very next physical key press to
@@ -215,6 +224,18 @@ export function SettingsPanel({ onClose }: Props) {
     }
   }
 
+  // Applies immediately (both here and to the native terminal border — see `App.accent_color`'s
+  // doc comment in lib.rs) rather than needing a separate Save click, same as the terminal-app
+  // picker above; a color swatch makes the result of picking obvious enough that a save step
+  // would just be friction.
+  async function saveAccentColor(color: string) {
+    setAccentColor(color);
+    document.documentElement.style.setProperty("--accent-color", color);
+    await api.setAccentColor(color);
+    setAccentSaved(true);
+    setTimeout(() => setAccentSaved(false), 1500);
+  }
+
   return (
     <div className="usage-overlay" onClick={onClose}>
       <div className="settings-panel" onClick={(e) => e.stopPropagation()}>
@@ -299,6 +320,29 @@ export function SettingsPanel({ onClose }: Props) {
                   )}
                 </div>
               </>
+            )}
+
+            {activeSection === "appearance" && (
+              <div className="usage-section">
+                <div className="usage-section-header">
+                  <h3>Accent color</h3>
+                </div>
+                <p className="claude-key-note">
+                  Used for the active session highlight in the sidebar and the border around
+                  whichever terminal currently has keyboard focus.
+                </p>
+                <div className="claude-key-input-row">
+                  <input
+                    type="color"
+                    value={accentColor}
+                    onChange={(e) => saveAccentColor(e.currentTarget.value)}
+                  />
+                  <button onClick={() => saveAccentColor(DEFAULT_ACCENT_COLOR)}>
+                    Reset to default
+                  </button>
+                  {accentSaved && <span className="settings-saved-hint">Saved</span>}
+                </div>
+              </div>
             )}
 
             {activeSection === "keyboard" && shortcuts.length > 0 && (
