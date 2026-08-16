@@ -208,6 +208,42 @@ pub fn clear_default_shell(db: &Db) -> Result<(), String> {
     db.delete_setting(DEFAULT_SHELL_SETTING).map_err(|e| e.to_string())
 }
 
+const ACCENT_COLOR_SETTING: &str = "accent_color";
+
+/// The built-in accent color — matches the sidebar's own default (`.session-item.active`'s
+/// `border-color` in App.css) so the native terminal border and the webview sidebar agree
+/// out of the box, before the user ever opens Settings.
+pub const DEFAULT_ACCENT_COLOR: &str = "#d8a657";
+
+/// The configured accent color as a `#rrggbb` hex string, shared by the sidebar's active-
+/// session highlight (CSS `--accent-color`) and the native active-tile border (`terminal.rs`'s
+/// `render_border`) — `None` if never customized, in which case both sides fall back to
+/// `DEFAULT_ACCENT_COLOR` independently.
+pub fn get_accent_color(db: &Db) -> Result<Option<String>, String> {
+    db.get_setting(ACCENT_COLOR_SETTING).map_err(|e| e.to_string())
+}
+
+pub fn set_accent_color(db: &Db, color: &str) -> Result<(), String> {
+    if parse_hex_color(color).is_none() {
+        return Err(format!("invalid color: {color}"));
+    }
+    db.set_setting(ACCENT_COLOR_SETTING, color).map_err(|e| e.to_string())
+}
+
+/// Parses a `#rrggbb` hex string (case-insensitive, exactly what an `<input type="color">`
+/// produces) into `wgpu`-ready `0.0..=1.0` RGB — `None` for anything else, so a malformed or
+/// tampered-with value from the db never reaches `set_setting`/the live border renderer.
+pub fn parse_hex_color(s: &str) -> Option<[f32; 3]> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
+}
+
 const VOICE_PTT_KEYCODE_SETTING: &str = "voice_ptt_keycode";
 
 /// The configured push-to-talk key for voice dictation (see `speech.rs`) — a raw macOS virtual

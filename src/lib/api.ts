@@ -59,6 +59,12 @@ export const api = {
     invoke<void>("rename_session", { id, name }),
   closeSession: (id: string) => invoke<void>("close_session", { id }),
   focusSession: (id: string) => invoke<void>("focus_session", { id }),
+  // One-shot: which tile Rust picked as active at startup, for seeding this app's own
+  // `activeId` state on mount — `null` if there were no sessions to pick from.
+  getActiveSession: () => invoke<string | null>("get_active_session"),
+  // Writes straight to a session's pty, regardless of which tile currently has keyboard focus —
+  // used by the sidebar's "Resume Claude" button (`claude --continue\r`).
+  sendToSession: (id: string, text: string) => invoke<void>("send_to_session", { id, text }),
   // Session id -> unix-epoch ms of its last pty output, for the sidebar's activity dot.
   getActivity: () => invoke<Record<string, number>>("get_activity"),
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
@@ -79,6 +85,11 @@ export const api = {
   getDefaultShell: () => invoke<string | null>("get_default_shell"),
   setDefaultShell: (shell: string) => invoke<void>("set_default_shell", { shell }),
   clearDefaultShell: () => invoke<void>("clear_default_shell"),
+  // The configured accent color (`#rrggbb`), or null if unset (both the sidebar's own
+  // `--accent-color` CSS variable and the native active-tile border fall back to the same
+  // built-in gold independently — see `commands::DEFAULT_ACCENT_COLOR`).
+  getAccentColor: () => invoke<string | null>("get_accent_color"),
+  setAccentColor: (color: string) => invoke<void>("set_accent_color", { color }),
   // Terminal apps installed on this machine (iTerm2, Warp, Windows Terminal, etc.) that a
   // session's folder can be popped open in as an alternative to the built-in native terminal.
   listTerminalApps: () => invoke<string[]>("list_terminal_apps"),

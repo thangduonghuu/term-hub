@@ -691,7 +691,7 @@ pub struct TextPipeline {
     /// `scale_factor` does (the window moving to a different-DPI display), so in practice this
     /// caches by character alone. `None` means this font has no glyph for that character
     /// (space, `.notdef`, etc.) — cached too, so a missing-glyph lookup isn't retried forever.
-    glyph_cache: std::collections::HashMap<(char, u32), Option<CachedGlyph>>,
+    glyph_cache: std::collections::HashMap<(char, u32, u32, u32), Option<CachedGlyph>>,
     /// Raw alpha-mask bytes for each cached glyph, indexed by `CachedGlyph::id`. Read back by
     /// the `rasterize_custom_glyph` callback `render_all` hands to glyphon, which glyphon calls
     /// at most once per distinct (id, size) the first time its *own* GPU atlas needs it — this
@@ -805,15 +805,16 @@ impl TextPipeline {
 
     /// Draws a border around one tile in the multi-session grid (Phase 3) — otherwise every
     /// session's pane is just an unbroken black rectangle with no visual separation from its
-    /// neighbors. `active` picks a brighter accent color for whichever tile currently has
-    /// keyboard focus; `exited` (Phase 5) overrides that with a dim red to flag a dead shell
-    /// process, since otherwise a tile whose pty died just freezes with no visual difference
-    /// from a live idle one. `radius` rounds the tile's corners (see `SelectionPipeline::
-    /// render_border`'s doc comment) — pass `0.0` for plain square corners. `x`/`y`/`w`/`h`/
-    /// `thickness`/`radius` are physical pixels. Must run after this tile's background/glyphs/
-    /// cursor are already drawn (see `RedrawRequested`'s draw order) — rounding works by
-    /// painting over whatever's underneath at each corner, same idea as the straight edges
-    /// painting over it along the sides.
+    /// neighbors. `active` picks `accent` (the user's configured accent color — see `App.
+    /// accent_color`'s doc comment in lib.rs) for whichever tile currently has keyboard focus;
+    /// `exited` (Phase 5) overrides that with a dim red to flag a dead shell process, since
+    /// otherwise a tile whose pty died just freezes with no visual difference from a live idle
+    /// one. `radius` rounds the tile's corners (see `SelectionPipeline::render_border`'s doc
+    /// comment) — pass `0.0` for plain square corners. `x`/`y`/`w`/`h`/`thickness`/`radius` are
+    /// physical pixels. Must run after this tile's background/glyphs/cursor are already drawn
+    /// (see `RedrawRequested`'s draw order) — rounding works by painting over whatever's
+    /// underneath at each corner, same idea as the straight edges painting over it along the
+    /// sides.
     #[allow(clippy::too_many_arguments)]
     pub fn render_tile_border(
         &self,
@@ -827,11 +828,13 @@ impl TextPipeline {
         radius: f32,
         active: bool,
         exited: bool,
+        accent: [f32; 4],
         viewport_w: u32,
         viewport_h: u32,
     ) {
         self.selection.render_border(
-            device, pass, x, y, w, h, thickness, radius, active, exited, viewport_w, viewport_h,
+            device, pass, x, y, w, h, thickness, radius, active, exited, accent, viewport_w,
+            viewport_h,
         );
     }
 
@@ -936,7 +939,7 @@ impl TextPipeline {
             let centering_offset = (t.cell_h - (ascent_px + descent_px)) / 2.0;
             let mut glyphs = Vec::with_capacity(t.frame.cells.len());
             for &(row, col, ch, color) in &t.frame.cells {
-                let Some(g) = self.glyph_for(ch, font_size_px) else { continue };
+                let Some(g) = self.glyph_for(ch, font_size_px, t.cell_w, t.cell_h) else { continue };
                 // Relative to this tile's `TextArea.left`/`top` (set below to `t.left`/`t.top`)
                 // — glyphon adds those itself when placing each `CustomGlyph`
                 // (`text_area.left + glyph.left * text_area.scale`, see glyphon's
@@ -950,11 +953,23 @@ impl TextPipeline {
                 // over them didn't.
                 let pen_x = col as f32 * t.cell_w;
                 let baseline_y = row as f32 * t.cell_h + centering_offset + ascent_px;
+                // `fills_cell` glyphs (box-drawing/block-elements, Nerd Font icons) were already
+                // rasterized to `t.cell_w`x`t.cell_h` (or, for a single-stroke line glyph, just
+                // one of those axes — see `rasterize`'s doc comment) in `rasterize` — placed at
+                // the cell's own top-left corner plus `g.bearing_left/top`'s centering offset
+                // (zero except for a line glyph's un-stretched thin axis) rather than baseline-
+                // relative like ordinary text, so the stretched axis still tiles edge-to-edge
+                // instead of overlapping or gapping neighboring cells.
+                let (left, top) = if fills_cell(ch) {
+                    (pen_x + g.bearing_left, row as f32 * t.cell_h + g.bearing_top)
+                } else {
+                    (pen_x + g.bearing_left, baseline_y - g.bearing_top)
+                };
                 let (r, gr, b) = color.unwrap_or(DEFAULT_FG_RGB);
                 glyphs.push(CustomGlyph {
                     id: g.id,
-                    left: pen_x + g.bearing_left,
-                    top: baseline_y - g.bearing_top,
+                    left,
+                    top,
                     width: g.width as f32,
                     height: g.height as f32,
                     color: Some(TextColor::rgb(r, gr, b)),
@@ -1015,10 +1030,20 @@ impl TextPipeline {
     /// at one pixel size. `None` means this font has no usable glyph for it (space, `.notdef`,
     /// a codepoint outside Monaco's coverage, etc.) — cached too, so a missing glyph isn't
     /// re-attempted every time it's encountered again.
-    fn glyph_for(&mut self, ch: char, font_size_px: f32) -> Option<&CachedGlyph> {
-        let key = (ch, font_size_px.to_bits());
+    ///
+    /// `cell_w_px`/`cell_h_px` only matter for `fills_cell` glyphs, which are rasterized at
+    /// exactly that size rather than their font-native size — folded into the cache key for
+    /// those so a later resize (which changes cell pixel dimensions) re-rasterizes them instead
+    /// of reusing a stale-sized bitmap. Ordinary glyphs key on `(0, 0)` regardless of cell size,
+    /// same cache behavior as before this distinction existed.
+    fn glyph_for(&mut self, ch: char, font_size_px: f32, cell_w_px: f32, cell_h_px: f32) -> Option<&CachedGlyph> {
+        let key = if fills_cell(ch) {
+            (ch, font_size_px.to_bits(), cell_w_px.to_bits(), cell_h_px.to_bits())
+        } else {
+            (ch, font_size_px.to_bits(), 0, 0)
+        };
         if !self.glyph_cache.contains_key(&key) {
-            let entry = self.rasterize(ch, font_size_px);
+            let entry = self.rasterize(ch, font_size_px, cell_w_px, cell_h_px);
             self.glyph_cache.insert(key, entry);
         }
         self.glyph_cache.get(&key).unwrap().as_ref()
@@ -1034,7 +1059,7 @@ impl TextPipeline {
     /// drawing/misc symbols, or emoji — previously any of those fell straight to `None` here,
     /// which left the cell's background color painted with nothing drawn on top of it (visible
     /// as flat, icon-less colored blocks in things like powerlevel10k/starship prompts).
-    fn rasterize(&mut self, ch: char, font_size_px: f32) -> Option<CachedGlyph> {
+    fn rasterize(&mut self, ch: char, font_size_px: f32, cell_w_px: f32, cell_h_px: f32) -> Option<CachedGlyph> {
         let (font_ref, glyph_id) = self.fonts.iter().find_map(|font| {
             let font_ref = font.as_swash();
             let glyph_id = font_ref.charmap().map(ch);
@@ -1056,6 +1081,41 @@ impl TextPipeline {
             "more distinct (char, size) glyphs drawn in one run than fit in a u16 id — \
              should be practically unreachable for real terminal content",
         );
+        // Box-drawing/block-element and Nerd Font icon glyphs are meant to tile exactly across a
+        // cell (see `fills_cell`), but the font's own outline for them isn't guaranteed to match
+        // this app's measured cell size — resample the rasterized mask to the cell's exact pixel
+        // box instead of keeping it at whatever size the font naturally produced. `render_all`
+        // positions these at the cell's top-left corner plus this centering bearing (not
+        // baseline-relative like ordinary text).
+        //
+        // A single straight stroke (`line_axis`) only needs *one* axis stretched to the cell's
+        // full size — the axis it runs along, so it connects edge-to-edge with the same
+        // character in the neighboring cell. The font's native raster is already razor-thin in
+        // the perpendicular axis (a hairline rule); stretching that axis too, like every other
+        // `fills_cell` glyph needs, balloons it into a solid bar (the bug behind e.g. a CLI's
+        // box-drawn input border rendering as thick gray blocks instead of thin rules). Corners/
+        // tees/crosses/block-elements/icons keep the full 2-axis stretch (`line_axis` is `None`
+        // for those), unchanged from before.
+        if fills_cell(ch) {
+            let full_w = cell_w_px.round().max(1.0) as u16;
+            let full_h = cell_h_px.round().max(1.0) as u16;
+            let (dst_w, dst_h) = match line_axis(ch) {
+                Some(true) => (full_w, image.placement.height as u16),
+                Some(false) => (image.placement.width as u16, full_h),
+                None => (full_w, full_h),
+            };
+            let data = resize_alpha(
+                &image.data,
+                image.placement.width as u16,
+                image.placement.height as u16,
+                dst_w,
+                dst_h,
+            );
+            self.glyph_data.push(data);
+            let bearing_left = (cell_w_px - dst_w as f32).max(0.0) / 2.0;
+            let bearing_top = (cell_h_px - dst_h as f32).max(0.0) / 2.0;
+            return Some(CachedGlyph { id, width: dst_w, height: dst_h, bearing_left, bearing_top });
+        }
         self.glyph_data.push(image.data);
         Some(CachedGlyph {
             id,
@@ -1065,6 +1125,65 @@ impl TextPipeline {
             bearing_top: image.placement.top as f32,
         })
     }
+}
+
+/// Characters designed to tile seamlessly, edge-to-edge, across a terminal cell — box-drawing
+/// and block-element glyphs (ASCII-art banners like LazyVim's startup logo lean on these) and
+/// Nerd Font icon glyphs (file/git/prompt icons) — whose own font-native ink bounding box isn't
+/// guaranteed to exactly fill a monospace cell (Monaco's block glyphs specifically don't, see
+/// the cursor-rendering doc comment above `CursorKind`). Drawn at the cell's exact pixel box
+/// (see `rasterize`/`render_all`) instead of at their natural font size/bearing, unlike ordinary
+/// text where small inter-glyph gaps are normal.
+fn fills_cell(ch: char) -> bool {
+    matches!(ch as u32,
+        0x2500..=0x259F // Box Drawing, Block Elements
+        | 0xE000..=0xF8FF // Private Use Area — most Nerd Font icon sets live here
+        | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD // Supplementary PUA-A/B — newer Nerd Font glyphs
+    )
+}
+
+/// `Some(true)`/`Some(false)` for a `fills_cell` box-drawing character that's a single straight
+/// stroke running horizontally/vertically with no corner, tee, or cross — light/heavy/double/
+/// dashed variants of `─` and `│`. `None` for every other `fills_cell` glyph (corners, tees,
+/// crosses, block elements, Nerd Font icons), which don't get the thin-axis treatment `rasterize`
+/// gives these — see its doc comment for why.
+fn line_axis(ch: char) -> Option<bool> {
+    match ch as u32 {
+        0x2500 | 0x2501 | 0x2504 | 0x2505 | 0x2508 | 0x2509 | 0x254C | 0x254D | 0x2550 => Some(true),
+        0x2502 | 0x2503 | 0x2506 | 0x2507 | 0x250A | 0x250B | 0x254E | 0x254F | 0x2551 => Some(false),
+        _ => None,
+    }
+}
+
+/// Bilinearly resamples a single-channel (alpha mask) glyph bitmap to `(dst_w, dst_h)` — see
+/// `fills_cell`/`rasterize` for why some glyphs need this instead of their native raster size.
+fn resize_alpha(src: &[u8], src_w: u16, src_h: u16, dst_w: u16, dst_h: u16) -> Vec<u8> {
+    let (src_w, src_h, dst_w, dst_h) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
+    if src_w == dst_w && src_h == dst_h {
+        return src.to_vec();
+    }
+    let at = |x: isize, y: isize| -> f32 {
+        let x = x.clamp(0, src_w as isize - 1) as usize;
+        let y = y.clamp(0, src_h as isize - 1) as usize;
+        src[y * src_w + x] as f32
+    };
+    let mut out = vec![0u8; dst_w * dst_h];
+    for dy in 0..dst_h {
+        let sy = ((dy as f32 + 0.5) * src_h as f32 / dst_h as f32) - 0.5;
+        let y0 = sy.floor();
+        let fy = sy - y0;
+        let y0 = y0 as isize;
+        for dx in 0..dst_w {
+            let sx = ((dx as f32 + 0.5) * src_w as f32 / dst_w as f32) - 0.5;
+            let x0 = sx.floor();
+            let fx = sx - x0;
+            let x0 = x0 as isize;
+            let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+            let bottom = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+            out[dy * dst_w + dx] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+        }
+    }
+    out
 }
 
 /// A minimal solid-quad wgpu pipeline for the selection highlight — glyphon only draws text,
@@ -1465,10 +1584,10 @@ impl SelectionPipeline {
     /// the tiled grid, and to highlight whichever one currently has keyboard focus (`active`).
     /// All pixel-space, physical pixels.
     ///
-    /// The focused tile gets a wider soft glow band layered under a crisp bright core line
-    /// (`render_glow_border`) instead of just a plain, same-width line in a different color —
-    /// with several tiles open, a single thin line in a slightly different color was too easy
-    /// to lose track of at a glance.
+    /// The focused tile gets `accent` — the user's configured accent color (`App.accent_color`
+    /// in lib.rs), shared with the active row in the sidebar and the Quick Open input's focus
+    /// ring via the frontend's own `--accent-color` CSS variable, for visual consistency across
+    /// the app. A single flat-color line, not a two-layer glow band.
     ///
     /// `radius` rounds the corners. This is *not* "draw the usual full-length straight edges,
     /// then punch a circle out of the corner": a first attempt did exactly that, and it reads as
@@ -1497,6 +1616,7 @@ impl SelectionPipeline {
         radius: f32,
         active: bool,
         exited: bool,
+        accent: [f32; 4],
         viewport_w: u32,
         viewport_h: u32,
     ) {
@@ -1509,7 +1629,9 @@ impl SelectionPipeline {
             return;
         }
         if active {
-            self.render_glow_border(device, pass, x, y, w, h, r, thickness, viewport_w, viewport_h);
+            self.render_flat_border(
+                device, pass, x, y, w, h, r, thickness * 1.5, accent, viewport_w, viewport_h,
+            );
             return;
         }
         self.render_flat_border(
@@ -1543,47 +1665,6 @@ impl SelectionPipeline {
         self.render_corner_ring(
             device, pass, x, y, w, h, r, (r - thickness).max(0.0), r, color, viewport_w,
             viewport_h,
-        );
-        self.punch_corners(device, pass, x, y, w, h, r, viewport_w, viewport_h);
-    }
-
-    /// The focused-tile treatment: a wide, low-alpha glow band with a crisp bright line on top
-    /// of it, both rounded — see `render_border`'s doc comment for why rounding a stroke needs
-    /// a ring at each corner rather than just a punch.
-    #[allow(clippy::too_many_arguments)]
-    fn render_glow_border(
-        &self,
-        device: &wgpu::Device,
-        pass: &mut wgpu::RenderPass,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        r: f32,
-        thickness: f32,
-        viewport_w: u32,
-        viewport_h: u32,
-    ) {
-        let glow_thickness = thickness * 3.5;
-        let glow_color = [0.4, 0.65, 1.0, 0.35];
-        let core_thickness = thickness * 1.5;
-        let core_color = [0.65, 0.85, 1.0, 1.0];
-
-        let glow = Self::border_rects(x, y, w, h, glow_thickness, r, glow_color);
-        self.draw_rects(device, pass, &glow, viewport_w, viewport_h);
-        let core = Self::border_rects(x, y, w, h, core_thickness, r, core_color);
-        self.draw_rects(device, pass, &core, viewport_w, viewport_h);
-
-        if r < 0.5 {
-            return;
-        }
-        self.render_corner_ring(
-            device, pass, x, y, w, h, r, (r - glow_thickness).max(0.0), r, glow_color,
-            viewport_w, viewport_h,
-        );
-        self.render_corner_ring(
-            device, pass, x, y, w, h, r, (r - core_thickness).max(0.0), r, core_color,
-            viewport_w, viewport_h,
         );
         self.punch_corners(device, pass, x, y, w, h, r, viewport_w, viewport_h);
     }

@@ -1,5 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { BarChart3, Copy, ExternalLink, FolderOpen, FolderPlus, Mic, Plus, Settings, X } from "lucide-react";
+import {
+  BarChart3,
+  Copy,
+  ExternalLink,
+  FolderOpen,
+  FolderPlus,
+  History,
+  Mic,
+  Plus,
+  Settings,
+  X,
+} from "lucide-react";
 import type { SessionInfo } from "../lib/api";
 import { folderName } from "../lib/path";
 import { LumenPromo } from "./LumenPromo";
@@ -15,6 +26,7 @@ interface Props {
   onRename: (id: string, name: string) => void;
   onSelect: (id: string) => void;
   onDuplicate: (session: SessionInfo) => void;
+  onResumeClaude: (session: SessionInfo) => void;
   onNewInFolder: (cwd: string) => void;
   onOpenFolder: () => void;
   onOpenExternal: (session: SessionInfo) => void;
@@ -35,6 +47,7 @@ export function Sidebar({
   onRename,
   onSelect,
   onDuplicate,
+  onResumeClaude,
   onNewInFolder,
   onOpenFolder,
   onOpenExternal,
@@ -180,6 +193,16 @@ export function Sidebar({
                         {session.name}
                       </span>
                     )}
+                    <button
+                      className="duplicate-btn"
+                      title="Resume Claude Code (claude --continue)"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onResumeClaude(session);
+                      }}
+                    >
+                      <History size={13} />
+                    </button>
                     <button
                       className="duplicate-btn"
                       title="Open this folder in an external terminal"
