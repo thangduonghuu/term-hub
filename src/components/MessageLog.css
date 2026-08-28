@@ -1,0 +1,85 @@
+/* Right-docked inter-session message log — its own webview (see lib.rs's `build_panel`). Solid
+   background so it reads as a panel over the terminal tiles behind it. */
+
+.msglog {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: #1c1c1c;
+  border-left: 1px solid #333;
+  color: #e6e6e6;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 12px;
+}
+
+.msglog-header {
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #9a9a9a;
+  border-bottom: 1px solid #333;
+}
+
+.msglog-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px 12px 12px;
+}
+
+.msglog-empty {
+  color: #7a7a7a;
+  line-height: 1.5;
+  padding-top: 8px;
+}
+
+.msglog-empty code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: #262626;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.msglog-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.msglog-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+
+.msglog-from {
+  color: var(--accent-color, #d8a657);
+  font-weight: 600;
+}
+
+.msglog-arrow {
+  color: #6e6e6e;
+}
+
+.msglog-to {
+  color: #cfcfcf;
+  font-weight: 600;
+}
+
+.msglog-time {
+  margin-left: auto;
+  color: #6e6e6e;
+  font-variant-numeric: tabular-nums;
+}
+
+.msglog-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.45;
+  color: #dcdcdc;
+}

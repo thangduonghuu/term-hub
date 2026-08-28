@@ -2,6 +2,7 @@ use rusqlite::{params, OptionalExtension, Connection};
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::message::{LogEntry, Message};
 use crate::session::SessionMeta;
 use crate::usage::{AgentUsage, DayUsage, SessionUsage};
 
@@ -37,7 +38,17 @@ impl Db {
             CREATE TABLE IF NOT EXISTS recent_folders (
                 path TEXT PRIMARY KEY,
                 last_opened_at INTEGER NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_session TEXT,
+                to_session TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                read_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_inbox
+                ON messages (to_session, read_at, id);",
         )?;
         // Backfill from whatever sessions already exist (e.g. every session predating the
         // `recent_folders` table, or a session restored at startup — `App::new`'s reconnect
@@ -77,6 +88,13 @@ impl Db {
     pub fn delete_session(&self, id: &str) -> rusqlite::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        // Drop any inter-session messages addressed to (or sent by) a session that no longer
+        // exists — an unread message to a closed session is undeliverable, and keeping it would
+        // leak a stale unread count for an id nothing can select anymore.
+        conn.execute(
+            "DELETE FROM messages WHERE to_session = ?1 OR from_session = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -197,6 +215,96 @@ impl Db {
         let conn = self.0.lock().unwrap();
         conn.execute("DELETE FROM recent_folders WHERE path = ?1", params![path])?;
         Ok(())
+    }
+
+    /// Records one inter-session message (see `docs/intersession-messaging-plan.md`). `from` is
+    /// the sender's session id, or `None` when sent from a plain shell outside any session.
+    /// Returns the new row id.
+    pub fn insert_message(
+        &self,
+        from: Option<&str>,
+        to: &str,
+        body: &str,
+        ts: i64,
+    ) -> rusqlite::Result<i64> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO messages (from_session, to_session, body, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![from, to, body, ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Returns `session`'s unread messages, oldest first. Unless `peek`, marks exactly those
+    /// rows read (stamped `ts`) so a later call won't return them again — scoped to the ids just
+    /// read, not a blanket `read_at IS NULL` update, so a message arriving between the select
+    /// and the update isn't silently consumed.
+    pub fn take_inbox(&self, session: &str, peek: bool, ts: i64) -> rusqlite::Result<Vec<Message>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.from_session, s.name, m.body, m.created_at
+             FROM messages m
+             LEFT JOIN sessions s ON s.id = m.from_session
+             WHERE m.to_session = ?1 AND m.read_at IS NULL
+             ORDER BY m.id ASC",
+        )?;
+        let msgs: Vec<Message> = stmt
+            .query_map(params![session], |row| {
+                Ok(Message {
+                    id: row.get(0)?,
+                    from_session: row.get(1)?,
+                    from_name: row.get(2)?,
+                    body: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if !peek && !msgs.is_empty() {
+            // ids are our own AUTOINCREMENT integers — safe to inline, no user input.
+            let ids = msgs.iter().map(|m| m.id.to_string()).collect::<Vec<_>>().join(",");
+            conn.execute(
+                &format!("UPDATE messages SET read_at = ?1 WHERE id IN ({ids})"),
+                params![ts],
+            )?;
+        }
+        Ok(msgs)
+    }
+
+    /// The most recent `limit` inter-session messages, oldest-first, both endpoints resolved to
+    /// display names — for the message-log panel's initial load.
+    pub fn recent_messages(&self, limit: i64) -> rusqlite::Result<Vec<LogEntry>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sf.name, st.name, m.body, m.created_at
+             FROM messages m
+             LEFT JOIN sessions sf ON sf.id = m.from_session
+             LEFT JOIN sessions st ON st.id = m.to_session
+             ORDER BY m.id DESC
+             LIMIT ?1",
+        )?;
+        let mut rows: Vec<LogEntry> = stmt
+            .query_map(params![limit], |row| {
+                Ok(LogEntry {
+                    from_name: row.get(0)?,
+                    to_name: row.get(1)?,
+                    body: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// `session id -> unread message count`, for sessions that currently have any.
+    pub fn unread_counts(&self) -> rusqlite::Result<std::collections::HashMap<String, i64>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT to_session, COUNT(*) FROM messages WHERE read_at IS NULL GROUP BY to_session",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
     }
 
     pub fn insert_usage_event(

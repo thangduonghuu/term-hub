@@ -6,6 +6,7 @@ import {
   FolderOpen,
   FolderPlus,
   History,
+  MessageSquare,
   Mic,
   Plus,
   Settings,
@@ -32,6 +33,8 @@ interface Props {
   onOpenExternal: (session: SessionInfo) => void;
   onOpenUsage: () => void;
   onOpenSettings: () => void;
+  onToggleMessageLog: () => void;
+  messageLogOpen: boolean;
   pendingRenameId: string | null;
   onPendingRenameHandled: () => void;
 }
@@ -53,6 +56,8 @@ export function Sidebar({
   onOpenExternal,
   onOpenUsage,
   onOpenSettings,
+  onToggleMessageLog,
+  messageLogOpen,
   pendingRenameId,
   onPendingRenameHandled,
 }: Props) {
@@ -119,6 +124,13 @@ export function Sidebar({
               <Mic size={15} />
             </span>
           )}
+          <button
+            className={messageLogOpen ? "usage-toggle-btn active" : "usage-toggle-btn"}
+            onClick={onToggleMessageLog}
+            title="Message log (inter-session messages)"
+          >
+            <MessageSquare size={15} />
+          </button>
           <button className="usage-toggle-btn" onClick={onOpenUsage} title="Token usage">
             <BarChart3 size={15} />
           </button>

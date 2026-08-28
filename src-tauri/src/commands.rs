@@ -135,6 +135,12 @@ pub fn list_sessions(db: &Db) -> Result<Vec<SessionInfo>, String> {
     Ok(metas.into_iter().map(|meta| SessionInfo { meta }).collect())
 }
 
+/// Recent inter-session messages for the log panel's initial load (see `control.rs` and
+/// `MessageLog.tsx`). Live updates after mount come via the `termhub:message` DOM event.
+pub fn get_message_log(db: &Db) -> Result<Vec<crate::message::LogEntry>, String> {
+    db.recent_messages(200).map_err(|e| e.to_string())
+}
+
 pub fn create_session(
     db: &Db,
     name: Option<String>,
