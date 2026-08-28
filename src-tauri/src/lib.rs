@@ -31,10 +31,23 @@ use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
-// Width of the right-docked inter-session message log panel (`MessageLog.tsx`) when it's open.
-// Its own webview, mirroring the left sidebar's; `App.log_open` toggles it and `tile_rects`
-// reserves this much off the right edge of the terminal area while it's showing.
+// The right-docked inter-session message log (`MessageLog.tsx`), its own webview. Three states
+// (`App.log_panel`): fully off-screen until the first message ever arrives, then a
+// `LOG_HANDLE_WIDTH` chat-button rail, expandable to the full `LOG_PANEL_WIDTH`. `tile_rects`
+// reserves whatever it currently occupies off the right edge of the terminal area.
 const LOG_PANEL_WIDTH: f64 = 300.0;
+const LOG_HANDLE_WIDTH: f64 = 36.0;
+
+/// How much of the message-log webview is on screen — see `LOG_PANEL_WIDTH` / `App.log_panel`.
+#[derive(Clone, Copy, PartialEq)]
+enum LogPanel {
+    /// No message has ever been logged this run — nothing shown.
+    Hidden,
+    /// The chat-button rail only.
+    Collapsed,
+    /// The full panel.
+    Open,
+}
 
 // The sidebar webview served `dev_server_url()` unconditionally in every build, dev and
 // release alike — fine under `tauri dev` (Vite is actually listening on :1420), but a packaged
@@ -307,9 +320,9 @@ pub enum AppEvent {
     // being full-window-sized always). The frontend is responsible for only reporting "closed"
     // once *every* modal it owns is closed, since this is a single shared flag, not a count.
     SetOverlayOpen(bool),
-    // Sent by `ipc.rs`'s `toggle_message_log` command (the sidebar's log-panel button) — flips
-    // `App.log_open`, slides the right-docked message-log webview in/out, and reflows the tiles
-    // to the new terminal-area width.
+    // Sent by `ipc.rs`'s `toggle_message_log` command (the chat-button rail / the panel's × in
+    // `MessageLog.tsx`) — expands or collapses the right-docked message-log panel between its
+    // rail and full width (`App.log_panel`), reflowing the tiles to the new terminal-area width.
     ToggleMessageLog,
     // Sent by `control.rs` whenever an inter-session message is delivered — forwarded into the
     // log-panel webview as a `termhub:message` DOM event so the feed updates live.
@@ -408,10 +421,10 @@ struct App {
     // Rc<RefCell<_>> (not Arc<Mutex<_>>) is enough.
     webview: Rc<RefCell<Option<WebView>>>,
     // Second child webview, docked to the right strip — the inter-session message log
-    // (`MessageLog.tsx`, loaded with `?panel=messages`). Kept parked off the right edge of the
-    // window while `log_open` is false; slid in and given `LOG_PANEL_WIDTH` when true.
+    // (`MessageLog.tsx`, loaded with `?panel=messages`). Always `LOG_PANEL_WIDTH` wide; how much
+    // of it sits on screen is `log_panel` (see `LogPanel` / `log_webview_rect`).
     log_webview: Rc<RefCell<Option<WebView>>>,
-    log_open: bool,
+    log_panel: LogPanel,
     // Every currently-open session's live pty-backed terminal, in tile order (see
     // `tile_rects`). A `Vec` (not a map) because tile layout is order-sensitive and the
     // session count is always small — linear lookup by id is fine at this scale.
@@ -571,7 +584,7 @@ impl App {
             gpu: None,
             webview: Rc::new(RefCell::new(None)),
             log_webview: Rc::new(RefCell::new(None)),
-            log_open: false,
+            log_panel: LogPanel::Hidden,
             terms: Vec::new(),
             active_id: None,
             last_frames: Vec::new(),
@@ -767,25 +780,24 @@ impl App {
         }
     }
 
-    /// How much horizontal space the message-log panel currently claims from the terminal
-    /// area's right edge — `LOG_PANEL_WIDTH` while open, nothing while closed.
+    /// How much horizontal space the message-log webview currently claims from the terminal
+    /// area's right edge — the full panel, just the chat-button rail, or nothing.
     fn log_inset(&self) -> f64 {
-        if self.log_open {
-            LOG_PANEL_WIDTH
-        } else {
-            0.0
+        match self.log_panel {
+            LogPanel::Hidden => 0.0,
+            LogPanel::Collapsed => LOG_HANDLE_WIDTH,
+            LogPanel::Open => LOG_PANEL_WIDTH,
         }
     }
 
-    /// The log panel webview's bounds — a `LOG_PANEL_WIDTH` strip on the right while `log_open`,
-    /// otherwise the same strip pushed fully past the right edge so it's just off-screen (kept
-    /// full-width rather than zeroed so there's no 0-size child-view edge case, and so it could
-    /// be animated later). Physical px for the same reason `webview_rect` uses them.
+    /// The log webview's bounds — always `LOG_PANEL_WIDTH` wide (no 0-size child-view edge case,
+    /// and the React layout never reflows on a state change), positioned so exactly `log_inset()`
+    /// of it shows on the right. Physical px for the same reason `webview_rect` uses them.
     fn log_webview_rect(&self, window: &Window) -> Rect {
         let scale = window.scale_factor();
         let size = window.inner_size();
         let w = LOG_PANEL_WIDTH * scale;
-        let x = if self.log_open { size.width as f64 - w } else { size.width as f64 };
+        let x = size.width as f64 - self.log_inset() * scale;
         Rect {
             position: PhysicalPosition::new(x, 0.0).into(),
             size: PhysicalSize::new(w, size.height as f64).into(),
@@ -793,13 +805,37 @@ impl App {
     }
 
     /// Re-applies both child webviews' bounds for the current window size / `webview_full` /
-    /// `log_open` state — called from every place that changes one of those.
+    /// `log_panel` state — called from every place that changes one of those.
     fn sync_webview_bounds(&self, window: &Window) {
         if let Some(wv) = self.webview.borrow().as_ref() {
             let _ = wv.set_bounds(self.webview_rect(window));
         }
         if let Some(wv) = self.log_webview.borrow().as_ref() {
             let _ = wv.set_bounds(self.log_webview_rect(window));
+        }
+    }
+
+    /// Re-lay-out and repaint after `log_panel` changed, and tell both webviews the new state
+    /// (`termhub:log-state` detail is `"hidden"` | `"collapsed"` | `"open"`).
+    fn refresh_log_panel(&mut self) {
+        let Some(window) = self.window.clone() else { return };
+        self.sync_webview_bounds(&window);
+        self.refit_all_tiles(&window); // terminal area grew/shrank by the panel delta
+        self.last_frames.clear();
+        window.request_redraw();
+        let state = match self.log_panel {
+            LogPanel::Hidden => "hidden",
+            LogPanel::Collapsed => "collapsed",
+            LogPanel::Open => "open",
+        };
+        let script = format!(
+            "window.dispatchEvent(new CustomEvent('termhub:log-state', {{ detail: '{state}' }}))"
+        );
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let _ = wv.evaluate_script(&script);
+        }
+        if let Some(wv) = self.log_webview.borrow().as_ref() {
+            let _ = wv.evaluate_script(&script);
         }
     }
 
@@ -1288,20 +1324,13 @@ impl ApplicationHandler<AppEvent> for App {
                 self.sync_webview_bounds(&window);
             }
             AppEvent::ToggleMessageLog => {
-                self.log_open = !self.log_open;
-                let Some(window) = self.window.clone() else { return };
-                self.sync_webview_bounds(&window);
-                // Terminal area just grew or shrank by `LOG_PANEL_WIDTH` — reflow the tiles.
-                self.refit_all_tiles(&window);
-                self.last_frames.clear();
-                window.request_redraw();
-                // Let the sidebar's toggle button reflect the new state.
-                if let Some(wv) = self.webview.borrow().as_ref() {
-                    let _ = wv.evaluate_script(&format!(
-                        "window.dispatchEvent(new CustomEvent('termhub:log-state', {{ detail: {} }}))",
-                        self.log_open
-                    ));
-                }
+                // Driven by the chat-button rail / the panel's × (`MessageLog.tsx`). Only ever
+                // fires while the rail is showing, so `Hidden` isn't a real input here.
+                self.log_panel = match self.log_panel {
+                    LogPanel::Open => LogPanel::Collapsed,
+                    _ => LogPanel::Open,
+                };
+                self.refresh_log_panel();
             }
             AppEvent::MessageLogged { from_name, to_name, body, ts } => {
                 if let Some(wv) = self.log_webview.borrow().as_ref() {
@@ -1316,6 +1345,12 @@ impl ApplicationHandler<AppEvent> for App {
                     let _ = wv.evaluate_script(&format!(
                         "window.dispatchEvent(new CustomEvent('termhub:message', {{ detail: {detail} }}))"
                     ));
+                }
+                // First message this run reveals the chat-button rail (not the full panel — the
+                // user expands it themselves). Later messages don't force it open.
+                if self.log_panel == LogPanel::Hidden {
+                    self.log_panel = LogPanel::Collapsed;
+                    self.refresh_log_panel();
                 }
             }
             AppEvent::MessageNudge { to_id, from_name, preview } => {
@@ -1402,7 +1437,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let logical_x = self.cursor_pos.0 / scale;
                 let logical_y = self.cursor_pos.1 / scale;
                 let logical_w = window.inner_size().width as f64 / scale;
-                if logical_x < SIDEBAR_WIDTH || (self.log_open && logical_x >= logical_w - LOG_PANEL_WIDTH) {
+                // Ignore presses on the sidebar or on whatever of the message-log webview is
+                // currently on screen (its rail and/or full panel — `log_inset()` covers both).
+                if logical_x < SIDEBAR_WIDTH || logical_x >= logical_w - self.log_inset() {
                     return;
                 }
                 #[cfg(target_os = "macos")]

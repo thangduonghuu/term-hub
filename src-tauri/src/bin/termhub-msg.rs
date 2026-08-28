@@ -30,8 +30,8 @@ mod unix_impl {
 termhub-msg — message other TermHub sessions
 
 usage:
-  termhub-msg list                          list open sessions (id, name, unread)
-  termhub-msg send <session> <text…>        send a message to a session (name or id)
+  termhub-msg list                          list open sessions (#num, name, id, unread)
+  termhub-msg send <session> <text…>        send a message to a session (#num, name, or id)
   termhub-msg broadcast <text…>             send a message to every other open session
   termhub-msg inbox [--peek]                read (and clear) this session's messages
   termhub-msg inbox --wait [--timeout N]    block until a message arrives (N secs, default 60)
@@ -149,7 +149,8 @@ usage:
                     let unread = s["unread"].as_i64().unwrap_or(0);
                     let badge = if unread > 0 { format!("  ({unread} unread)") } else { String::new() };
                     println!(
-                        "{mark} {:<20} {}{badge}",
+                        "{mark} #{:<3} {:<20} {}{badge}",
+                        s["num"].as_i64().unwrap_or(0),
                         s["name"].as_str().unwrap_or("?"),
                         s["id"].as_str().unwrap_or("?"),
                     );

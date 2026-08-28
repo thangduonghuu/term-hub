@@ -119,8 +119,13 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
             let me = req.session_id.as_deref();
             let out: Vec<Value> = sessions
                 .iter()
-                .map(|s| {
+                .enumerate()
+                .map(|(i, s)| {
                     json!({
+                        // 1-based position in creation order — the `#N` shown in the sidebar and
+                        // usable as a `send` target (`resolve`). Renumbers if an earlier session
+                        // closes; the id and name are the stable handles.
+                        "num": i + 1,
                         "id": s.id,
                         "name": s.name,
                         "cwd": s.cwd,
@@ -263,10 +268,15 @@ fn field<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, S
     serde_json::from_value(raw).map_err(|e| format!("bad arg {key}: {e}"))
 }
 
-/// Resolves a `send` target given as either an exact session id or a session name
-/// (case-insensitive). A name shared by several open sessions is rejected with their ids so the
-/// caller can disambiguate.
+/// Resolves a `send` target: a `#N` / `N` position (1-based, `list` order), then an exact
+/// session id, then a session name (case-insensitive). A name shared by several open sessions is
+/// rejected with their ids so the caller can disambiguate.
 fn resolve<'a>(sessions: &'a [SessionMeta], q: &str) -> Result<&'a SessionMeta, String> {
+    if let Ok(n) = q.trim_start_matches('#').parse::<usize>() {
+        return sessions
+            .get(n.wrapping_sub(1))
+            .ok_or_else(|| format!("no session #{n} (there are {})", sessions.len()));
+    }
     if let Some(s) = sessions.iter().find(|s| s.id == q) {
         return Ok(s);
     }
@@ -395,6 +405,47 @@ mod tests {
         let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
         assert_eq!(alice["is_current"], true);
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn send_resolves_hash_number_targets() {
+        let (db, path) = test_db();
+        let state = ControlState { db: db.clone(), sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+
+        // test_db inserts alice (=#1) then bob (=#2)
+        let sent = dispatch(
+            &req(Some("id-a"), "send", json!({ "to": "#2", "body": "hi #2" })),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(sent["recipient"], "id-b");
+
+        // bare number works too
+        dispatch(&req(Some("id-a"), "send", json!({ "to": "2", "body": "again" })), &state).unwrap();
+        let inbox = dispatch(&req(Some("id-b"), "inbox", json!({})), &state).unwrap();
+        assert_eq!(inbox.as_array().unwrap().len(), 2);
+
+        // out of range
+        assert!(dispatch(
+            &req(Some("id-a"), "send", json!({ "to": "#9", "body": "x" })),
+            &state
+        )
+        .unwrap_err()
+        .contains("no session #9"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn list_numbers_sessions_from_one() {
+        let (db, path) = test_db();
+        let state = ControlState { db, sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+        let list = dispatch(&req(Some("id-a"), "list", json!({})), &state).unwrap();
+        let rows = list.as_array().unwrap();
+        assert_eq!(rows[0]["num"], 1);
+        assert_eq!(rows[0]["name"], "alice");
+        assert_eq!(rows[1]["num"], 2);
         let _ = std::fs::remove_file(path);
     }
 

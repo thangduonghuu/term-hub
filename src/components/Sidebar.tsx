@@ -1,14 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  BarChart3,
   Copy,
   ExternalLink,
   FolderOpen,
   FolderPlus,
   History,
   Mail,
-  MessageSquare,
   Mic,
+  Pencil,
   Plus,
   Settings,
   X,
@@ -16,6 +15,10 @@ import {
 import type { SessionInfo } from "../lib/api";
 import { folderName } from "../lib/path";
 import { LumenPromo } from "./LumenPromo";
+
+// Rough menu box, for clamping it inside the narrow sidebar webview.
+const CTX_MENU_W = 208;
+const CTX_MENU_H = 190;
 
 interface Props {
   sessions: SessionInfo[];
@@ -33,10 +36,7 @@ interface Props {
   onNewInFolder: (cwd: string) => void;
   onOpenFolder: () => void;
   onOpenExternal: (session: SessionInfo) => void;
-  onOpenUsage: () => void;
   onOpenSettings: () => void;
-  onToggleMessageLog: () => void;
-  messageLogOpen: boolean;
   pendingRenameId: string | null;
   onPendingRenameHandled: () => void;
 }
@@ -57,10 +57,7 @@ export function Sidebar({
   onNewInFolder,
   onOpenFolder,
   onOpenExternal,
-  onOpenUsage,
   onOpenSettings,
-  onToggleMessageLog,
-  messageLogOpen,
   pendingRenameId,
   onPendingRenameHandled,
 }: Props) {
@@ -72,6 +69,10 @@ export function Sidebar({
   // real keyboard focus on its native terminal tile (which Rust already focuses on spawn), not
   // have this input's `autoFocus` yank it back into the sidebar.
   const [autoFocusEdit, setAutoFocusEdit] = useState(false);
+  // Right-click menu for a session row — replaces the old always-there hover buttons.
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; session: SessionInfo } | null>(
+    null,
+  );
 
   // New sessions open straight into an editable, blank name field instead of a
   // generic default label — the user names it right away instead of double-clicking later.
@@ -96,13 +97,53 @@ export function Sidebar({
     setEditingId(null);
   }
 
+  function openContextMenu(e: React.MouseEvent, session: SessionInfo) {
+    e.preventDefault();
+    e.stopPropagation();
+    const x = Math.min(e.clientX, window.innerWidth - CTX_MENU_W - 4);
+    const y = Math.min(e.clientY, window.innerHeight - CTX_MENU_H - 4);
+    setCtxMenu({ x: Math.max(4, x), y: Math.max(4, y), session });
+  }
+
+  // A click elsewhere, Escape, or scrolling the list dismisses the context menu. Deliberately
+  // NOT window `blur` — in this multi-surface app focus hops between the webview and the native
+  // terminal views constantly, which would close the menu the instant it opened.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    document
+      .querySelector(".session-groups")
+      ?.addEventListener("scroll", close, { passive: true });
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+      document.querySelector(".session-groups")?.removeEventListener("scroll", close);
+    };
+  }, [ctxMenu]);
+
+  // `#N` — 1-based position in creation order, matching what `control.rs` assigns so
+  // `termhub-msg send #2 …` hits the same session shown here. Renumbers if an earlier session
+  // closes.
+  const sessionNum = useMemo(() => {
+    const m = new Map<string, number>();
+    sessions.forEach((s, i) => m.set(s.id, i + 1));
+    return m;
+  }, [sessions]);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return sessions;
+    const asNum = q.replace(/^#/, "");
     return sessions.filter(
-      (s) => s.name.toLowerCase().includes(q) || s.cwd.toLowerCase().includes(q),
+      (s) =>
+        s.name.toLowerCase().includes(q) ||
+        s.cwd.toLowerCase().includes(q) ||
+        String(sessionNum.get(s.id)) === asNum,
     );
-  }, [sessions, query]);
+  }, [sessions, query, sessionNum]);
 
   const groups = useMemo(() => {
     const map = new Map<string, SessionInfo[]>();
@@ -127,16 +168,6 @@ export function Sidebar({
               <Mic size={15} />
             </span>
           )}
-          <button
-            className={messageLogOpen ? "usage-toggle-btn active" : "usage-toggle-btn"}
-            onClick={onToggleMessageLog}
-            title="Message log (inter-session messages)"
-          >
-            <MessageSquare size={15} />
-          </button>
-          <button className="usage-toggle-btn" onClick={onOpenUsage} title="Token usage">
-            <BarChart3 size={15} />
-          </button>
           <button className="usage-toggle-btn" onClick={onOpenSettings} title="Settings">
             <Settings size={15} />
           </button>
@@ -178,7 +209,14 @@ export function Sidebar({
                     key={session.id}
                     className={`session-item ${session.id === activeId ? "active" : ""}`}
                     onClick={() => onSelect(session.id)}
+                    onContextMenu={(e) => openContextMenu(e, session)}
                   >
+                    <span
+                      className="session-num"
+                      title={`Session #${sessionNum.get(session.id)} — target it with \`termhub-msg send #${sessionNum.get(session.id)} …\``}
+                    >
+                      #{sessionNum.get(session.id)}
+                    </span>
                     {editingId === session.id ? (
                       <input
                         autoFocus={autoFocusEdit}
@@ -226,46 +264,6 @@ export function Sidebar({
                         {unreadBySession[session.id]}
                       </span>
                     )}
-                    <button
-                      className="duplicate-btn"
-                      title="Resume Claude Code (claude --continue)"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onResumeClaude(session);
-                      }}
-                    >
-                      <History size={13} />
-                    </button>
-                    <button
-                      className="duplicate-btn"
-                      title="Open this folder in an external terminal"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onOpenExternal(session);
-                      }}
-                    >
-                      <ExternalLink size={13} />
-                    </button>
-                    <button
-                      className="duplicate-btn"
-                      title="Duplicate session"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDuplicate(session);
-                      }}
-                    >
-                      <Copy size={13} />
-                    </button>
-                    <button
-                      className="close-btn"
-                      title="Close session"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onClose(session.id);
-                      }}
-                    >
-                      <X size={14} />
-                    </button>
                   </li>
                 );
               })}
@@ -277,6 +275,33 @@ export function Sidebar({
         )}
       </div>
       <LumenPromo />
+
+      {ctxMenu && (
+        <ul
+          className="session-ctx-menu"
+          style={{ left: ctxMenu.x, top: ctxMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <li onClick={() => { startRename(ctxMenu.session); setCtxMenu(null); }}>
+            <Pencil size={13} /> Rename
+          </li>
+          <li onClick={() => { onResumeClaude(ctxMenu.session); setCtxMenu(null); }}>
+            <History size={13} /> Resume Claude Code
+          </li>
+          <li onClick={() => { onOpenExternal(ctxMenu.session); setCtxMenu(null); }}>
+            <ExternalLink size={13} /> Open in external terminal
+          </li>
+          <li onClick={() => { onDuplicate(ctxMenu.session); setCtxMenu(null); }}>
+            <Copy size={13} /> Duplicate session
+          </li>
+          <li
+            className="session-ctx-danger"
+            onClick={() => { onClose(ctxMenu.session.id); setCtxMenu(null); }}
+          >
+            <X size={13} /> Close session
+          </li>
+        </ul>
+      )}
     </aside>
   );
 }

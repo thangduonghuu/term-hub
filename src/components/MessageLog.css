@@ -1,20 +1,71 @@
-/* Right-docked inter-session message log — its own webview (see lib.rs's `build_panel`). Solid
-   background so it reads as a panel over the terminal tiles behind it. */
+/* Right-docked inter-session message log — its own webview (see lib.rs's `build_panel`). The
+   webview is always `LOG_PANEL_WIDTH` wide; Rust slides it so only `.msglog-rail` (width must
+   match lib.rs's `LOG_HANDLE_WIDTH`) shows while collapsed, the whole thing while open, and
+   nothing at all until the first message. Solid backgrounds — the webview is transparent. */
 
 .msglog {
   position: fixed;
   inset: 0;
   display: flex;
-  flex-direction: column;
-  background: #1c1c1c;
-  border-left: 1px solid #333;
+  flex-direction: row;
   color: #e6e6e6;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 12px;
 }
 
+.msglog-rail {
+  position: relative;
+  flex: 0 0 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 10px;
+  background: #202020;
+  border: none;
+  border-left: 1px solid #2e2e2e;
+  color: #cfcfcf;
+  cursor: pointer;
+}
+
+.msglog-rail:hover {
+  background: #2a2a2a;
+  color: #fff;
+}
+
+.msglog-rail-badge {
+  position: absolute;
+  top: 4px;
+  right: 3px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent-color, #d8a657);
+  color: #1a1a1a;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+
+.msglog-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: #1c1c1c;
+  border-left: 1px solid #333;
+}
+
+.msglog:not(.open) .msglog-panel {
+  display: none;
+}
+
 .msglog-header {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 10px 12px;
   font-size: 11px;
   font-weight: 600;
@@ -22,6 +73,23 @@
   text-transform: uppercase;
   color: #9a9a9a;
   border-bottom: 1px solid #333;
+}
+
+.msglog-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #9a9a9a;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.msglog-close:hover {
+  background: #2e2e2e;
+  color: #e6e6e6;
 }
 
 .msglog-body {
