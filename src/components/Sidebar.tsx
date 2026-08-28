@@ -88,13 +88,26 @@ export function Sidebar({
     setEditingId(null);
   }
 
+  // `#N` — 1-based position in creation order, matching what `control.rs` assigns so
+  // `termhub-msg send #2 …` hits the same session shown here. Renumbers if an earlier session
+  // closes.
+  const sessionNum = useMemo(() => {
+    const m = new Map<string, number>();
+    sessions.forEach((s, i) => m.set(s.id, i + 1));
+    return m;
+  }, [sessions]);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return sessions;
+    const asNum = q.replace(/^#/, "");
     return sessions.filter(
-      (s) => s.name.toLowerCase().includes(q) || s.cwd.toLowerCase().includes(q),
+      (s) =>
+        s.name.toLowerCase().includes(q) ||
+        s.cwd.toLowerCase().includes(q) ||
+        String(sessionNum.get(s.id)) === asNum,
     );
-  }, [sessions, query]);
+  }, [sessions, query, sessionNum]);
 
   const groups = useMemo(() => {
     const map = new Map<string, SessionInfo[]>();
@@ -161,6 +174,12 @@ export function Sidebar({
                     className={`session-item ${session.id === activeId ? "active" : ""}`}
                     onClick={() => onSelect(session.id)}
                   >
+                    <span
+                      className="session-num"
+                      title={`Session #${sessionNum.get(session.id)} — target it with \`termhub-msg send #${sessionNum.get(session.id)} …\``}
+                    >
+                      #{sessionNum.get(session.id)}
+                    </span>
                     {editingId === session.id ? (
                       <input
                         autoFocus={autoFocusEdit}

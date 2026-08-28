@@ -254,6 +254,19 @@ body {
   white-space: nowrap;
 }
 
+/* `#N` handle for inter-session messaging (see `sessionNum` in Sidebar.tsx). */
+.session-num {
+  flex-shrink: 0;
+  min-width: 1.6em;
+  color: #6e6e6e;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.session-item.active .session-num {
+  color: #a9b7c6;
+}
+
 .activity-dot {
   display: inline-block;
   width: 6px;
