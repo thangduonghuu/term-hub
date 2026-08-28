@@ -59,6 +59,11 @@ export function Sidebar({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   const [query, setQuery] = useState("");
+  // Only the double-click rename path (`startRename`) should steal keyboard focus into the
+  // sidebar webview. The auto-opened field below must not — a newly created session should keep
+  // real keyboard focus on its native terminal tile (which Rust already focuses on spawn), not
+  // have this input's `autoFocus` yank it back into the sidebar.
+  const [autoFocusEdit, setAutoFocusEdit] = useState(false);
 
   // New sessions open straight into an editable, blank name field instead of a
   // generic default label — the user names it right away instead of double-clicking later.
@@ -66,6 +71,7 @@ export function Sidebar({
     if (pendingRenameId && sessions.some((s) => s.id === pendingRenameId)) {
       setEditingId(pendingRenameId);
       setDraftName("");
+      setAutoFocusEdit(false);
       onPendingRenameHandled();
     }
   }, [pendingRenameId, sessions, onPendingRenameHandled]);
@@ -73,6 +79,7 @@ export function Sidebar({
   function startRename(session: SessionInfo) {
     setEditingId(session.id);
     setDraftName(session.name);
+    setAutoFocusEdit(true);
   }
 
   function commitRename(id: string) {
@@ -159,7 +166,7 @@ export function Sidebar({
                   >
                     {editingId === session.id ? (
                       <input
-                        autoFocus
+                        autoFocus={autoFocusEdit}
                         className="rename-input"
                         placeholder={session.name}
                         value={draftName}
