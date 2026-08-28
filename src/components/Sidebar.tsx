@@ -105,20 +105,20 @@ export function Sidebar({
     setCtxMenu({ x: Math.max(4, x), y: Math.max(4, y), session });
   }
 
-  // Any click, Escape, scroll, or focus loss dismisses the context menu.
+  // A click elsewhere, Escape, or scrolling the list dismisses the context menu. Deliberately
+  // NOT window `blur` — in this multi-surface app focus hops between the webview and the native
+  // terminal views constantly, which would close the menu the instant it opened.
   useEffect(() => {
     if (!ctxMenu) return;
     const close = () => setCtxMenu(null);
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
     window.addEventListener("click", close);
-    window.addEventListener("blur", close);
     window.addEventListener("keydown", onKey);
     document
       .querySelector(".session-groups")
       ?.addEventListener("scroll", close, { passive: true });
     return () => {
       window.removeEventListener("click", close);
-      window.removeEventListener("blur", close);
       window.removeEventListener("keydown", onKey);
       document.querySelector(".session-groups")?.removeEventListener("scroll", close);
     };
