@@ -314,30 +314,39 @@ body {
   line-height: 1.4;
 }
 
-.duplicate-btn,
-.close-btn {
-  display: inline-flex;
+/* Right-click menu on a session row (`session-ctx-menu` in Sidebar.tsx) — replaces the old
+   hover action buttons. */
+.session-ctx-menu {
+  position: fixed;
+  z-index: 1200;
+  min-width: 188px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+
+.session-ctx-menu li {
+  display: flex;
   align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: none;
-  color: #9a9a9a;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  color: #dcdcdc;
   cursor: pointer;
-  padding: 0 4px;
-  visibility: hidden;
 }
 
-.session-item:hover .duplicate-btn,
-.session-item:hover .close-btn {
-  visibility: visible;
+.session-ctx-menu li:hover {
+  background: #34424f;
 }
 
-.duplicate-btn:hover {
-  color: #58a6ff;
-}
-
-.close-btn:hover {
-  color: #f85149;
+.session-ctx-menu .session-ctx-danger:hover {
+  background: #4a1f1f;
+  color: #f2c9c9;
 }
 
 .sidebar-settings {
