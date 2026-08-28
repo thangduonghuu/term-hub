@@ -5,8 +5,8 @@
 //! the running TermHub process (`control.rs`) over a Unix socket: one JSON line out, one JSON
 //! line back. See `docs/intersession-messaging-plan.md`.
 //!
-//! Phase 1: `list`, `send`, `inbox`, `whoami`. Later phases add `inbox --wait` and an
-//! `mcp` subcommand (stdio MCP server).
+//! Commands: `list`, `send`, `broadcast`, `inbox` (`--peek` / `--wait` / `--timeout`),
+//! `whoami`. A later phase adds an `mcp` subcommand (stdio MCP server).
 
 #[cfg(unix)]
 fn main() {
@@ -30,10 +30,12 @@ mod unix_impl {
 termhub-msg — message other TermHub sessions
 
 usage:
-  termhub-msg list                     list open sessions (id, name, unread)
-  termhub-msg send <session> <text…>   send a message to a session (name or id)
-  termhub-msg inbox [--peek]           read (and clear) this session's messages
-  termhub-msg whoami                   show this session's id and name";
+  termhub-msg list                          list open sessions (id, name, unread)
+  termhub-msg send <session> <text…>        send a message to a session (name or id)
+  termhub-msg broadcast <text…>             send a message to every other open session
+  termhub-msg inbox [--peek]                read (and clear) this session's messages
+  termhub-msg inbox --wait [--timeout N]    block until a message arrives (N secs, default 60)
+  termhub-msg whoami                        show this session's id and name";
 
     pub fn run(args: &[String]) -> i32 {
         let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -47,9 +49,27 @@ usage:
                 }
                 json!({ "cmd": "send", "args": { "to": args[1], "body": args[2..].join(" ") } })
             }
+            "broadcast" => {
+                if args.len() < 2 {
+                    eprintln!("termhub-msg: broadcast needs a message\n\n{USAGE}");
+                    return 2;
+                }
+                json!({ "cmd": "broadcast", "args": { "body": args[1..].join(" ") } })
+            }
             "inbox" => {
-                let peek = args[1..].iter().any(|a| a == "--peek");
-                json!({ "cmd": "inbox", "args": { "peek": peek } })
+                let rest = &args[1..];
+                let peek = rest.iter().any(|a| a == "--peek");
+                let wait = rest.iter().any(|a| a == "--wait");
+                let timeout = rest
+                    .iter()
+                    .position(|a| a == "--timeout")
+                    .and_then(|i| rest.get(i + 1))
+                    .and_then(|v| v.parse::<u64>().ok());
+                let mut inbox_args = json!({ "peek": peek, "wait": wait });
+                if let Some(t) = timeout {
+                    inbox_args["timeout_secs"] = json!(t);
+                }
+                json!({ "cmd": "inbox", "args": inbox_args })
             }
             "-h" | "--help" | "help" => {
                 println!("{USAGE}");
@@ -143,6 +163,12 @@ usage:
                     "sent to {} (#{})",
                     data["recipient_name"].as_str().unwrap_or("?"),
                     data["message_id"].as_i64().unwrap_or(0),
+                );
+            }
+            "broadcast" => {
+                println!(
+                    "broadcast to {} session(s)",
+                    data["message_count"].as_i64().unwrap_or(0),
                 );
             }
             "whoami" => {

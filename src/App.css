@@ -244,6 +244,22 @@ body {
   padding: 2px 4px;
 }
 
+/* Per-session unread inter-session-message count (see `get_unread_counts`). Sits at the row's
+   right edge; the hover-only action buttons render after it. */
+.unread-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 1px 5px 1px 4px;
+  border-radius: 8px;
+  background: var(--accent-color);
+  color: #1a1a1a;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
 .duplicate-btn,
 .close-btn {
   display: inline-flex;

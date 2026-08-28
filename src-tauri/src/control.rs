@@ -8,15 +8,16 @@
 //! connection. A thread per connection, same shape as `ipc.rs`'s dispatch. Everything it needs
 //! is `Send` (`Arc<Db>`), so it never has to reach into `App`.
 //!
-//! Phase 1 (this file): `whoami`, `list`, `send`, `inbox` — pull only, no push notification,
-//! no `inbox --wait`. Later phases add an `AppEvent` push for a toast/nudge and blocking
-//! receive.
+//! Commands: `whoami`, `list`, `send`, `broadcast`, `inbox` (with `peek` / `wait` /
+//! `timeout_secs`). `inbox` with `wait` polls `take_inbox` every 500 ms until a message lands
+//! or the timeout elapses — a thread-per-connection blocking read, no `AppEvent` involved.
+//! Still to come (Phase 3+): the `termhub-msg mcp` stdio server and a toast/idle-nudge push.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -154,9 +155,60 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
             });
             Ok(json!({ "message_id": mid, "recipient": target.id, "recipient_name": target.name }))
         }
+        "broadcast" => {
+            let body: String = field(&req.args, "body")?;
+            if body.trim().is_empty() {
+                return Err("empty message body".into());
+            }
+            let me = req.session_id.as_deref();
+            let sessions = db.list_sessions().map_err(|e| e.to_string())?;
+            let ts = now();
+            let mut recipients = Vec::new();
+            for s in &sessions {
+                if Some(s.id.as_str()) == me {
+                    continue;
+                }
+                db.insert_message(me, &s.id, &body, ts).map_err(|e| e.to_string())?;
+                recipients.push(s.id.clone());
+            }
+            if recipients.is_empty() {
+                return Err("no other sessions to broadcast to".into());
+            }
+            let from_name = me
+                .and_then(|id| sessions.iter().find(|s| s.id == id))
+                .map(|s| s.name.clone());
+            (state.notify)(AppEvent::MessageLogged {
+                from_name,
+                to_name: format!("everyone ({} sessions)", recipients.len()),
+                body: body.clone(),
+                ts,
+            });
+            Ok(json!({ "message_count": recipients.len(), "recipients": recipients }))
+        }
         "inbox" => {
             let id = req.session_id.as_deref().ok_or("not running inside a TermHub session")?;
             let peek = req.args.get("peek").and_then(Value::as_bool).unwrap_or(false);
+            let wait = req.args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            if wait {
+                // Poll for a message up to `timeout_secs` (default 60, capped at 600). Each tick
+                // is a cheap `peek` read; the real (possibly consuming) read happens once, only
+                // after something's actually there — so a message landing mid-wait is taken
+                // exactly once.
+                let timeout =
+                    req.args.get("timeout_secs").and_then(Value::as_u64).unwrap_or(60).min(600);
+                let deadline = Instant::now() + Duration::from_secs(timeout);
+                loop {
+                    let waiting = db.take_inbox(id, true, now()).map_err(|e| e.to_string())?;
+                    if !waiting.is_empty() {
+                        let msgs = db.take_inbox(id, peek, now()).map_err(|e| e.to_string())?;
+                        return serde_json::to_value(msgs).map_err(|e| e.to_string());
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(json!([]));
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
             let msgs = db.take_inbox(id, peek, now()).map_err(|e| e.to_string())?;
             serde_json::to_value(msgs).map_err(|e| e.to_string())
         }
@@ -300,6 +352,69 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
         assert_eq!(alice["is_current"], true);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn broadcast_fans_out_to_every_other_session() {
+        let (db, path) = test_db();
+        db.insert_session(&SessionMeta {
+            id: "id-c".into(),
+            name: "carol".into(),
+            cwd: "/tmp".into(),
+            shell: String::new(),
+            created_at: 0,
+        })
+        .unwrap();
+        let state =
+            ControlState { db: db.clone(), sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+
+        let out = dispatch(
+            &req(Some("id-a"), "broadcast", json!({ "body": "standup in 5" })),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(out["message_count"], 2);
+
+        for who in ["id-b", "id-c"] {
+            let inbox = dispatch(&req(Some(who), "inbox", json!({})), &state).unwrap();
+            assert_eq!(inbox[0]["body"], "standup in 5");
+        }
+        // the sender doesn't get its own broadcast
+        let mine = dispatch(&req(Some("id-a"), "inbox", json!({})), &state).unwrap();
+        assert!(mine.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_wait_returns_a_message_already_waiting() {
+        let (db, path) = test_db();
+        let state = ControlState { db, sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+        dispatch(&req(Some("id-a"), "send", json!({ "to": "id-b", "body": "now" })), &state).unwrap();
+
+        let got = dispatch(
+            &req(Some("id-b"), "inbox", json!({ "wait": true, "timeout_secs": 2 })),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(got[0]["body"], "now");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_wait_times_out_empty() {
+        let (db, path) = test_db();
+        let state = ControlState { db, sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+
+        let got = dispatch(
+            &req(Some("id-b"), "inbox", json!({ "wait": true, "timeout_secs": 1 })),
+            &state,
+        )
+        .unwrap();
+        assert!(got.as_array().unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);
     }

@@ -24,6 +24,7 @@ function App() {
   const [showQuickOpen, setShowQuickOpen] = useState(false);
   const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
   const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
+  const [unreadBySession, setUnreadBySession] = useState<Record<string, number>>({});
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [messageLogOpen, setMessageLogOpen] = useState(false);
@@ -73,6 +74,18 @@ function App() {
     };
     poll();
     const interval = setInterval(poll, EXITED_POLL_MS);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Unread inter-session-message counts for the sidebar badge — no push channel (the count
+  // drops when the recipient runs `termhub-msg inbox` in its shell, which TermHub doesn't see),
+  // so poll it on the same cadence as activity.
+  useEffect(() => {
+    const poll = () => {
+      api.getUnreadCounts().then(setUnreadBySession);
+    };
+    poll();
+    const interval = setInterval(poll, ACTIVITY_POLL_MS);
     return () => clearInterval(interval);
   }, []);
 
@@ -250,6 +263,7 @@ function App() {
         recentlyActive={recentlyActive}
         voiceRecording={voiceRecording}
         exitedIds={exitedIds}
+        unreadBySession={unreadBySession}
         onNew={handleNew}
         onClose={handleClose}
         onRename={handleRename}

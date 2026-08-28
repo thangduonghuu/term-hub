@@ -19,8 +19,16 @@ the same repo that Claude Code talks to as an MCP server.
   `control.rs`'s `send` fires `AppEvent::MessageLogged` via a `notify` callback → forwarded to
   the panel as a `termhub:message` DOM event; history loads on mount via `get_message_log`
   (`Db::recent_messages`).
-- Phases 2–4 — the remaining items (blocking `inbox --wait`, unread badges, MCP server,
-  toast/pty nudge, Windows) — not started.
+- **Phase 2 — done.** `broadcast` command (`control.rs` + `termhub-msg broadcast`, fans out to
+  one row per other session); blocking `inbox --wait [--timeout N]` (500 ms poll loop in
+  `dispatch`, default 60 s, cap 600, peek-then-real-take so a mid-wait arrival is consumed
+  once); `read_at` tracking and `purge_messages_for` on `delete_session` were already in.
+  `get_unread_counts` IPC command polled by `App.tsx`, driving a per-session unread badge in
+  the sidebar. `Cargo.toml` gained `default-run = "termhub"` (the two-binary clash the plan's
+  Open decision #4 flagged). 8 `control.rs` tests. Condvar wake for `--wait` still deferred to
+  Phase 4.
+- Phases 3–4 — the remaining items (MCP server + Settings section, toast/pty nudge,
+  `TERMHUB_TOKEN`, Windows) — not started.
 
 ---
 

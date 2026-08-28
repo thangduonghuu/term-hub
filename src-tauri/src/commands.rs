@@ -141,6 +141,12 @@ pub fn get_message_log(db: &Db) -> Result<Vec<crate::message::LogEntry>, String>
     db.recent_messages(200).map_err(|e| e.to_string())
 }
 
+/// `session id -> unread inter-session-message count`, polled by `App.tsx` alongside
+/// `get_activity` to drive the sidebar's per-session unread badge.
+pub fn get_unread_counts(db: &Db) -> Result<std::collections::HashMap<String, i64>, String> {
+    db.unread_counts().map_err(|e| e.to_string())
+}
+
 pub fn create_session(
     db: &Db,
     name: Option<String>,

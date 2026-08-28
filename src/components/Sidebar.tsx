@@ -6,6 +6,7 @@ import {
   FolderOpen,
   FolderPlus,
   History,
+  Mail,
   MessageSquare,
   Mic,
   Plus,
@@ -22,6 +23,7 @@ interface Props {
   recentlyActive: Set<string>;
   voiceRecording: boolean;
   exitedIds: Set<string>;
+  unreadBySession: Record<string, number>;
   onNew: () => void;
   onClose: (id: string) => void;
   onRename: (id: string, name: string) => void;
@@ -45,6 +47,7 @@ export function Sidebar({
   recentlyActive,
   voiceRecording,
   exitedIds,
+  unreadBySession,
   onNew,
   onClose,
   onRename,
@@ -210,6 +213,17 @@ export function Sidebar({
                           )
                         )}
                         {session.name}
+                      </span>
+                    )}
+                    {(unreadBySession[session.id] ?? 0) > 0 && (
+                      <span
+                        className="unread-badge"
+                        title={`${unreadBySession[session.id]} unread message${
+                          unreadBySession[session.id] === 1 ? "" : "s"
+                        } — run \`termhub-msg inbox\` in this session`}
+                      >
+                        <Mail size={11} />
+                        {unreadBySession[session.id]}
                       </span>
                     )}
                     <button

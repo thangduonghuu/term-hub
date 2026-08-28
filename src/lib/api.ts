@@ -79,6 +79,8 @@ export const api = {
   getActivity: () => invoke<Record<string, number>>("get_activity"),
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
   getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
+  // Session id -> count of unread inter-session messages, for the sidebar's unread badge.
+  getUnreadCounts: () => invoke<Record<string, number>>("get_unread_counts"),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   // Native OS folder-browse dialog — null if the user cancels. Used by the "Browse…" row in the
   // Open Recent picker, for folders that aren't in the MRU list yet.
