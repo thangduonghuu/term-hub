@@ -854,6 +854,20 @@ impl TextPipeline {
         );
     }
 
+    /// Draws a batch of solid (alpha-blended) rectangles in physical-pixel coords — reuses the
+    /// selection quad pipeline. Used for the accent tint over a tile being dragged to a new grid
+    /// slot (see lib.rs's `tile_drag`).
+    pub fn fill_rects(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        rects: &[(f32, f32, f32, f32, [f32; 4])],
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        self.selection.draw_rects(device, pass, rects, viewport_w, viewport_h);
+    }
+
     /// Renders every currently-visible tile's text (left-aligned within its own origin), plus
     /// its background fills and selection highlight underneath. Foreground text goes through
     /// `TextArea::custom_glyphs` — a manually-positioned glyph per non-blank cell — instead of

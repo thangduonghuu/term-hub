@@ -119,6 +119,23 @@ const TEXT_TOP_MARGIN: f64 = 4.0;
 // half the tile's own width/height (see `render_rounded_corners`) so this stays sane once
 // enough sessions are open that tiles shrink well below this.
 const TILE_CORNER_RADIUS: f64 = 10.0;
+// A left press that stays within `LONG_PRESS_SLOP` logical px of where it started for this long
+// picks the tile up for a drag-to-swap (see `App.press_pending` and the `MouseInput`/
+// `about_to_wait` handlers) instead of being a text-selection drag. Moving further than the slop
+// before the delay elapses commits the press to a text selection.
+const LONG_PRESS_DELAY: Duration = Duration::from_millis(300);
+const LONG_PRESS_SLOP: f64 = 4.0;
+// How long a tile-swap slide takes to move the two tiles into their new positions — short
+// enough not to feel sluggish, long enough to read as a move rather than a jump.
+const TILE_ANIM: Duration = Duration::from_millis(160);
+
+/// An in-progress tile-swap slide (see `App.tile_anim`). `from` is where each tile — indexed in
+/// the *post-swap* `App.terms` order — sat just before the swap; `RedrawRequested` eases every
+/// tile's drawn rect from `from[i]` to its final `tile_rects` position over `TILE_ANIM`.
+struct TileAnim {
+    start: Instant,
+    from: Vec<(f64, f64, f64, f64)>,
+}
 
 /// Logical-space (x, y, width, height) rectangles — one per currently-open session, in the
 /// same order as `App.terms` — tiling them across the window's terminal area (everything
@@ -438,6 +455,18 @@ struct App {
     // so dragging past a tile's edge keeps extending that tile's selection rather than
     // switching tiles mid-drag.
     selecting_tile: Option<String>,
+    // A left press on a tile that hasn't yet resolved into a text selection (cursor moved past
+    // `LONG_PRESS_SLOP`) or a tile pick-up (held still for `LONG_PRESS_DELAY`, promoted in
+    // `about_to_wait`). Holds (session id, press instant, press cursor pos in physical px).
+    press_pending: Option<(String, Instant, (f64, f64))>,
+    // Tile drag-to-reorder: set once a press is held long enough to pick the tile up (see
+    // `press_pending`). Holds the id of the session being dragged; on mouse-up the tile under
+    // the cursor swaps grid positions with it. `tile_rects` is driven purely by `terms` order,
+    // so a `terms.swap` is the whole move.
+    tile_drag: Option<String>,
+    // Set on a completed pick-up-drag swap; drives the slide animation in `RedrawRequested` and
+    // is cleared there once `TILE_ANIM` has elapsed. See `TileAnim`.
+    tile_anim: Option<TileAnim>,
     // Leftover fractional pixel-scroll distance carried between `MouseWheel` events. A single
     // trackpad callback's `PixelDelta` is often just a few px — smaller than `CELL_H` — so
     // converting it to whole lines and discarding the remainder every time made slow, deliberate
@@ -550,6 +579,9 @@ impl App {
             #[cfg(not(target_os = "macos"))]
             modifiers: winit::keyboard::ModifiersState::empty(),
             selecting_tile: None,
+            press_pending: None,
+            tile_drag: None,
+            tile_anim: None,
             scroll_remainder: 0.0,
             cursor_visible: true,
             next_blink: Instant::now() + BLINK_INTERVAL,
@@ -1302,6 +1334,15 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                // Moving beyond the slop before the long-press fires means this press is a
+                // text-selection drag, not a tile pick-up — drop the pending pick-up.
+                if let Some((_, _, origin)) = &self.press_pending {
+                    let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+                    let (dx, dy) = (position.x - origin.0, position.y - origin.1);
+                    if (dx * dx + dy * dy).sqrt() > LONG_PRESS_SLOP * scale {
+                        self.press_pending = None;
+                    }
+                }
                 if let Some(sel_id) = self.selecting_tile.clone() {
                     if let Some(window) = &self.window {
                         let scale = window.scale_factor();
@@ -1312,6 +1353,13 @@ impl ApplicationHandler<AppEvent> for App {
                                 point_to_cell_in_tile(scale, tx, ty, position.x, position.y, self.cell_w);
                             self.terms[idx].1.update_selection(col, row);
                         }
+                        window.request_redraw();
+                    }
+                }
+                // A tile pick-up drag in progress — repaint so the drop-target highlight tracks
+                // whichever tile the cursor is now over.
+                if self.tile_drag.is_some() {
+                    if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
@@ -1354,13 +1402,45 @@ impl ApplicationHandler<AppEvent> for App {
                         let (_, term) = &mut self.terms[idx];
                         term.clear_selection();
                         term.start_selection(col, row);
-                        self.selecting_tile = Some(id);
+                        self.selecting_tile = Some(id.clone());
+                        // Same press also arms a tile pick-up: if it stays put for
+                        // `LONG_PRESS_DELAY` (checked in `about_to_wait`), the tentative
+                        // selection above is discarded and the tile enters a drag-to-swap.
+                        self.press_pending = Some((id, Instant::now(), self.cursor_pos));
                     }
                 }
                 window.request_redraw();
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 self.selecting_tile = None;
+                self.press_pending = None;
+                // Finish a pick-up drag: the tile under the cursor swaps grid positions with the
+                // dragged one, then both slide into place (see `TileAnim`). A release over the
+                // same tile / the sidebar / a gap just clears the drag highlight.
+                if let Some(src_id) = self.tile_drag.take() {
+                    if let Some(window) = self.window.clone() {
+                        let scale = window.scale_factor();
+                        let logical_x = self.cursor_pos.0 / scale;
+                        let logical_y = self.cursor_pos.1 / scale;
+                        let rects = tile_rects(&window, self.terms.len(), self.log_inset());
+                        if let (Some(dst), Some(src)) = (
+                            tile_at(&rects, logical_x, logical_y),
+                            self.terms.iter().position(|(id, _)| *id == src_id),
+                        ) {
+                            if src != dst {
+                                self.terms.swap(src, dst);
+                                let mut from = rects.clone();
+                                from.swap(src, dst);
+                                self.tile_anim = Some(TileAnim { start: Instant::now(), from });
+                            }
+                        }
+                        // Repaint regardless — the drag highlight on the tiles has to clear even
+                        // when the drop was a no-op, and `last_frames` is indexed in `terms`
+                        // order so it's stale after any swap.
+                        self.last_frames.clear();
+                        window.request_redraw();
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Positive `lines` scrolls further back into scrollback history (matches
@@ -1588,7 +1668,31 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
                 let scale = window.scale_factor();
-                let rects = tile_rects(window, self.terms.len(), log_inset);
+                let mut rects = tile_rects(window, self.terms.len(), log_inset);
+
+                // Ease every tile from where it sat pre-swap toward its final slot while a
+                // pick-up-drag swap is animating (see `TileAnim`). Only x/y move on a swap —
+                // the two tiles are the same size — so w/h are left at their final values.
+                let anim_done = if let Some(anim) = &self.tile_anim {
+                    let t = (anim.start.elapsed().as_secs_f64() / TILE_ANIM.as_secs_f64())
+                        .clamp(0.0, 1.0);
+                    if t < 1.0 && anim.from.len() == rects.len() {
+                        let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+                        for (r, &f) in rects.iter_mut().zip(anim.from.iter()) {
+                            r.0 = f.0 + (r.0 - f.0) * e;
+                            r.1 = f.1 + (r.1 - f.1) * e;
+                        }
+                    }
+                    t >= 1.0
+                } else {
+                    false
+                };
+                if anim_done {
+                    self.tile_anim = None;
+                    // Force this final at-rest frame past the unchanged-content early-return
+                    // below so tiles don't stop a fraction of a pixel short.
+                    self.last_frames.clear();
+                }
 
                 // Drop cached frames for tiles no longer open (closed sessions) so the cache
                 // doesn't grow without bound across a long-running app.
@@ -1646,7 +1750,9 @@ impl ApplicationHandler<AppEvent> for App {
                             let cell_w_px = self.cell_w * scale;
                             let cell_h_px = terminal::CELL_H as f64 * scale;
                             let x = tx * scale + TEXT_LEFT_MARGIN * scale + col as f64 * cell_w_px;
-                            let y = ty * scale + TEXT_TOP_MARGIN * scale + row as f64 * cell_h_px;
+                            let y = ty * scale
+                                + TEXT_TOP_MARGIN * scale
+                                + row as f64 * cell_h_px;
                             if let Some(rect) =
                                 macos::to_screen_rect(window, scale, x, y, cell_w_px, cell_h_px)
                             {
@@ -1674,7 +1780,12 @@ impl ApplicationHandler<AppEvent> for App {
                         )
                     })
                     .collect();
-                if new_last == self.last_frames {
+                // A live pick-up drag (drop-target highlight follows the cursor) or a running
+                // swap slide both need to repaint even though no tile's content changed.
+                if new_last == self.last_frames
+                    && self.tile_drag.is_none()
+                    && self.tile_anim.is_none()
+                {
                     return;
                 }
                 self.last_frames = new_last;
@@ -1743,6 +1854,46 @@ impl ApplicationHandler<AppEvent> for App {
                         gpu.config.height,
                     );
 
+                    // While a tile is picked up (long-press, see `LONG_PRESS_DELAY`) tint it in
+                    // the accent color, and tint whichever tile the cursor is over as the drop
+                    // target. Drawn over the tiles' content but before the rounded borders so
+                    // each tile's frame still sits on top.
+                    if self.tile_drag.is_some() {
+                        let drop_idx = self.tile_drag.as_deref().and_then(|src| {
+                            let lx = self.cursor_pos.0 / scale;
+                            let ly = self.cursor_pos.1 / scale;
+                            tile_at(&rects, lx, ly).filter(|&i| frames[i].0 != src)
+                        });
+                        let mut overlay_rects: Vec<(f32, f32, f32, f32, [f32; 4])> = Vec::new();
+                        for (i, ((id, _, _, _), &(tx, ty, tw, th))) in
+                            frames.iter().zip(rects.iter()).enumerate()
+                        {
+                            let a = if self.tile_drag.as_deref() == Some(id.as_str()) {
+                                0.18
+                            } else if Some(i) == drop_idx {
+                                0.10
+                            } else {
+                                continue;
+                            };
+                            overlay_rects.push((
+                                (tx * scale).round() as f32,
+                                (ty * scale).round() as f32,
+                                (tw * scale).round() as f32,
+                                (th * scale).round() as f32,
+                                [self.accent_color[0], self.accent_color[1], self.accent_color[2], a],
+                            ));
+                        }
+                        if !overlay_rects.is_empty() {
+                            gpu.text.fill_rects(
+                                &gpu.device,
+                                &mut pass,
+                                &overlay_rects,
+                                gpu.config.width,
+                                gpu.config.height,
+                            );
+                        }
+                    }
+
                     // Drawn last — the rounded-corner cleanup this does paints over whatever's
                     // underneath at each corner (see `render_tile_border`'s doc comment), so it
                     // has to run after this tile's own text/background/cursor are already on
@@ -1807,6 +1958,29 @@ impl ApplicationHandler<AppEvent> for App {
                 self.next_reconnect = now + RECONNECT_STAGGER;
             }
         }
+        // A press held still on a tile past `LONG_PRESS_DELAY` picks the tile up for a
+        // drag-to-swap; the text selection tentatively started on press is discarded.
+        if let Some((id, at, _)) = &self.press_pending {
+            if now.duration_since(*at) >= LONG_PRESS_DELAY {
+                let id = id.clone();
+                if let Some(idx) = self.terms.iter().position(|(tid, _)| *tid == id) {
+                    self.terms[idx].1.clear_selection();
+                }
+                self.selecting_tile = None;
+                self.tile_drag = Some(id);
+                self.press_pending = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+        // While a tile-swap slide is running, wake every frame to advance it (see `TileAnim`);
+        // `RedrawRequested` clears `tile_anim` once it's done, ending this.
+        if self.tile_anim.is_some() {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
         // A small periodic wakeup (twice a second) to drive cursor blinking — negligible next
         // to the blind per-frame redraw timer this app deliberately moved away from (see the
         // plan doc's Phase 1b findings); everything else stays purely event-driven. While
@@ -1814,6 +1988,12 @@ impl ApplicationHandler<AppEvent> for App {
         let mut deadline = self.next_blink;
         if !self.pending_reconnects.is_empty() {
             deadline = deadline.min(self.next_reconnect);
+        }
+        if self.tile_anim.is_some() {
+            deadline = deadline.min(now + Duration::from_millis(8));
+        }
+        if let Some((_, at, _)) = &self.press_pending {
+            deadline = deadline.min(*at + LONG_PRESS_DELAY);
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
