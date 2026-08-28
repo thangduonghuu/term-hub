@@ -95,6 +95,7 @@ export function SettingsPanel({ onClose }: Props) {
   const [accentSaved, setAccentSaved] = useState(false);
   const [mcpCmd, setMcpCmd] = useState("");
   const [mcpCopied, setMcpCopied] = useState(false);
+  const [messageToast, setMessageToast] = useState(true);
 
   useEffect(() => {
     api.getDefaultShell().then((s) => setShell(s ?? ""));
@@ -105,6 +106,7 @@ export function SettingsPanel({ onClose }: Props) {
     api.getShortcuts().then(setShortcuts);
     api.getAccentColor().then((c) => setAccentColor(c ?? DEFAULT_ACCENT_COLOR));
     api.getMcpRegisterCommand().then(setMcpCmd).catch(() => setMcpCmd(""));
+    api.getMessageToastEnabled().then(setMessageToast).catch(() => {});
   }, []);
 
   // While "recording" (after clicking Change), capture the very next physical key press to
@@ -461,6 +463,18 @@ export function SettingsPanel({ onClose }: Props) {
                   The CLI also works directly: <code>termhub-msg send &lt;session&gt; &lt;text&gt;</code>,
                   <code>termhub-msg inbox --wait</code>, etc. — run <code>termhub-msg --help</code>.
                 </p>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={messageToast}
+                    onChange={(e) => {
+                      const on = e.currentTarget.checked;
+                      setMessageToast(on);
+                      api.setMessageToastEnabled(on);
+                    }}
+                  />
+                  Pop a toast when a message arrives for a session in this window
+                </label>
               </div>
             )}
           </div>

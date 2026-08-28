@@ -36,8 +36,18 @@ the same repo that Claude Code talks to as an MCP server.
   `SettingsPanel.tsx` shows it with a copy button (hidden on non-Unix, like Voice). 5
   `mcp::tests`. The `get_message_settings` / `set_message_settings` enable+nudge settings are
   Phase 4, not here.
-- Phase 4 — the remaining items (toast + idle pty nudge + setting, `TERMHUB_TOKEN`, Condvar
-  wake for `--wait`, Windows named-pipe backend) — not started.
+- **Phase 4 — partial.** Arrival toast done: `control.rs` fires `AppEvent::MessageNudge` once
+  per recipient (from `send` and each `broadcast` target) with a length-capped `preview`;
+  `lib.rs` forwards it to the sidebar webview as `termhub:message-toast` (gated on the
+  `intersession_toast` setting, default on) and `App.tsx` shows an auto-dismissing banner. A
+  "Pop a toast when a message arrives" checkbox in Settings > Messaging (`get`/
+  `set_message_toast_enabled`).
+  **Still open:** the idle *pty* nudge — `TerminalSession::write` targets the shell's stdin, so
+  writing a `[termhub] …` line there would type/run it at the recipient's prompt; a
+  display-only inject primitive is needed first, so the nudge-mode setting was dropped for now.
+  Also not started: `TERMHUB_TOKEN` hardening (`session_tokens` table + server-side check),
+  Condvar wake for `inbox --wait` (the 500 ms poll is fine), Windows named-pipe backend
+  (`interprocess`) — the app doesn't build on Windows at all yet.
 
 ---
 

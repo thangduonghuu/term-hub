@@ -146,12 +146,17 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
                 .as_deref()
                 .and_then(|id| sessions.iter().find(|s| s.id == id))
                 .map(|s| s.name.clone());
-            // Feed the live message-log panel (`MessageLog.tsx`).
+            // Feed the live message-log panel (`MessageLog.tsx`) and the recipient's toast.
             (state.notify)(AppEvent::MessageLogged {
-                from_name,
+                from_name: from_name.clone(),
                 to_name: target.name.clone(),
                 body: body.clone(),
                 ts,
+            });
+            (state.notify)(AppEvent::MessageNudge {
+                to_id: target.id.clone(),
+                from_name,
+                preview: preview(&body),
             });
             Ok(json!({ "message_id": mid, "recipient": target.id, "recipient_name": target.name }))
         }
@@ -178,11 +183,18 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
                 .and_then(|id| sessions.iter().find(|s| s.id == id))
                 .map(|s| s.name.clone());
             (state.notify)(AppEvent::MessageLogged {
-                from_name,
+                from_name: from_name.clone(),
                 to_name: format!("everyone ({} sessions)", recipients.len()),
                 body: body.clone(),
                 ts,
             });
+            for to_id in &recipients {
+                (state.notify)(AppEvent::MessageNudge {
+                    to_id: to_id.clone(),
+                    from_name: from_name.clone(),
+                    preview: preview(&body),
+                });
+            }
             Ok(json!({ "message_count": recipients.len(), "recipients": recipients }))
         }
         "inbox" => {
@@ -213,6 +225,18 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
             serde_json::to_value(msgs).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// A one-line, length-capped snippet of a message body for the arrival toast — the full text
+/// still lands in the inbox and the log panel.
+fn preview(body: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > MAX_CHARS {
+        format!("{}…", one_line.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        one_line
     }
 }
 

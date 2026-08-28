@@ -25,6 +25,7 @@ function App() {
   const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
   const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
   const [unreadBySession, setUnreadBySession] = useState<Record<string, number>>({});
+  const [messageToast, setMessageToast] = useState<{ from: string; preview: string } | null>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [messageLogOpen, setMessageLogOpen] = useState(false);
@@ -250,11 +251,34 @@ function App() {
     return () => window.removeEventListener("termhub:log-state", onLogState);
   }, []);
 
+  // Inter-session message arrived for one of this window's sessions (see `AppEvent::MessageNudge`)
+  // — pop a transient toast, same auto-dismiss pattern as the voice-error banner.
+  useEffect(() => {
+    function onMessageToast(e: Event) {
+      const d = (e as CustomEvent<{ from: string | null; preview: string }>).detail;
+      setMessageToast({ from: d.from ?? "outside a session", preview: d.preview });
+    }
+    window.addEventListener("termhub:message-toast", onMessageToast);
+    return () => window.removeEventListener("termhub:message-toast", onMessageToast);
+  }, []);
+
+  useEffect(() => {
+    if (!messageToast) return;
+    const timer = setTimeout(() => setMessageToast(null), 6000);
+    return () => clearTimeout(timer);
+  }, [messageToast]);
+
   return (
     <div className="app-shell">
       {voiceError && (
         <div className="voice-error-banner" onClick={() => setVoiceError(null)}>
           {voiceError}
+        </div>
+      )}
+      {messageToast && (
+        <div className="message-toast-banner" onClick={() => setMessageToast(null)}>
+          <strong>{messageToast.from}</strong>
+          <span>{messageToast.preview}</span>
         </div>
       )}
       <Sidebar
