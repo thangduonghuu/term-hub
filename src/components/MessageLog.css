@@ -15,6 +15,9 @@
 
 .msglog-header {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 10px 12px;
   font-size: 11px;
   font-weight: 600;
@@ -22,6 +25,23 @@
   text-transform: uppercase;
   color: #9a9a9a;
   border-bottom: 1px solid #333;
+}
+
+.msglog-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #9a9a9a;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.msglog-close:hover {
+  background: #2e2e2e;
+  color: #e6e6e6;
 }
 
 .msglog-body {

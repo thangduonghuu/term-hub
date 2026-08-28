@@ -1317,6 +1317,23 @@ impl ApplicationHandler<AppEvent> for App {
                         "window.dispatchEvent(new CustomEvent('termhub:message', {{ detail: {detail} }}))"
                     ));
                 }
+                // With no sidebar toggle button any more, an arriving message is what slides the
+                // panel into view. Close it from the × in its own header (`AppEvent::
+                // ToggleMessageLog`).
+                if !self.log_open {
+                    self.log_open = true;
+                    if let Some(window) = self.window.clone() {
+                        self.sync_webview_bounds(&window);
+                        self.refit_all_tiles(&window);
+                        self.last_frames.clear();
+                        window.request_redraw();
+                    }
+                    if let Some(wv) = self.log_webview.borrow().as_ref() {
+                        let _ = wv.evaluate_script(
+                            "window.dispatchEvent(new CustomEvent('termhub:log-state', { detail: true }))",
+                        );
+                    }
+                }
             }
             AppEvent::MessageNudge { to_id, from_name, preview } => {
                 // Opt-out via Settings > Messaging (`intersession_toast`, `"0"` = off, absent = on).

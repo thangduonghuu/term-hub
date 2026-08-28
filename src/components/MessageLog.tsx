@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { X } from "lucide-react";
 import { api, type LogEntry } from "../lib/api";
 import "./MessageLog.css";
 
@@ -35,7 +36,16 @@ export function MessageLog() {
 
   return (
     <div className="msglog">
-      <div className="msglog-header">Messages</div>
+      <div className="msglog-header">
+        <span>Messages</span>
+        <button
+          className="msglog-close"
+          onClick={() => api.toggleMessageLog()}
+          title="Close (reopens on the next message)"
+        >
+          <X size={14} />
+        </button>
+      </div>
       <div className="msglog-body">
         {entries.length === 0 ? (
           <div className="msglog-empty">
