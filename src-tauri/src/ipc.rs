@@ -142,6 +142,14 @@ fn handle(
         }
         // One-shot: the frontend calls this once on mount to seed its `activeId` state with
         // whichever tile `App::resumed` picked at startup — see `ActiveSession`'s doc comment.
+        // Right-docked inter-session message log panel (`MessageLog.tsx`). The toggle is driven
+        // from the sidebar's button; the panel itself loads its history with `get_message_log`
+        // on mount, then gets live `termhub:message` DOM events pushed from `control.rs`.
+        "toggle_message_log" => {
+            let _ = proxy.send_event(AppEvent::ToggleMessageLog);
+            to_value(())
+        }
+        "get_message_log" => commands::get_message_log(db).and_then(to_value),
         "get_active_session" => {
             let id = active.lock().map_err(|_| "active lock poisoned".to_string())?;
             to_value(id.clone())

@@ -26,6 +26,7 @@ function App() {
   const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceRecording, setVoiceRecording] = useState(false);
+  const [messageLogOpen, setMessageLogOpen] = useState(false);
 
   useEffect(() => {
     api.listSessions().then(setSessions);
@@ -226,6 +227,16 @@ function App() {
     return () => window.removeEventListener("termhub:voice-state", onVoiceState);
   }, []);
 
+  // Rust flips `App.log_open` when the message-log panel slides in/out (see
+  // `AppEvent::ToggleMessageLog`) and echoes the new state back so this button stays in sync.
+  useEffect(() => {
+    function onLogState(e: Event) {
+      setMessageLogOpen((e as CustomEvent<boolean>).detail);
+    }
+    window.addEventListener("termhub:log-state", onLogState);
+    return () => window.removeEventListener("termhub:log-state", onLogState);
+  }, []);
+
   return (
     <div className="app-shell">
       {voiceError && (
@@ -250,6 +261,8 @@ function App() {
         onOpenExternal={handleOpenExternal}
         onOpenUsage={() => setShowUsage(true)}
         onOpenSettings={() => setShowSettings(true)}
+        onToggleMessageLog={() => api.toggleMessageLog()}
+        messageLogOpen={messageLogOpen}
         pendingRenameId={pendingRenameId}
         onPendingRenameHandled={() => setPendingRenameId(null)}
       />

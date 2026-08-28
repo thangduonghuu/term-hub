@@ -1,7 +1,10 @@
 mod commands;
+#[cfg(unix)]
+mod control;
 mod db;
 mod external_terminal;
 mod ipc;
+mod message;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -28,6 +31,10 @@ use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::{Rect, WebView, WebViewBuilder};
 
 const SIDEBAR_WIDTH: f64 = 220.0;
+// Width of the right-docked inter-session message log panel (`MessageLog.tsx`) when it's open.
+// Its own webview, mirroring the left sidebar's; `App.log_open` toggles it and `tile_rects`
+// reserves this much off the right edge of the terminal area while it's showing.
+const LOG_PANEL_WIDTH: f64 = 300.0;
 
 // The sidebar webview served `dev_server_url()` unconditionally in every build, dev and
 // release alike — fine under `tauri dev` (Vite is actually listening on :1420), but a packaged
@@ -118,13 +125,13 @@ const TILE_CORNER_RADIUS: f64 = 10.0;
 /// right of the sidebar) in a roughly-square grid (`ceil(sqrt(n))` columns), the classic
 /// tiling-window-manager layout the plan doc's Phase 3 calls for. Recomputed on demand rather
 /// than cached, since it only depends on cheap inputs (window size, session count).
-fn tile_rects(window: &Window, n: usize) -> Vec<(f64, f64, f64, f64)> {
+fn tile_rects(window: &Window, n: usize, right_inset: f64) -> Vec<(f64, f64, f64, f64)> {
     if n == 0 {
         return Vec::new();
     }
     let scale = window.scale_factor();
     let size = window.inner_size();
-    let area_w = (size.width as f64 / scale - SIDEBAR_WIDTH).max(1.0);
+    let area_w = (size.width as f64 / scale - SIDEBAR_WIDTH - right_inset).max(1.0);
     let area_h = (size.height as f64 / scale).max(1.0);
     let cols = (n as f64).sqrt().ceil() as usize;
     let rows = (n + cols - 1) / cols;
@@ -145,6 +152,33 @@ fn tile_at(rects: &[(f64, f64, f64, f64)], logical_x: f64, logical_y: f64) -> Op
     rects.iter().position(|&(x, y, w, h)| {
         logical_x >= x && logical_x < x + w && logical_y >= y && logical_y < y + h
     })
+}
+
+/// Forces a child webview's NSView back to the front of its superview's subview stack — the
+/// wgpu Metal surface otherwise composites over it (see the long comment at the original
+/// sidebar-webview creation for the full why, and the linked wgpu/wry issues). No-op off macOS.
+fn raise_child_webview(webview: &WebView) {
+    #[cfg(target_os = "macos")]
+    {
+        use wry::WebViewExtMacOS;
+        let wk_webview = webview.webview();
+        // wry pins a different `objc2` than this crate, so `Retained<T>` isn't a shared type —
+        // reinterpret the underlying Objective-C `id` (same object either way) as this crate's
+        // own `NSView` binding via a raw-pointer cast.
+        let ns_view: &objc2_app_kit::NSView =
+            unsafe { &*((&*wk_webview) as *const _ as *const objc2_app_kit::NSView) };
+        if let Some(superview) = unsafe { ns_view.superview() } {
+            unsafe {
+                superview.addSubview_positioned_relativeTo(
+                    ns_view,
+                    objc2_app_kit::NSWindowOrderingMode::NSWindowAbove,
+                    None,
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = webview;
 }
 
 /// How many columns/rows of terminal grid fit in a `width_px` x `height_px` (physical pixels)
@@ -256,6 +290,13 @@ pub enum AppEvent {
     // being full-window-sized always). The frontend is responsible for only reporting "closed"
     // once *every* modal it owns is closed, since this is a single shared flag, not a count.
     SetOverlayOpen(bool),
+    // Sent by `ipc.rs`'s `toggle_message_log` command (the sidebar's log-panel button) — flips
+    // `App.log_open`, slides the right-docked message-log webview in/out, and reflows the tiles
+    // to the new terminal-area width.
+    ToggleMessageLog,
+    // Sent by `control.rs` whenever an inter-session message is delivered — forwarded into the
+    // log-panel webview as a `termhub:message` DOM event so the feed updates live.
+    MessageLogged { from_name: Option<String>, to_name: String, body: String, ts: i64 },
     // Sent by `ipc.rs`'s `set_accent_color` command when the user picks a different accent
     // color in Settings — updates `App.accent_color` (see its doc comment) so the native
     // active-tile border repaints with it immediately, without needing the app restarted to
@@ -335,6 +376,9 @@ struct GpuState<'a> {
 struct App {
     db: Arc<Db>,
     proxy: EventLoopProxy<AppEvent>,
+    // Path to the inter-session-messaging control socket (see `control.rs`), injected into
+    // every spawned session's env as `TERMHUB_SOCK`. Same value `run()` binds the server on.
+    sock_path: std::path::PathBuf,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState<'static>>,
     // `WebViewBuilder::with_ipc_handler`'s closure needs a handle to the webview it's part
@@ -342,6 +386,11 @@ struct App {
     // in right after `build_as_child` returns. Everything here runs on the main thread, so
     // Rc<RefCell<_>> (not Arc<Mutex<_>>) is enough.
     webview: Rc<RefCell<Option<WebView>>>,
+    // Second child webview, docked to the right strip — the inter-session message log
+    // (`MessageLog.tsx`, loaded with `?panel=messages`). Kept parked off the right edge of the
+    // window while `log_open` is false; slid in and given `LOG_PANEL_WIDTH` when true.
+    log_webview: Rc<RefCell<Option<WebView>>>,
+    log_open: bool,
     // Every currently-open session's live pty-backed terminal, in tile order (see
     // `tile_rects`). A `Vec` (not a map) because tile layout is order-sensitive and the
     // session count is always small — linear lookup by id is fine at this scale.
@@ -484,9 +533,12 @@ impl App {
         Self {
             db,
             proxy,
+            sock_path: control_socket_path(),
             window: None,
             gpu: None,
             webview: Rc::new(RefCell::new(None)),
+            log_webview: Rc::new(RefCell::new(None)),
+            log_open: false,
             terms: Vec::new(),
             active_id: None,
             last_frames: Vec::new(),
@@ -679,12 +731,48 @@ impl App {
         }
     }
 
+    /// How much horizontal space the message-log panel currently claims from the terminal
+    /// area's right edge — `LOG_PANEL_WIDTH` while open, nothing while closed.
+    fn log_inset(&self) -> f64 {
+        if self.log_open {
+            LOG_PANEL_WIDTH
+        } else {
+            0.0
+        }
+    }
+
+    /// The log panel webview's bounds — a `LOG_PANEL_WIDTH` strip on the right while `log_open`,
+    /// otherwise the same strip pushed fully past the right edge so it's just off-screen (kept
+    /// full-width rather than zeroed so there's no 0-size child-view edge case, and so it could
+    /// be animated later). Physical px for the same reason `webview_rect` uses them.
+    fn log_webview_rect(&self, window: &Window) -> Rect {
+        let scale = window.scale_factor();
+        let size = window.inner_size();
+        let w = LOG_PANEL_WIDTH * scale;
+        let x = if self.log_open { size.width as f64 - w } else { size.width as f64 };
+        Rect {
+            position: PhysicalPosition::new(x, 0.0).into(),
+            size: PhysicalSize::new(w, size.height as f64).into(),
+        }
+    }
+
+    /// Re-applies both child webviews' bounds for the current window size / `webview_full` /
+    /// `log_open` state — called from every place that changes one of those.
+    fn sync_webview_bounds(&self, window: &Window) {
+        if let Some(wv) = self.webview.borrow().as_ref() {
+            let _ = wv.set_bounds(self.webview_rect(window));
+        }
+        if let Some(wv) = self.log_webview.borrow().as_ref() {
+            let _ = wv.set_bounds(self.log_webview_rect(window));
+        }
+    }
+
     /// Refits every open session's grid (and its pty's `winsize`) to its current tile — called
     /// after the window resizes or the number of open sessions changes, either of which
     /// changes every tile's size via `tile_rects`.
     fn refit_all_tiles(&mut self, window: &Window) {
         let scale = window.scale_factor();
-        let rects = tile_rects(window, self.terms.len());
+        let rects = tile_rects(window, self.terms.len(), self.log_inset());
         for ((_, term), &(_, _, w, h)) in self.terms.iter_mut().zip(rects.iter()) {
             let (cols, rows) = grid_size_for_area(scale, w * scale, h * scale, self.cell_w);
             term.resize(cols, rows);
@@ -697,10 +785,22 @@ impl App {
     /// (`pending_reconnects`). Returns whether the spawn succeeded.
     fn spawn_session(&mut self, window: &Window, id: String, cwd: &str, shell: &str) -> bool {
         let scale = window.scale_factor();
-        let rects = tile_rects(window, self.terms.len() + 1);
+        let rects = tile_rects(window, self.terms.len() + 1, self.log_inset());
         let &(_, _, w, h) = rects.last().unwrap_or(&(0.0, 0.0, 0.0, 0.0));
         let (cols, rows) = grid_size_for_area(scale, w * scale, h * scale, self.cell_w);
-        match TerminalSession::spawn(id.clone(), cwd, shell, cols, rows, self.proxy.clone()) {
+        // Session's display name, for the `TERMHUB_SESSION_NAME` env var (inter-session
+        // messaging). Empty if the row's somehow already gone — not worth failing the spawn.
+        let name = self.db.get_session(&id).map(|m| m.name).unwrap_or_default();
+        match TerminalSession::spawn(
+            id.clone(),
+            cwd,
+            shell,
+            &name,
+            &self.sock_path,
+            cols,
+            rows,
+            self.proxy.clone(),
+        ) {
             Ok(term) => {
                 self.terms.push((id, term));
                 self.refit_all_tiles(window);
@@ -754,78 +854,62 @@ impl ApplicationHandler<AppEvent> for App {
         let mut text = TextPipeline::new(&device, &queue, format, config.width, config.height);
         self.cell_w = text.measure_cell_width() as f64;
 
-        // --- sidebar webview docked to the left strip, replacing the old Tauri-owned window ---
-        let rect = self.webview_rect(&window);
-        let db_for_ipc = self.db.clone();
-        let proxy_for_ipc = self.proxy.clone();
-        let activity_for_ipc = self.activity.clone();
-        let exited_for_ipc = self.exited.clone();
-        let active_for_ipc = self.active.clone();
-        let webview = WebViewBuilder::new().with_bounds(rect).with_transparent(true);
-        #[cfg(debug_assertions)]
-        let webview = webview.with_url(dev_server_url());
-        #[cfg(not(debug_assertions))]
-        let webview = webview
-            .with_custom_protocol("termhub".into(), |_id, request| {
-                let path = request.uri().path().trim_start_matches('/');
-                let path = if path.is_empty() { "index.html" } else { path };
-                match assets::Assets::get(path) {
-                    Some(file) => wry::http::Response::builder()
-                        .header("Content-Type", assets::mime_of(path))
-                        .body(std::borrow::Cow::from(file.data.into_owned()))
-                        .unwrap(),
-                    None => wry::http::Response::builder()
-                        .status(404)
-                        .body(std::borrow::Cow::from(Vec::new()))
-                        .unwrap(),
-                }
-            })
-            .with_url("termhub://localhost/index.html");
-        let webview = webview
-            .with_ipc_handler(move |msg| {
-                ipc::spawn_dispatch(
-                    db_for_ipc.clone(),
-                    activity_for_ipc.clone(),
-                    exited_for_ipc.clone(),
-                    active_for_ipc.clone(),
-                    proxy_for_ipc.clone(),
-                    msg.body(),
-                );
-            })
-            .build_as_child(&*window)
-            .expect("failed to build sidebar webview");
-
-        // The sidebar webview and this app's wgpu terminal surface share the same window, and
-        // on this wgpu version the surface's Metal layer composites in front of child NSViews
-        // regardless of AppKit's normal (most-recently-added-subview-wins) ordering — a known
-        // wgpu/wry interaction on macOS (https://github.com/DioxusLabs/dioxus/issues/3727,
-        // https://github.com/tauri-apps/wry/issues/1335). Explicitly re-inserting the webview's
-        // own NSView at the top of its superview's subview stack forces it back in front.
-        // `webview.webview()` returns wry's *own* `objc2` binding of the view (wry and this
-        // crate pin different `objc2` versions, per Cargo.lock — Retained<T> isn't the same
-        // type across them), so this goes through a raw pointer cast rather than wry's typed
-        // `Retained<WryWebView>` API: `Deref` still gets us `&WryWebView`, and reinterpreting
-        // that reference's address as `&objc2_app_kit::NSView` (this crate's own version) is
-        // valid because both bindings ultimately describe the exact same Objective-C object —
-        // the Rust wrapper type is version-specific, the underlying `id` is not.
-        #[cfg(target_os = "macos")]
-        {
-            use wry::WebViewExtMacOS;
-            let wk_webview = webview.webview();
-            let webview_ns_view: &objc2_app_kit::NSView =
-                unsafe { &*((&*wk_webview) as *const _ as *const objc2_app_kit::NSView) };
-            if let Some(superview) = unsafe { webview_ns_view.superview() } {
-                unsafe {
-                    superview.addSubview_positioned_relativeTo(
-                        webview_ns_view,
-                        objc2_app_kit::NSWindowOrderingMode::NSWindowAbove,
-                        None,
-                    );
-                }
-            }
-        }
-
+        // --- two child webviews sharing the window with the wgpu terminal surface: the sidebar
+        // docked to the left strip, and the message-log panel parked off the right edge until
+        // toggled open. Both load the same bundle; `?panel=messages` tells the frontend's
+        // `main.tsx` to mount `MessageLog` instead of `App`. ---
+        let (webview, log_webview) = {
+            let build_panel = |bounds: Rect, query: &'static str| -> WebView {
+                let db = self.db.clone();
+                let proxy = self.proxy.clone();
+                let activity = self.activity.clone();
+                let exited = self.exited.clone();
+                let active = self.active.clone();
+                let builder = WebViewBuilder::new().with_bounds(bounds).with_transparent(true);
+                #[cfg(debug_assertions)]
+                let builder = builder.with_url(format!("{}/{query}", dev_server_url()));
+                #[cfg(not(debug_assertions))]
+                let builder = builder
+                    .with_custom_protocol("termhub".into(), |_id, request| {
+                        let path = request.uri().path().trim_start_matches('/');
+                        let path = if path.is_empty() { "index.html" } else { path };
+                        match assets::Assets::get(path) {
+                            Some(file) => wry::http::Response::builder()
+                                .header("Content-Type", assets::mime_of(path))
+                                .body(std::borrow::Cow::from(file.data.into_owned()))
+                                .unwrap(),
+                            None => wry::http::Response::builder()
+                                .status(404)
+                                .body(std::borrow::Cow::from(Vec::new()))
+                                .unwrap(),
+                        }
+                    })
+                    .with_url(format!("termhub://localhost/index.html{query}"));
+                builder
+                    .with_ipc_handler(move |msg| {
+                        ipc::spawn_dispatch(
+                            db.clone(),
+                            activity.clone(),
+                            exited.clone(),
+                            active.clone(),
+                            proxy.clone(),
+                            msg.body(),
+                        );
+                    })
+                    .build_as_child(&*window)
+                    .expect("failed to build child webview")
+            };
+            (
+                build_panel(self.webview_rect(&window), ""),
+                build_panel(self.log_webview_rect(&window), "?panel=messages"),
+            )
+        };
+        // Raise the log panel first, then the sidebar — sidebar ends up frontmost so a
+        // full-window overlay modal (`webview_full`) always covers the log panel too.
+        raise_child_webview(&log_webview);
+        raise_child_webview(&webview);
         *self.webview.borrow_mut() = Some(webview);
+        *self.log_webview.borrow_mut() = Some(log_webview);
 
         // --- reconnect a live pty-backed terminal for every session already saved in the db
         // (Phase 3: multi-session tiling — previously this spawned exactly one hardcoded
@@ -1160,9 +1244,37 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::SetOverlayOpen(open) => {
                 self.webview_full = open;
                 let Some(window) = self.window.clone() else { return };
-                let rect = self.webview_rect(&window);
+                self.sync_webview_bounds(&window);
+            }
+            AppEvent::ToggleMessageLog => {
+                self.log_open = !self.log_open;
+                let Some(window) = self.window.clone() else { return };
+                self.sync_webview_bounds(&window);
+                // Terminal area just grew or shrank by `LOG_PANEL_WIDTH` — reflow the tiles.
+                self.refit_all_tiles(&window);
+                self.last_frames.clear();
+                window.request_redraw();
+                // Let the sidebar's toggle button reflect the new state.
                 if let Some(wv) = self.webview.borrow().as_ref() {
-                    let _ = wv.set_bounds(rect);
+                    let _ = wv.evaluate_script(&format!(
+                        "window.dispatchEvent(new CustomEvent('termhub:log-state', {{ detail: {} }}))",
+                        self.log_open
+                    ));
+                }
+            }
+            AppEvent::MessageLogged { from_name, to_name, body, ts } => {
+                if let Some(wv) = self.log_webview.borrow().as_ref() {
+                    // `body` is arbitrary agent/user text — must be JSON-escaped, unlike the
+                    // id/literal payloads the other `evaluate_script` calls here carry.
+                    let detail = serde_json::json!({
+                        "from": from_name,
+                        "to": to_name,
+                        "body": body,
+                        "ts": ts,
+                    });
+                    let _ = wv.evaluate_script(&format!(
+                        "window.dispatchEvent(new CustomEvent('termhub:message', {{ detail: {detail} }}))"
+                    ));
                 }
             }
             AppEvent::SetAccentColor(rgb) => {
@@ -1193,7 +1305,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(sel_id) = self.selecting_tile.clone() {
                     if let Some(window) = &self.window {
                         let scale = window.scale_factor();
-                        let rects = tile_rects(window, self.terms.len());
+                        let rects = tile_rects(window, self.terms.len(), self.log_inset());
                         if let Some(idx) = self.terms.iter().position(|(tid, _)| *tid == sel_id) {
                             let (tx, ty, _, _) = rects[idx];
                             let (col, row) =
@@ -1214,14 +1326,15 @@ impl ApplicationHandler<AppEvent> for App {
                 let scale = window.scale_factor();
                 let logical_x = self.cursor_pos.0 / scale;
                 let logical_y = self.cursor_pos.1 / scale;
-                if logical_x < SIDEBAR_WIDTH {
+                let logical_w = window.inner_size().width as f64 / scale;
+                if logical_x < SIDEBAR_WIDTH || (self.log_open && logical_x >= logical_w - LOG_PANEL_WIDTH) {
                     return;
                 }
                 #[cfg(target_os = "macos")]
                 if let Some(view) = &self.input_view {
                     macos::focus_input_view(view);
                 }
-                let rects = tile_rects(&window, self.terms.len());
+                let rects = tile_rects(&window, self.terms.len(), self.log_inset());
                 if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
                     let id = self.terms[idx].0.clone();
                     self.active_id = Some(id.clone());
@@ -1270,7 +1383,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let scale = window.scale_factor();
                 let logical_x = self.cursor_pos.0 / scale;
                 let logical_y = self.cursor_pos.1 / scale;
-                let rects = tile_rects(&window, self.terms.len());
+                let rects = tile_rects(&window, self.terms.len(), self.log_inset());
                 if let Some(idx) = tile_at(&rects, logical_x, logical_y) {
                     let (tx, ty, _, _) = rects[idx];
                     let (col, row) = point_to_cell_in_tile(
@@ -1293,10 +1406,7 @@ impl ApplicationHandler<AppEvent> for App {
                     gpu.text.resize(&gpu.queue, gpu.config.width, gpu.config.height);
                 }
                 if let Some(window) = self.window.clone() {
-                    let rect = self.webview_rect(&window);
-                    if let Some(wv) = self.webview.borrow().as_ref() {
-                        let _ = wv.set_bounds(rect);
-                    }
+                    self.sync_webview_bounds(&window);
                     // Keep every tile's grid (and its pty's own `winsize`, so `SIGWINCH`-aware
                     // programs like `vim`/`htop` redraw correctly) in sync with the window —
                     // previously hardcoded to 120x40 regardless of actual window size.
@@ -1325,10 +1435,7 @@ impl ApplicationHandler<AppEvent> for App {
                         gpu.surface.configure(&gpu.device, &gpu.config);
                         gpu.text.resize(&gpu.queue, gpu.config.width, gpu.config.height);
                     }
-                    let rect = self.webview_rect(&window);
-                    if let Some(wv) = self.webview.borrow().as_ref() {
-                        let _ = wv.set_bounds(rect);
-                    }
+                    self.sync_webview_bounds(&window);
                     self.refit_all_tiles(&window);
                     window.request_redraw();
                 }
@@ -1435,6 +1542,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // method call would conflict with.
                 let exited_snapshot: HashSet<String> =
                     self.exited.lock().map(|s| s.clone()).unwrap_or_default();
+                // Read before the `gpu` mutable borrow below — `log_inset()` takes `&self`.
+                let log_inset = self.log_inset();
                 let (Some(gpu), Some(window)) = (self.gpu.as_mut(), self.window.as_ref()) else {
                     return;
                 };
@@ -1479,7 +1588,7 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
                 let scale = window.scale_factor();
-                let rects = tile_rects(window, self.terms.len());
+                let rects = tile_rects(window, self.terms.len(), log_inset);
 
                 // Drop cached frames for tiles no longer open (closed sessions) so the cache
                 // doesn't grow without bound across a long-running app.
@@ -1734,6 +1843,21 @@ fn app_data_dir() -> std::path::PathBuf {
     dirs::data_dir().expect("no data dir for this platform").join("com.termhub.app")
 }
 
+/// Path to the inter-session-messaging control socket (see `control.rs`). Single source of
+/// truth: `run()` binds the server here and `App` injects the same path into every session's
+/// `TERMHUB_SOCK`.
+///
+/// Deliberately *not* under the app data dir: a Unix socket path must fit in
+/// `sockaddr_un.sun_path` (~104 bytes on macOS), and `~/Library/Application Support/
+/// com.termhub.app/` already eats most of that. `/tmp` keeps it short; the username keeps it
+/// per-user on a shared machine (same idea as tmux's `/tmp/tmux-<uid>/`).
+fn control_socket_path() -> std::path::PathBuf {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "default".into());
+    std::path::PathBuf::from(format!("/tmp/termhub-{user}.sock"))
+}
+
 pub fn run() {
     std::fs::create_dir_all(app_data_dir()).expect("failed to create app data dir");
     let db = Arc::new(
@@ -1775,9 +1899,29 @@ pub fn run() {
     let proxy = event_loop.create_proxy();
     event_loop.set_control_flow(ControlFlow::Wait);
 
+    // Inter-session messaging control socket (see `control.rs`). Serves on its own background
+    // threads; a bind failure is non-fatal (logged, feature disabled). `notify` forwards a
+    // delivered message into the event loop so the log-panel webview updates live.
+    #[cfg(unix)]
+    {
+        let notify_proxy = proxy.clone();
+        control::spawn(control::ControlState {
+            db: db.clone(),
+            sock_path: control_socket_path(),
+            notify: Box::new(move |ev| {
+                let _ = notify_proxy.send_event(ev);
+            }),
+        });
+    }
+
     let activity: Activity = Arc::new(Mutex::new(HashMap::new()));
     let exited: Exited = Arc::new(Mutex::new(HashSet::new()));
     let active: ActiveSession = Arc::new(Mutex::new(None));
     let mut app = App::new(db, proxy, activity, exited, active);
     event_loop.run_app(&mut app).expect("event loop error");
+
+    // Best-effort: don't leave a dead socket file behind on a clean exit. A hard kill skips
+    // this, but `control::spawn` removes any stale socket before it binds on the next launch.
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(control_socket_path());
 }

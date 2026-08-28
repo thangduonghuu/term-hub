@@ -242,10 +242,13 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: String,
         cwd: &str,
         shell: &str,
+        name: &str,
+        sock_path: &std::path::Path,
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<AppEvent>,
@@ -306,6 +309,19 @@ impl TerminalSession {
             ["Q_TERM", "Q_TERM_TMUX", "QTERM_SESSION_ID", "Q_PARENT", "NEOFETCH_SHOWN"]
         {
             env.insert(stale.to_string(), String::new());
+        }
+        // Inter-session messaging (see `control.rs` and `docs/intersession-messaging-plan.md`):
+        // tell anything running in this session who it is and how to reach TermHub's control
+        // socket, and put the `termhub-msg` CLI (shipped next to the running executable) on
+        // PATH so it's callable with no setup.
+        env.insert("TERMHUB_SESSION_ID".to_string(), id.clone());
+        env.insert("TERMHUB_SESSION_NAME".to_string(), name.to_string());
+        env.insert("TERMHUB_SOCK".to_string(), sock_path.display().to_string());
+        if let Some(bin_dir) =
+            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            env.insert("PATH".to_string(), format!("{}:{}", bin_dir.display(), existing));
         }
         // Previously always `None` regardless of the session's own `SessionMeta.shell` — every
         // session silently got `alacritty_terminal`'s own default ($SHELL/COMSPEC) no matter
