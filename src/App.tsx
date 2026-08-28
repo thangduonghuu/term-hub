@@ -28,7 +28,6 @@ function App() {
   const [messageToast, setMessageToast] = useState<{ from: string; preview: string } | null>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceRecording, setVoiceRecording] = useState(false);
-  const [messageLogOpen, setMessageLogOpen] = useState(false);
 
   useEffect(() => {
     api.listSessions().then(setSessions);
@@ -241,16 +240,6 @@ function App() {
     return () => window.removeEventListener("termhub:voice-state", onVoiceState);
   }, []);
 
-  // Rust flips `App.log_open` when the message-log panel slides in/out (see
-  // `AppEvent::ToggleMessageLog`) and echoes the new state back so this button stays in sync.
-  useEffect(() => {
-    function onLogState(e: Event) {
-      setMessageLogOpen((e as CustomEvent<boolean>).detail);
-    }
-    window.addEventListener("termhub:log-state", onLogState);
-    return () => window.removeEventListener("termhub:log-state", onLogState);
-  }, []);
-
   // Inter-session message arrived for one of this window's sessions (see `AppEvent::MessageNudge`)
   // — pop a transient toast, same auto-dismiss pattern as the voice-error banner.
   useEffect(() => {
@@ -297,10 +286,7 @@ function App() {
         onNewInFolder={handleNewInFolder}
         onOpenFolder={handleOpenFolder}
         onOpenExternal={handleOpenExternal}
-        onOpenUsage={() => setShowUsage(true)}
         onOpenSettings={() => setShowSettings(true)}
-        onToggleMessageLog={() => api.toggleMessageLog()}
-        messageLogOpen={messageLogOpen}
         pendingRenameId={pendingRenameId}
         onPendingRenameHandled={() => setPendingRenameId(null)}
       />
