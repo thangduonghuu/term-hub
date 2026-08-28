@@ -314,6 +314,10 @@ pub enum AppEvent {
     // Sent by `control.rs` whenever an inter-session message is delivered — forwarded into the
     // log-panel webview as a `termhub:message` DOM event so the feed updates live.
     MessageLogged { from_name: Option<String>, to_name: String, body: String, ts: i64 },
+    // Sent by `control.rs` once per recipient of a delivered message — drives the sidebar's
+    // arrival toast (`termhub:message-toast`). Separate from `MessageLogged` (one per send, for
+    // the transcript panel) because it's per-target and carries the recipient's session id.
+    MessageNudge { to_id: String, from_name: Option<String>, preview: String },
     // Sent by `ipc.rs`'s `set_accent_color` command when the user picks a different accent
     // color in Settings — updates `App.accent_color` (see its doc comment) so the native
     // active-tile border repaints with it immediately, without needing the app restarted to
@@ -823,12 +827,17 @@ impl App {
         // Session's display name, for the `TERMHUB_SESSION_NAME` env var (inter-session
         // messaging). Empty if the row's somehow already gone — not worth failing the spawn.
         let name = self.db.get_session(&id).map(|m| m.name).unwrap_or_default();
+        // Fresh per-pty auth token for `TERMHUB_TOKEN` (see `control.rs`'s inbox check). A
+        // failed write just means the token check falls back to lenient for this session.
+        let token = uuid::Uuid::new_v4().to_string();
+        let _ = self.db.set_session_token(&id, &token);
         match TerminalSession::spawn(
             id.clone(),
             cwd,
             shell,
             &name,
             &self.sock_path,
+            &token,
             cols,
             rows,
             self.proxy.clone(),
@@ -1307,6 +1316,24 @@ impl ApplicationHandler<AppEvent> for App {
                     let _ = wv.evaluate_script(&format!(
                         "window.dispatchEvent(new CustomEvent('termhub:message', {{ detail: {detail} }}))"
                     ));
+                }
+            }
+            AppEvent::MessageNudge { to_id, from_name, preview } => {
+                // Opt-out via Settings > Messaging (`intersession_toast`, `"0"` = off, absent = on).
+                let enabled =
+                    self.db.get_setting("intersession_toast").ok().flatten().as_deref() != Some("0");
+                if enabled {
+                    if let Some(wv) = self.webview.borrow().as_ref() {
+                        // `from_name` / `preview` are arbitrary agent text — JSON-escape.
+                        let detail = serde_json::json!({
+                            "from": from_name,
+                            "preview": preview,
+                            "toId": to_id,
+                        });
+                        let _ = wv.evaluate_script(&format!(
+                            "window.dispatchEvent(new CustomEvent('termhub:message-toast', {{ detail: {detail} }}))"
+                        ));
+                    }
                 }
             }
             AppEvent::SetAccentColor(rgb) => {

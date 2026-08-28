@@ -8,15 +8,16 @@
 //! connection. A thread per connection, same shape as `ipc.rs`'s dispatch. Everything it needs
 //! is `Send` (`Arc<Db>`), so it never has to reach into `App`.
 //!
-//! Phase 1 (this file): `whoami`, `list`, `send`, `inbox` — pull only, no push notification,
-//! no `inbox --wait`. Later phases add an `AppEvent` push for a toast/nudge and blocking
-//! receive.
+//! Commands: `whoami`, `list`, `send`, `broadcast`, `inbox` (with `peek` / `wait` /
+//! `timeout_secs`). `inbox` with `wait` polls `take_inbox` every 500 ms until a message lands
+//! or the timeout elapses — a thread-per-connection blocking read, no `AppEvent` involved.
+//! Still to come (Phase 3+): the `termhub-msg mcp` stdio server and a toast/idle-nudge push.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -39,6 +40,10 @@ pub struct ControlState {
 struct Req {
     #[serde(default)]
     session_id: Option<String>,
+    /// The caller's `TERMHUB_TOKEN` (see `terminal.rs`) — required to match before `inbox` /
+    /// `whoami` will act for `session_id`. Not needed for `list` / `send` / `broadcast`.
+    #[serde(default)]
+    token: Option<String>,
     cmd: String,
     #[serde(default)]
     args: Value,
@@ -104,6 +109,7 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
     match req.cmd.as_str() {
         "whoami" => {
             let id = req.session_id.as_deref().ok_or("not running inside a TermHub session")?;
+            check_token(db, id, req.token.as_deref())?;
             let meta = db.get_session(id).map_err(|_| "session not found".to_string())?;
             Ok(json!({ "id": meta.id, "name": meta.name, "cwd": meta.cwd }))
         }
@@ -145,22 +151,110 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
                 .as_deref()
                 .and_then(|id| sessions.iter().find(|s| s.id == id))
                 .map(|s| s.name.clone());
-            // Feed the live message-log panel (`MessageLog.tsx`).
+            // Feed the live message-log panel (`MessageLog.tsx`) and the recipient's toast.
             (state.notify)(AppEvent::MessageLogged {
-                from_name,
+                from_name: from_name.clone(),
                 to_name: target.name.clone(),
                 body: body.clone(),
                 ts,
             });
+            (state.notify)(AppEvent::MessageNudge {
+                to_id: target.id.clone(),
+                from_name,
+                preview: preview(&body),
+            });
             Ok(json!({ "message_id": mid, "recipient": target.id, "recipient_name": target.name }))
+        }
+        "broadcast" => {
+            let body: String = field(&req.args, "body")?;
+            if body.trim().is_empty() {
+                return Err("empty message body".into());
+            }
+            let me = req.session_id.as_deref();
+            let sessions = db.list_sessions().map_err(|e| e.to_string())?;
+            let ts = now();
+            let mut recipients = Vec::new();
+            for s in &sessions {
+                if Some(s.id.as_str()) == me {
+                    continue;
+                }
+                db.insert_message(me, &s.id, &body, ts).map_err(|e| e.to_string())?;
+                recipients.push(s.id.clone());
+            }
+            if recipients.is_empty() {
+                return Err("no other sessions to broadcast to".into());
+            }
+            let from_name = me
+                .and_then(|id| sessions.iter().find(|s| s.id == id))
+                .map(|s| s.name.clone());
+            (state.notify)(AppEvent::MessageLogged {
+                from_name: from_name.clone(),
+                to_name: format!("everyone ({} sessions)", recipients.len()),
+                body: body.clone(),
+                ts,
+            });
+            for to_id in &recipients {
+                (state.notify)(AppEvent::MessageNudge {
+                    to_id: to_id.clone(),
+                    from_name: from_name.clone(),
+                    preview: preview(&body),
+                });
+            }
+            Ok(json!({ "message_count": recipients.len(), "recipients": recipients }))
         }
         "inbox" => {
             let id = req.session_id.as_deref().ok_or("not running inside a TermHub session")?;
+            check_token(db, id, req.token.as_deref())?;
             let peek = req.args.get("peek").and_then(Value::as_bool).unwrap_or(false);
+            let wait = req.args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            if wait {
+                // Poll for a message up to `timeout_secs` (default 60, capped at 600). Each tick
+                // is a cheap `peek` read; the real (possibly consuming) read happens once, only
+                // after something's actually there — so a message landing mid-wait is taken
+                // exactly once.
+                let timeout =
+                    req.args.get("timeout_secs").and_then(Value::as_u64).unwrap_or(60).min(600);
+                let deadline = Instant::now() + Duration::from_secs(timeout);
+                loop {
+                    let waiting = db.take_inbox(id, true, now()).map_err(|e| e.to_string())?;
+                    if !waiting.is_empty() {
+                        let msgs = db.take_inbox(id, peek, now()).map_err(|e| e.to_string())?;
+                        return serde_json::to_value(msgs).map_err(|e| e.to_string());
+                    }
+                    if Instant::now() >= deadline {
+                        return Ok(json!([]));
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
             let msgs = db.take_inbox(id, peek, now()).map_err(|e| e.to_string())?;
             serde_json::to_value(msgs).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// Confirms the caller holds `session`'s `TERMHUB_TOKEN` before it's allowed to read that
+/// session's mailbox. Lenient when no token is on record — a session predating this feature, or
+/// one still mid-spawn — but a token that *is* recorded has to match exactly.
+fn check_token(db: &Db, session: &str, presented: Option<&str>) -> Result<(), String> {
+    match db.session_token(session).map_err(|e| e.to_string())? {
+        Some(expected) if presented != Some(expected.as_str()) => {
+            Err("bad or missing TERMHUB_TOKEN for this session".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A one-line, length-capped snippet of a message body for the arrival toast — the full text
+/// still lands in the inbox and the log panel.
+fn preview(body: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > MAX_CHARS {
+        format!("{}…", one_line.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        one_line
     }
 }
 
@@ -212,7 +306,7 @@ mod tests {
     }
 
     fn req(session_id: Option<&str>, cmd: &str, args: Value) -> Req {
-        Req { session_id: session_id.map(str::to_string), cmd: cmd.into(), args }
+        Req { session_id: session_id.map(str::to_string), token: None, cmd: cmd.into(), args }
     }
 
     #[test]
@@ -300,6 +394,94 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
         assert_eq!(alice["is_current"], true);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn broadcast_fans_out_to_every_other_session() {
+        let (db, path) = test_db();
+        db.insert_session(&SessionMeta {
+            id: "id-c".into(),
+            name: "carol".into(),
+            cwd: "/tmp".into(),
+            shell: String::new(),
+            created_at: 0,
+        })
+        .unwrap();
+        let state =
+            ControlState { db: db.clone(), sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+
+        let out = dispatch(
+            &req(Some("id-a"), "broadcast", json!({ "body": "standup in 5" })),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(out["message_count"], 2);
+
+        for who in ["id-b", "id-c"] {
+            let inbox = dispatch(&req(Some(who), "inbox", json!({})), &state).unwrap();
+            assert_eq!(inbox[0]["body"], "standup in 5");
+        }
+        // the sender doesn't get its own broadcast
+        let mine = dispatch(&req(Some("id-a"), "inbox", json!({})), &state).unwrap();
+        assert!(mine.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_wait_returns_a_message_already_waiting() {
+        let (db, path) = test_db();
+        let state = ControlState { db, sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+        dispatch(&req(Some("id-a"), "send", json!({ "to": "id-b", "body": "now" })), &state).unwrap();
+
+        let got = dispatch(
+            &req(Some("id-b"), "inbox", json!({ "wait": true, "timeout_secs": 2 })),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(got[0]["body"], "now");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_enforces_token_once_one_is_recorded() {
+        let (db, path) = test_db();
+        db.set_session_token("id-b", "secret-b").unwrap();
+        let state =
+            ControlState { db: db.clone(), sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+        dispatch(&req(Some("id-a"), "send", json!({ "to": "id-b", "body": "hi" })), &state).unwrap();
+
+        // no token, then wrong token → rejected, message left untouched
+        let mut call = req(Some("id-b"), "inbox", json!({}));
+        assert!(dispatch(&call, &state).unwrap_err().contains("TERMHUB_TOKEN"));
+        call.token = Some("wrong".into());
+        assert!(dispatch(&call, &state).unwrap_err().contains("TERMHUB_TOKEN"));
+
+        // right token → delivered
+        call.token = Some("secret-b".into());
+        let got = dispatch(&call, &state).unwrap();
+        assert_eq!(got[0]["body"], "hi");
+
+        // a session with no token on record stays lenient (id-a was never given one)
+        assert!(dispatch(&req(Some("id-a"), "whoami", json!({})), &state).is_ok());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_wait_times_out_empty() {
+        let (db, path) = test_db();
+        let state = ControlState { db, sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+
+        let got = dispatch(
+            &req(Some("id-b"), "inbox", json!({ "wait": true, "timeout_secs": 1 })),
+            &state,
+        )
+        .unwrap();
+        assert!(got.as_array().unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);
     }

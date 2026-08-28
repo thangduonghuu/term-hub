@@ -19,8 +19,41 @@ the same repo that Claude Code talks to as an MCP server.
   `control.rs`'s `send` fires `AppEvent::MessageLogged` via a `notify` callback → forwarded to
   the panel as a `termhub:message` DOM event; history loads on mount via `get_message_log`
   (`Db::recent_messages`).
-- Phases 2–4 — the remaining items (blocking `inbox --wait`, unread badges, MCP server,
-  toast/pty nudge, Windows) — not started.
+- **Phase 2 — done.** `broadcast` command (`control.rs` + `termhub-msg broadcast`, fans out to
+  one row per other session); blocking `inbox --wait [--timeout N]` (500 ms poll loop in
+  `dispatch`, default 60 s, cap 600, peek-then-real-take so a mid-wait arrival is consumed
+  once); `read_at` tracking and `purge_messages_for` on `delete_session` were already in.
+  `get_unread_counts` IPC command polled by `App.tsx`, driving a per-session unread badge in
+  the sidebar. `Cargo.toml` gained `default-run = "termhub"` (the two-binary clash the plan's
+  Open decision #4 flagged). 8 `control.rs` tests. Condvar wake for `--wait` still deferred to
+  Phase 4.
+- **Phase 3 — done.** `termhub-msg mcp` — a hand-rolled stdio JSON-RPC 2.0 server
+  (newline-delimited, not `Content-Length`): `initialize` / `ping` / `tools/list` /
+  `tools/call`, five tools (`list_sessions`, `send_message`, `broadcast_message`,
+  `check_inbox`, `wait_for_message`), each one round-trip through the same `call()` socket
+  helper the CLI uses. `get_mcp_register_command` IPC returns the absolute-path
+  `claude mcp add termhub-msg -- <path> mcp` line; a new **Messaging** section in
+  `SettingsPanel.tsx` shows it with a copy button (hidden on non-Unix, like Voice). 5
+  `mcp::tests`. The `get_message_settings` / `set_message_settings` enable+nudge settings are
+  Phase 4, not here.
+- **Phase 4 — mostly done.**
+  - *Arrival toast:* `control.rs` fires `AppEvent::MessageNudge` once per recipient (from `send`
+    and each `broadcast` target) with a length-capped `preview`; `lib.rs` forwards it to the
+    sidebar webview as `termhub:message-toast` (gated on `intersession_toast`, default on) and
+    `App.tsx` shows an auto-dismissing banner. Checkbox in Settings > Messaging (`get`/
+    `set_message_toast_enabled`).
+  - *`TERMHUB_TOKEN` hardening:* new `session_tokens` table (own table, never rides into
+    `SessionMeta`); `App::spawn_session` mints a fresh `Uuid` per pty and injects it as
+    `TERMHUB_TOKEN` alongside `TERMHUB_SESSION_ID`; `termhub-msg` forwards it; `control.rs`'s
+    `check_token` requires it to match for `inbox` / `whoami` (lenient only when no token is on
+    record — a pre-feature session, or one mid-spawn). `send` / `broadcast` / `list` stay open
+    (sender-spoofing is the accepted risk). `delete_session` / `clear_sessions` purge tokens.
+    +1 `control.rs` test (9 total).
+  - **Still open:** the idle *pty* nudge — `TerminalSession::write` targets the shell's stdin,
+    so writing a `[termhub] …` line there would type/run it at the recipient's prompt; a
+    display-only inject primitive is needed first, so the nudge-mode setting was dropped.
+    Condvar wake for `inbox --wait` (the 500 ms poll is fine) and the Windows named-pipe
+    backend (the app doesn't build on Windows at all yet) also not started.
 
 ---
 

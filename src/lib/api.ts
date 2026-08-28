@@ -79,6 +79,14 @@ export const api = {
   getActivity: () => invoke<Record<string, number>>("get_activity"),
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
   getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
+  // Session id -> count of unread inter-session messages, for the sidebar's unread badge.
+  getUnreadCounts: () => invoke<Record<string, number>>("get_unread_counts"),
+  // `claude mcp add …` snippet for Settings > Messaging (registers the `termhub-msg mcp` server).
+  getMcpRegisterCommand: () => invoke<string>("get_mcp_register_command"),
+  // Whether a toast pops in the sidebar when this session receives an inter-session message.
+  getMessageToastEnabled: () => invoke<boolean>("get_message_toast_enabled"),
+  setMessageToastEnabled: (enabled: boolean) =>
+    invoke<void>("set_message_toast_enabled", { enabled }),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   // Native OS folder-browse dialog — null if the user cancels. Used by the "Browse…" row in the
   // Open Recent picker, for folders that aren't in the MRU list yet.
