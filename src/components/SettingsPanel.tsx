@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Keyboard, Mic, Palette, RotateCcw, TerminalSquare, X } from "lucide-react";
+import { Copy, Keyboard, MessageSquare, Mic, Palette, RotateCcw, TerminalSquare, X } from "lucide-react";
 import { api, type KeyBinding } from "../lib/api";
 
 // Matches `commands::DEFAULT_ACCENT_COLOR` in the Rust backend — this is only the fallback
@@ -72,6 +72,7 @@ const SECTIONS = [
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "keyboard", label: "Keyboard Shortcuts", icon: Keyboard },
   { id: "voice", label: "Voice Dictation", icon: Mic },
+  { id: "messaging", label: "Messaging", icon: MessageSquare },
 ] as const;
 type SectionId = (typeof SECTIONS)[number]["id"];
 
@@ -92,6 +93,8 @@ export function SettingsPanel({ onClose }: Props) {
   const [shortcutCaptureError, setShortcutCaptureError] = useState<string | null>(null);
   const [accentColor, setAccentColor] = useState(DEFAULT_ACCENT_COLOR);
   const [accentSaved, setAccentSaved] = useState(false);
+  const [mcpCmd, setMcpCmd] = useState("");
+  const [mcpCopied, setMcpCopied] = useState(false);
 
   useEffect(() => {
     api.getDefaultShell().then((s) => setShell(s ?? ""));
@@ -101,6 +104,7 @@ export function SettingsPanel({ onClose }: Props) {
     api.getVoicePttKeycode().then(setPttKeycode);
     api.getShortcuts().then(setShortcuts);
     api.getAccentColor().then((c) => setAccentColor(c ?? DEFAULT_ACCENT_COLOR));
+    api.getMcpRegisterCommand().then(setMcpCmd).catch(() => setMcpCmd(""));
   }, []);
 
   // While "recording" (after clicking Change), capture the very next physical key press to
@@ -184,7 +188,11 @@ export function SettingsPanel({ onClose }: Props) {
   // would show as empty. Keyboard Shortcuts hides the same way, off `shortcuts` instead.
   const sections = SECTIONS.filter(
     (s) =>
-      (s.id !== "voice" || pttOptions.length > 0) && (s.id !== "keyboard" || shortcuts.length > 0),
+      (s.id !== "voice" || pttOptions.length > 0) &&
+      (s.id !== "keyboard" || shortcuts.length > 0) &&
+      // Messaging is Unix-only (the control socket) — `get_mcp_register_command` errors out
+      // elsewhere, leaving `mcpCmd` empty. Hide the whole section rather than show a dead one.
+      (s.id !== "messaging" || mcpCmd !== ""),
   );
 
   async function savePttKeycode(keycode: number) {
@@ -421,6 +429,38 @@ export function SettingsPanel({ onClose }: Props) {
                 </div>
                 {pttCaptureError && <p className="ptt-capture-error">{pttCaptureError}</p>}
                 {pttSaved && <span className="settings-saved-hint">Saved</span>}
+              </div>
+            )}
+
+            {activeSection === "messaging" && (
+              <div className="usage-section">
+                <div className="usage-section-header">
+                  <h3>Claude Code MCP tools</h3>
+                </div>
+                <p className="claude-key-note">
+                  Register the <code>termhub-msg</code> MCP server with Claude Code and an agent
+                  in this session can message other sessions with tools (<code>list_sessions</code>,
+                  <code>send_message</code>, <code>broadcast_message</code>, <code>check_inbox</code>,
+                  <code>wait_for_message</code>). Run this once from any session's shell:
+                </p>
+                <div className="claude-key-active-row">
+                  <input type="text" readOnly value={mcpCmd} onFocus={(e) => e.currentTarget.select()} />
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(mcpCmd).then(() => {
+                        setMcpCopied(true);
+                        setTimeout(() => setMcpCopied(false), 1500);
+                      });
+                    }}
+                  >
+                    <Copy size={13} />
+                    {mcpCopied ? "Copied" : "Copy"}
+                  </button>
+                </div>
+                <p className="claude-key-note">
+                  The CLI also works directly: <code>termhub-msg send &lt;session&gt; &lt;text&gt;</code>,
+                  <code>termhub-msg inbox --wait</code>, etc. — run <code>termhub-msg --help</code>.
+                </p>
               </div>
             )}
           </div>

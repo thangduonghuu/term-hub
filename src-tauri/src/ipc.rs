@@ -152,6 +152,8 @@ fn handle(
         "get_message_log" => commands::get_message_log(db).and_then(to_value),
         // Polled by `App.tsx` like `get_activity`; feeds the sidebar's per-session unread badge.
         "get_unread_counts" => commands::get_unread_counts(db).and_then(to_value),
+        // The `claude mcp add …` snippet shown in Settings > Messaging.
+        "get_mcp_register_command" => commands::get_mcp_register_command().and_then(to_value),
         "get_active_session" => {
             let id = active.lock().map_err(|_| "active lock poisoned".to_string())?;
             to_value(id.clone())

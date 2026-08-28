@@ -147,6 +147,18 @@ pub fn get_unread_counts(db: &Db) -> Result<std::collections::HashMap<String, i6
     db.unread_counts().map_err(|e| e.to_string())
 }
 
+/// The `claude mcp add …` line for the Settings > Messaging copy-button — registers the
+/// `termhub-msg mcp` stdio server (see `bin/termhub-msg.rs`) with Claude Code. Uses the
+/// absolute path to the CLI, which ships next to the GUI binary, so it also works run from a
+/// plain shell outside a session. `None` on the (unsupported) platforms where the CLI can't
+/// resolve its own location.
+pub fn get_mcp_register_command() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("no parent directory for the running executable")?;
+    let cli = dir.join("termhub-msg");
+    Ok(format!("claude mcp add termhub-msg -- {} mcp", cli.display()))
+}
+
 pub fn create_session(
     db: &Db,
     name: Option<String>,

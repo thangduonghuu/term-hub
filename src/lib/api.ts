@@ -81,6 +81,8 @@ export const api = {
   getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
   // Session id -> count of unread inter-session messages, for the sidebar's unread badge.
   getUnreadCounts: () => invoke<Record<string, number>>("get_unread_counts"),
+  // `claude mcp add …` snippet for Settings > Messaging (registers the `termhub-msg mcp` server).
+  getMcpRegisterCommand: () => invoke<string>("get_mcp_register_command"),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   // Native OS folder-browse dialog — null if the user cancels. Used by the "Browse…" row in the
   // Open Recent picker, for folders that aren't in the MRU list yet.

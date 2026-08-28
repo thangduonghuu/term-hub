@@ -27,8 +27,17 @@ the same repo that Claude Code talks to as an MCP server.
   the sidebar. `Cargo.toml` gained `default-run = "termhub"` (the two-binary clash the plan's
   Open decision #4 flagged). 8 `control.rs` tests. Condvar wake for `--wait` still deferred to
   Phase 4.
-- Phases 3–4 — the remaining items (MCP server + Settings section, toast/pty nudge,
-  `TERMHUB_TOKEN`, Windows) — not started.
+- **Phase 3 — done.** `termhub-msg mcp` — a hand-rolled stdio JSON-RPC 2.0 server
+  (newline-delimited, not `Content-Length`): `initialize` / `ping` / `tools/list` /
+  `tools/call`, five tools (`list_sessions`, `send_message`, `broadcast_message`,
+  `check_inbox`, `wait_for_message`), each one round-trip through the same `call()` socket
+  helper the CLI uses. `get_mcp_register_command` IPC returns the absolute-path
+  `claude mcp add termhub-msg -- <path> mcp` line; a new **Messaging** section in
+  `SettingsPanel.tsx` shows it with a copy button (hidden on non-Unix, like Voice). 5
+  `mcp::tests`. The `get_message_settings` / `set_message_settings` enable+nudge settings are
+  Phase 4, not here.
+- Phase 4 — the remaining items (toast + idle pty nudge + setting, `TERMHUB_TOKEN`, Condvar
+  wake for `--wait`, Windows named-pipe backend) — not started.
 
 ---
 
