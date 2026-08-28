@@ -827,12 +827,17 @@ impl App {
         // Session's display name, for the `TERMHUB_SESSION_NAME` env var (inter-session
         // messaging). Empty if the row's somehow already gone — not worth failing the spawn.
         let name = self.db.get_session(&id).map(|m| m.name).unwrap_or_default();
+        // Fresh per-pty auth token for `TERMHUB_TOKEN` (see `control.rs`'s inbox check). A
+        // failed write just means the token check falls back to lenient for this session.
+        let token = uuid::Uuid::new_v4().to_string();
+        let _ = self.db.set_session_token(&id, &token);
         match TerminalSession::spawn(
             id.clone(),
             cwd,
             shell,
             &name,
             &self.sock_path,
+            &token,
             cols,
             rows,
             self.proxy.clone(),

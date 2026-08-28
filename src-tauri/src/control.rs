@@ -40,6 +40,10 @@ pub struct ControlState {
 struct Req {
     #[serde(default)]
     session_id: Option<String>,
+    /// The caller's `TERMHUB_TOKEN` (see `terminal.rs`) — required to match before `inbox` /
+    /// `whoami` will act for `session_id`. Not needed for `list` / `send` / `broadcast`.
+    #[serde(default)]
+    token: Option<String>,
     cmd: String,
     #[serde(default)]
     args: Value,
@@ -105,6 +109,7 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
     match req.cmd.as_str() {
         "whoami" => {
             let id = req.session_id.as_deref().ok_or("not running inside a TermHub session")?;
+            check_token(db, id, req.token.as_deref())?;
             let meta = db.get_session(id).map_err(|_| "session not found".to_string())?;
             Ok(json!({ "id": meta.id, "name": meta.name, "cwd": meta.cwd }))
         }
@@ -199,6 +204,7 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
         }
         "inbox" => {
             let id = req.session_id.as_deref().ok_or("not running inside a TermHub session")?;
+            check_token(db, id, req.token.as_deref())?;
             let peek = req.args.get("peek").and_then(Value::as_bool).unwrap_or(false);
             let wait = req.args.get("wait").and_then(Value::as_bool).unwrap_or(false);
             if wait {
@@ -225,6 +231,18 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
             serde_json::to_value(msgs).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// Confirms the caller holds `session`'s `TERMHUB_TOKEN` before it's allowed to read that
+/// session's mailbox. Lenient when no token is on record — a session predating this feature, or
+/// one still mid-spawn — but a token that *is* recorded has to match exactly.
+fn check_token(db: &Db, session: &str, presented: Option<&str>) -> Result<(), String> {
+    match db.session_token(session).map_err(|e| e.to_string())? {
+        Some(expected) if presented != Some(expected.as_str()) => {
+            Err("bad or missing TERMHUB_TOKEN for this session".into())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -288,7 +306,7 @@ mod tests {
     }
 
     fn req(session_id: Option<&str>, cmd: &str, args: Value) -> Req {
-        Req { session_id: session_id.map(str::to_string), cmd: cmd.into(), args }
+        Req { session_id: session_id.map(str::to_string), token: None, cmd: cmd.into(), args }
     }
 
     #[test]
@@ -424,6 +442,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got[0]["body"], "now");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_enforces_token_once_one_is_recorded() {
+        let (db, path) = test_db();
+        db.set_session_token("id-b", "secret-b").unwrap();
+        let state =
+            ControlState { db: db.clone(), sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+        dispatch(&req(Some("id-a"), "send", json!({ "to": "id-b", "body": "hi" })), &state).unwrap();
+
+        // no token, then wrong token → rejected, message left untouched
+        let mut call = req(Some("id-b"), "inbox", json!({}));
+        assert!(dispatch(&call, &state).unwrap_err().contains("TERMHUB_TOKEN"));
+        call.token = Some("wrong".into());
+        assert!(dispatch(&call, &state).unwrap_err().contains("TERMHUB_TOKEN"));
+
+        // right token → delivered
+        call.token = Some("secret-b".into());
+        let got = dispatch(&call, &state).unwrap();
+        assert_eq!(got[0]["body"], "hi");
+
+        // a session with no token on record stays lenient (id-a was never given one)
+        assert!(dispatch(&req(Some("id-a"), "whoami", json!({})), &state).is_ok());
 
         let _ = std::fs::remove_file(path);
     }

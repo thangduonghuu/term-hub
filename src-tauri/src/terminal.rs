@@ -249,6 +249,7 @@ impl TerminalSession {
         shell: &str,
         name: &str,
         sock_path: &std::path::Path,
+        token: &str,
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<AppEvent>,
@@ -317,6 +318,10 @@ impl TerminalSession {
         env.insert("TERMHUB_SESSION_ID".to_string(), id.clone());
         env.insert("TERMHUB_SESSION_NAME".to_string(), name.to_string());
         env.insert("TERMHUB_SOCK".to_string(), sock_path.display().to_string());
+        // Proves to `control.rs` that a caller is really *this* session before it's allowed to
+        // read this session's inbox — a co-located process can guess the id (it's in
+        // `termhub-msg list`) but not this.
+        env.insert("TERMHUB_TOKEN".to_string(), token.to_string());
         if let Some(bin_dir) =
             std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {

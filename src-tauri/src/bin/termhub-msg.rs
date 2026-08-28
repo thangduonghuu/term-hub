@@ -111,6 +111,9 @@ usage:
         if let Ok(id) = std::env::var("TERMHUB_SESSION_ID") {
             req["session_id"] = json!(id);
         }
+        if let Ok(token) = std::env::var("TERMHUB_TOKEN") {
+            req["token"] = json!(token);
+        }
         let stream = UnixStream::connect(&sock)
             .map_err(|e| format!("can't reach TermHub at {sock}: {e}"))?;
         let mut writer = stream.try_clone().map_err(|e| e.to_string())?;

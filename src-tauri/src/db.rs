@@ -48,7 +48,17 @@ impl Db {
                 read_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_messages_inbox
-                ON messages (to_session, read_at, id);",
+                ON messages (to_session, read_at, id);
+            -- One opaque random token per live session, injected into its pty as
+            -- `TERMHUB_TOKEN` (see `terminal.rs`). `control.rs` requires it to match before
+            -- letting a caller read another session's inbox, so knowing a session id (which
+            -- `termhub-msg list` shows) isn't enough to read its messages. Kept in its own
+            -- table rather than a `sessions` column so it never rides along into `SessionMeta`
+            -- / the frontend.
+            CREATE TABLE IF NOT EXISTS session_tokens (
+                session_id TEXT PRIMARY KEY,
+                token TEXT NOT NULL
+            );",
         )?;
         // Backfill from whatever sessions already exist (e.g. every session predating the
         // `recent_folders` table, or a session restored at startup — `App::new`'s reconnect
@@ -95,6 +105,7 @@ impl Db {
             "DELETE FROM messages WHERE to_session = ?1 OR from_session = ?1",
             params![id],
         )?;
+        conn.execute("DELETE FROM session_tokens WHERE session_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -105,6 +116,7 @@ impl Db {
     pub fn clear_sessions(&self) -> rusqlite::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute("DELETE FROM sessions", [])?;
+        conn.execute("DELETE FROM session_tokens", [])?;
         Ok(())
     }
 
@@ -295,6 +307,32 @@ impl Db {
             .collect::<rusqlite::Result<_>>()?;
         rows.reverse();
         Ok(rows)
+    }
+
+    /// Stores (or replaces) a session's `TERMHUB_TOKEN` — see the `session_tokens` table. Called
+    /// from `App::spawn_session` every time a session's pty is (re)spawned, so the token is
+    /// fresh for the life of that pty.
+    pub fn set_session_token(&self, id: &str, token: &str) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session_tokens (session_id, token) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET token = excluded.token",
+            params![id, token],
+        )?;
+        Ok(())
+    }
+
+    /// A session's current `TERMHUB_TOKEN`, or `None` if it has none on record (a session
+    /// predating this, or mid-spawn) — `control.rs` treats that as "nothing to check against"
+    /// rather than a hard failure.
+    pub fn session_token(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT token FROM session_tokens WHERE session_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
     }
 
     /// `session id -> unread message count`, for sessions that currently have any.
