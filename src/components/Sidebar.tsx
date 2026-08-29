@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import type { SessionInfo } from "../lib/api";
 import { folderName } from "../lib/path";
+import { sessionColor, sessionTint } from "../lib/sessionColor";
 import { LumenPromo } from "./LumenPromo";
 
 // Rough menu box, for clamping it inside the narrow sidebar webview.
@@ -213,6 +214,10 @@ export function Sidebar({
                   >
                     <span
                       className="session-num"
+                      style={{
+                        color: sessionColor(session.id, sessionNum.get(session.id)),
+                        backgroundColor: sessionTint(session.id, sessionNum.get(session.id)),
+                      }}
                       title={`Session #${sessionNum.get(session.id)} — target it with \`termhub-msg send #${sessionNum.get(session.id)} …\``}
                     >
                       #{sessionNum.get(session.id)}

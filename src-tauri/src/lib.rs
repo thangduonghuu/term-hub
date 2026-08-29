@@ -326,7 +326,14 @@ pub enum AppEvent {
     ToggleMessageLog,
     // Sent by `control.rs` whenever an inter-session message is delivered — forwarded into the
     // log-panel webview as a `termhub:message` DOM event so the feed updates live.
-    MessageLogged { from_name: Option<String>, to_name: String, body: String, ts: i64 },
+    MessageLogged {
+        from_id: Option<String>,
+        from_name: Option<String>,
+        to_id: Option<String>,
+        to_name: String,
+        body: String,
+        ts: i64,
+    },
     // Sent by `control.rs` once per recipient of a delivered message — drives the sidebar's
     // arrival toast (`termhub:message-toast`). Separate from `MessageLogged` (one per send, for
     // the transcript panel) because it's per-target and carries the recipient's session id.
@@ -1337,12 +1344,27 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 self.refresh_log_panel();
             }
-            AppEvent::MessageLogged { from_name, to_name, body, ts } => {
+            AppEvent::MessageLogged { from_id, from_name, to_id, to_name, body, ts } => {
                 if let Some(wv) = self.log_webview.borrow().as_ref() {
+                    // Resolve each endpoint to its `#N` (1-based creation order — the same
+                    // numbering the sidebar and `control.rs` use) here, on the main thread with
+                    // the db in hand: the log webview is push-only (`AppEvent::IpcResponse` only
+                    // ever targets the sidebar webview), so it can't fetch the session list
+                    // itself to map ids to numbers / bubble colours.
+                    let sessions = self.db.list_sessions().unwrap_or_default();
+                    let num_of = |id: &Option<String>| {
+                        id.as_ref()
+                            .and_then(|id| sessions.iter().position(|s| &s.id == id))
+                            .map(|i| i + 1)
+                    };
                     // `body` is arbitrary agent/user text — must be JSON-escaped, unlike the
                     // id/literal payloads the other `evaluate_script` calls here carry.
                     let detail = serde_json::json!({
+                        "fromId": from_id,
+                        "fromNum": num_of(&from_id),
                         "from": from_name,
+                        "toId": to_id,
+                        "toNum": num_of(&to_id),
                         "to": to_name,
                         "body": body,
                         "ts": ts,

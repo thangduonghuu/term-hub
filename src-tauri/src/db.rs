@@ -288,7 +288,7 @@ impl Db {
     pub fn recent_messages(&self, limit: i64) -> rusqlite::Result<Vec<LogEntry>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT sf.name, st.name, m.body, m.created_at
+            "SELECT m.from_session, sf.name, m.to_session, st.name, m.body, m.created_at
              FROM messages m
              LEFT JOIN sessions sf ON sf.id = m.from_session
              LEFT JOIN sessions st ON st.id = m.to_session
@@ -298,10 +298,12 @@ impl Db {
         let mut rows: Vec<LogEntry> = stmt
             .query_map(params![limit], |row| {
                 Ok(LogEntry {
-                    from_name: row.get(0)?,
-                    to_name: row.get(1)?,
-                    body: row.get(2)?,
-                    created_at: row.get(3)?,
+                    from_id: row.get(0)?,
+                    from_name: row.get(1)?,
+                    to_id: row.get(2)?,
+                    to_name: row.get(3)?,
+                    body: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

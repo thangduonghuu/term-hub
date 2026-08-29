@@ -51,11 +51,13 @@ export interface ClaudeLimits {
   limits: [string, string][];
 }
 
-// One line in the right-docked inter-session message log (`MessageLog.tsx`). `from_name` is
-// null when the message was sent from a shell outside any session; `to_name` null if that
-// session has since been closed.
+// One line in the right-docked inter-session message log (`MessageLog.tsx`). `from_*` is null
+// when the message was sent from a shell outside any session; `to_*` null for a broadcast or a
+// since-closed session. The ids let the panel resolve each end to its `#N` and bubble colour.
 export interface LogEntry {
+  from_id: string | null;
   from_name: string | null;
+  to_id: string | null;
   to_name: string | null;
   body: string;
   created_at: number;

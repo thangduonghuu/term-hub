@@ -226,7 +226,9 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
             // Feed the live message-log panel (`MessageLog.tsx`), then either type the message
             // into the recipient's pty (auto-delivery) or pop its arrival toast.
             (state.notify)(AppEvent::MessageLogged {
+                from_id: req.session_id.clone(),
                 from_name: from_name.clone(),
+                to_id: Some(target.id.clone()),
                 to_name: target.name.clone(),
                 body: body.clone(),
                 ts,
@@ -264,7 +266,9 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
                 .and_then(|id| sessions.iter().find(|s| s.id == id))
                 .map(|s| s.name.clone());
             (state.notify)(AppEvent::MessageLogged {
+                from_id: me.map(str::to_string),
                 from_name: from_name.clone(),
+                to_id: None,
                 to_name: format!("everyone ({} sessions)", recipients.len()),
                 body: body.clone(),
                 ts,
