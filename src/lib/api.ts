@@ -87,6 +87,11 @@ export const api = {
   getMessageToastEnabled: () => invoke<boolean>("get_message_toast_enabled"),
   setMessageToastEnabled: (enabled: boolean) =>
     invoke<void>("set_message_toast_enabled", { enabled }),
+  // Whether an incoming inter-session message is typed straight into the target session's
+  // terminal (for a keyboard-driven agent that doesn't poll its inbox). Opt-in.
+  getMessageAutodeliverEnabled: () => invoke<boolean>("get_message_autodeliver_enabled"),
+  setMessageAutodeliverEnabled: (enabled: boolean) =>
+    invoke<void>("set_message_autodeliver_enabled", { enabled }),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   // Native OS folder-browse dialog — null if the user cancels. Used by the "Browse…" row in the
   // Open Recent picker, for folders that aren't in the MRU list yet.

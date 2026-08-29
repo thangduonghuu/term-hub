@@ -96,6 +96,7 @@ export function SettingsPanel({ onClose }: Props) {
   const [mcpCmd, setMcpCmd] = useState("");
   const [mcpCopied, setMcpCopied] = useState(false);
   const [messageToast, setMessageToast] = useState(true);
+  const [messageAutodeliver, setMessageAutodeliver] = useState(false);
 
   useEffect(() => {
     api.getDefaultShell().then((s) => setShell(s ?? ""));
@@ -107,6 +108,7 @@ export function SettingsPanel({ onClose }: Props) {
     api.getAccentColor().then((c) => setAccentColor(c ?? DEFAULT_ACCENT_COLOR));
     api.getMcpRegisterCommand().then(setMcpCmd).catch(() => setMcpCmd(""));
     api.getMessageToastEnabled().then(setMessageToast).catch(() => {});
+    api.getMessageAutodeliverEnabled().then(setMessageAutodeliver).catch(() => {});
   }, []);
 
   // While "recording" (after clicking Change), capture the very next physical key press to
@@ -474,6 +476,20 @@ export function SettingsPanel({ onClose }: Props) {
                     }}
                   />
                   Pop a toast when a message arrives for a session in this window
+                </label>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={messageAutodeliver}
+                    onChange={(e) => {
+                      const on = e.currentTarget.checked;
+                      setMessageAutodeliver(on);
+                      api.setMessageAutodeliverEnabled(on);
+                    }}
+                  />
+                  Type an incoming message straight into the session's terminal — for a Claude
+                  Code agent that isn't watching its inbox. Skipped while a session is in{" "}
+                  <code>wait_for_message</code>.
                 </label>
               </div>
             )}

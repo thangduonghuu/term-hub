@@ -49,11 +49,29 @@ the same repo that Claude Code talks to as an MCP server.
     record — a pre-feature session, or one mid-spawn). `send` / `broadcast` / `list` stay open
     (sender-spoofing is the accepted risk). `delete_session` / `clear_sessions` purge tokens.
     +1 `control.rs` test (9 total).
-  - **Still open:** the idle *pty* nudge — `TerminalSession::write` targets the shell's stdin,
-    so writing a `[termhub] …` line there would type/run it at the recipient's prompt; a
-    display-only inject primitive is needed first, so the nudge-mode setting was dropped.
-    Condvar wake for `inbox --wait` (the 500 ms poll is fine) and the Windows named-pipe
-    backend (the app doesn't build on Windows at all yet) also not started.
+  - **Still open:** Condvar wake for `inbox --wait` (the 500 ms poll is fine) and the Windows
+    named-pipe backend (the app doesn't build on Windows at all yet).
+- **Phase 5 — auto-deliver into the terminal — done.** Revisits the Phase 4 "still open" idle
+  *pty* nudge, now that typing into the recipient is the *wanted* behaviour for a
+  keyboard-driven agent. New `intersession_autodeliver` setting (Settings › Messaging,
+  **opt-in**, absent = off — unlike the toast, this drives the target's input). When on,
+  `send` / `broadcast` fire `AppEvent::MessageInject` instead of `MessageNudge`: `lib.rs`
+  bracketed-pastes `[termhub-msg from <who>] <body>` + a trailing `\r` into the target
+  session's pty (`Terminal::paste` + `write`), so a Claude Code agent there picks the message
+  up as a submitted prompt without ever polling `check_inbox`. The inject also clears the
+  target's unread rows (`take_inbox`) — it's been delivered by typing, so the sidebar badge
+  shouldn't double-count — and the arrival toast is skipped for that recipient
+  (`maybe_inject` returns whether it injected; callers gate the nudge on it). **Suppressed
+  while the target is parked in `inbox --wait`:** a process-global `waiting_sessions` set,
+  populated by a `WaitGuard` (RAII — clears on every early `return` and on panic) around the
+  `--wait` poll loop, tells `maybe_inject` to fall through to the normal unread path, so a
+  `wait_for_message` agent never gets the same message both typed in *and* returned from the
+  wait. `get` / `set_message_autodeliver_enabled` IPC (`ipc.rs` + `commands.rs`) and
+  `api.ts`; checkbox in `SettingsPanel.tsx`. +2 `control.rs` tests
+  (`autodeliver_on_injects_instead_of_nudging`, `autodeliver_skipped_while_target_is_waiting`),
+  13 total. **Verified live:** #2 → #1 `send` auto-typed into #1's terminal with #1's inbox
+  left empty; #1 → #2 reply while #2 sat in `inbox --wait` was returned from the wait (not
+  injected), and a following `inbox --peek` showed it already consumed.
 
 ---
 
@@ -385,7 +403,8 @@ runs `claude mcp add --scope local …` via a one-shot injected command.
 - **MCP** (`bin/termhub.rs`): feed canned `initialize` / `tools/list` / `tools/call` JSON on
   stdin, assert stdout frames.
 - **Manual matrix:** CLI path (Phase 1/2), MCP path (Phase 3), nudge idle vs busy (Phase 4),
-  session delete mid-conversation, TermHub restart with unread messages pending.
+  auto-deliver inject vs `inbox --wait` suppression (Phase 5), session delete mid-conversation,
+  TermHub restart with unread messages pending.
 - CI: `cargo build`, `cargo clippy -- -D warnings` for the new modules, `npm run build`.
 
 ---

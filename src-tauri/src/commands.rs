@@ -157,6 +157,19 @@ pub fn set_message_toast_enabled(db: &Db, enabled: bool) -> Result<(), String> {
     db.set_setting("intersession_toast", if enabled { "1" } else { "0" }).map_err(|e| e.to_string())
 }
 
+/// Whether an inter-session message for a session in this window is typed straight into that
+/// session's terminal (Settings > Messaging) — for a keyboard-driven agent that doesn't poll
+/// `check_inbox`. Stored as `"1"` / `"0"`; absent means off (this drives the target's input, so
+/// it's opt-in, unlike the toast).
+pub fn get_message_autodeliver_enabled(db: &Db) -> Result<bool, String> {
+    Ok(db.get_setting("intersession_autodeliver").map_err(|e| e.to_string())?.as_deref() == Some("1"))
+}
+
+pub fn set_message_autodeliver_enabled(db: &Db, enabled: bool) -> Result<(), String> {
+    db.set_setting("intersession_autodeliver", if enabled { "1" } else { "0" })
+        .map_err(|e| e.to_string())
+}
+
 /// The `claude mcp add …` line for the Settings > Messaging copy-button — registers the
 /// `termhub-msg mcp` stdio server (see `bin/termhub-msg.rs`) with Claude Code. Uses the
 /// absolute path to the CLI, which ships next to the GUI binary, so it also works run from a

@@ -331,6 +331,11 @@ pub enum AppEvent {
     // arrival toast (`termhub:message-toast`). Separate from `MessageLogged` (one per send, for
     // the transcript panel) because it's per-target and carries the recipient's session id.
     MessageNudge { to_id: String, from_name: Option<String>, preview: String },
+    // Sent by `control.rs` instead of `MessageNudge` when `intersession_autodeliver` is on and
+    // the target isn't mid-`inbox --wait` — types the message straight into the target
+    // session's pty (bracketed paste + Enter) so a keyboard-driven agent there picks it up as a
+    // submitted prompt.
+    MessageInject { to_id: String, from_name: Option<String>, body: String },
     // Sent by `ipc.rs`'s `set_accent_color` command when the user picks a different accent
     // color in Settings — updates `App.accent_color` (see its doc comment) so the native
     // active-tile border repaints with it immediately, without needing the app restarted to
@@ -1351,6 +1356,19 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.log_panel == LogPanel::Hidden {
                     self.log_panel = LogPanel::Collapsed;
                     self.refresh_log_panel();
+                }
+            }
+            AppEvent::MessageInject { to_id, from_name, body } => {
+                if let Some((_, term)) = self.terms.iter_mut().find(|(tid, _)| *tid == to_id) {
+                    let who = from_name.as_deref().unwrap_or("an outside shell");
+                    // Bracketed paste (see `Terminal::paste`) so a multi-line body and any
+                    // pasted-path recognition behave; the trailing CR submits it in an agent
+                    // TUI like Claude Code.
+                    term.paste(&format!("[termhub-msg from {who}] {body}"));
+                    term.write("\r");
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             AppEvent::MessageNudge { to_id, from_name, preview } => {

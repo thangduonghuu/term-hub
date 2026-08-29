@@ -161,6 +161,13 @@ fn handle(
             let enabled: bool = arg(&args, "enabled").ok_or("missing enabled")?;
             commands::set_message_toast_enabled(db, enabled).and_then(to_value)
         }
+        "get_message_autodeliver_enabled" => {
+            commands::get_message_autodeliver_enabled(db).and_then(to_value)
+        }
+        "set_message_autodeliver_enabled" => {
+            let enabled: bool = arg(&args, "enabled").ok_or("missing enabled")?;
+            commands::set_message_autodeliver_enabled(db, enabled).and_then(to_value)
+        }
         "get_active_session" => {
             let id = active.lock().map_err(|_| "active lock poisoned".to_string())?;
             to_value(id.clone())
