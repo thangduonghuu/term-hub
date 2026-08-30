@@ -51,6 +51,16 @@ export interface ClaudeLimits {
   limits: [string, string][];
 }
 
+// One line in the right-docked inter-session message log (`MessageLog.tsx`). `from_name` is
+// null when the message was sent from a shell outside any session; `to_name` null if that
+// session has since been closed.
+export interface LogEntry {
+  from_name: string | null;
+  to_name: string | null;
+  body: string;
+  created_at: number;
+}
+
 export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   createSession: (name?: string, cwd?: string) =>
@@ -69,6 +79,14 @@ export const api = {
   getActivity: () => invoke<Record<string, number>>("get_activity"),
   // Ids of sessions whose shell process has exited, for the sidebar's dead-session indicator.
   getExitedSessions: () => invoke<string[]>("get_exited_sessions"),
+  // Session id -> count of unread inter-session messages, for the sidebar's unread badge.
+  getUnreadCounts: () => invoke<Record<string, number>>("get_unread_counts"),
+  // `claude mcp add …` snippet for Settings > Messaging (registers the `termhub-msg mcp` server).
+  getMcpRegisterCommand: () => invoke<string>("get_mcp_register_command"),
+  // Whether a toast pops in the sidebar when this session receives an inter-session message.
+  getMessageToastEnabled: () => invoke<boolean>("get_message_toast_enabled"),
+  setMessageToastEnabled: (enabled: boolean) =>
+    invoke<void>("set_message_toast_enabled", { enabled }),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   // Native OS folder-browse dialog — null if the user cancels. Used by the "Browse…" row in the
   // Open Recent picker, for folders that aren't in the MRU list yet.
@@ -80,6 +98,12 @@ export const api = {
   // dashboard, settings) is open/closed — their centered-overlay CSS only has as much viewport
   // to work with as the webview itself.
   setOverlayOpen: (open: boolean) => invoke<void>("set_overlay_open", { open }),
+  // Slides the right-docked inter-session message log panel in/out (its own webview) and
+  // reflows the terminal tiles to the new width.
+  toggleMessageLog: () => invoke<void>("toggle_message_log", {}),
+  // Recent inter-session messages, oldest-first — the log panel's initial load. Live updates
+  // after that arrive as `termhub:message` window events pushed from Rust.
+  getMessageLog: () => invoke<LogEntry[]>("get_message_log"),
   // The configured default-shell override for new sessions, or null if unset ($SHELL/COMSPEC
   // is used instead — see `commands::create_session`).
   getDefaultShell: () => invoke<string | null>("get_default_shell"),

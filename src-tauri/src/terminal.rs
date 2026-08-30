@@ -242,10 +242,14 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: String,
         cwd: &str,
         shell: &str,
+        name: &str,
+        sock_path: &std::path::Path,
+        token: &str,
         cols: usize,
         rows: usize,
         proxy: EventLoopProxy<AppEvent>,
@@ -306,6 +310,23 @@ impl TerminalSession {
             ["Q_TERM", "Q_TERM_TMUX", "QTERM_SESSION_ID", "Q_PARENT", "NEOFETCH_SHOWN"]
         {
             env.insert(stale.to_string(), String::new());
+        }
+        // Inter-session messaging (see `control.rs` and `docs/intersession-messaging-plan.md`):
+        // tell anything running in this session who it is and how to reach TermHub's control
+        // socket, and put the `termhub-msg` CLI (shipped next to the running executable) on
+        // PATH so it's callable with no setup.
+        env.insert("TERMHUB_SESSION_ID".to_string(), id.clone());
+        env.insert("TERMHUB_SESSION_NAME".to_string(), name.to_string());
+        env.insert("TERMHUB_SOCK".to_string(), sock_path.display().to_string());
+        // Proves to `control.rs` that a caller is really *this* session before it's allowed to
+        // read this session's inbox — a co-located process can guess the id (it's in
+        // `termhub-msg list`) but not this.
+        env.insert("TERMHUB_TOKEN".to_string(), token.to_string());
+        if let Some(bin_dir) =
+            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            env.insert("PATH".to_string(), format!("{}:{}", bin_dir.display(), existing));
         }
         // Previously always `None` regardless of the session's own `SessionMeta.shell` — every
         // session silently got `alacritty_terminal`'s own default ($SHELL/COMSPEC) no matter
@@ -836,6 +857,20 @@ impl TextPipeline {
             device, pass, x, y, w, h, thickness, radius, active, exited, accent, viewport_w,
             viewport_h,
         );
+    }
+
+    /// Draws a batch of solid (alpha-blended) rectangles in physical-pixel coords — reuses the
+    /// selection quad pipeline. Used for the accent tint over a tile being dragged to a new grid
+    /// slot (see lib.rs's `tile_drag`).
+    pub fn fill_rects(
+        &self,
+        device: &wgpu::Device,
+        pass: &mut wgpu::RenderPass,
+        rects: &[(f32, f32, f32, f32, [f32; 4])],
+        viewport_w: u32,
+        viewport_h: u32,
+    ) {
+        self.selection.draw_rects(device, pass, rects, viewport_w, viewport_h);
     }
 
     /// Renders every currently-visible tile's text (left-aligned within its own origin), plus

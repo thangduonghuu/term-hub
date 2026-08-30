@@ -135,6 +135,40 @@ pub fn list_sessions(db: &Db) -> Result<Vec<SessionInfo>, String> {
     Ok(metas.into_iter().map(|meta| SessionInfo { meta }).collect())
 }
 
+/// Recent inter-session messages for the log panel's initial load (see `control.rs` and
+/// `MessageLog.tsx`). Live updates after mount come via the `termhub:message` DOM event.
+pub fn get_message_log(db: &Db) -> Result<Vec<crate::message::LogEntry>, String> {
+    db.recent_messages(200).map_err(|e| e.to_string())
+}
+
+/// `session id -> unread inter-session-message count`, polled by `App.tsx` alongside
+/// `get_activity` to drive the sidebar's per-session unread badge.
+pub fn get_unread_counts(db: &Db) -> Result<std::collections::HashMap<String, i64>, String> {
+    db.unread_counts().map_err(|e| e.to_string())
+}
+
+/// Whether an arrival toast pops in the sidebar when this session receives an inter-session
+/// message (Settings > Messaging). Stored as `"1"` / `"0"`; absent means on.
+pub fn get_message_toast_enabled(db: &Db) -> Result<bool, String> {
+    Ok(db.get_setting("intersession_toast").map_err(|e| e.to_string())?.as_deref() != Some("0"))
+}
+
+pub fn set_message_toast_enabled(db: &Db, enabled: bool) -> Result<(), String> {
+    db.set_setting("intersession_toast", if enabled { "1" } else { "0" }).map_err(|e| e.to_string())
+}
+
+/// The `claude mcp add …` line for the Settings > Messaging copy-button — registers the
+/// `termhub-msg mcp` stdio server (see `bin/termhub-msg.rs`) with Claude Code. Uses the
+/// absolute path to the CLI, which ships next to the GUI binary, so it also works run from a
+/// plain shell outside a session. `None` on the (unsupported) platforms where the CLI can't
+/// resolve its own location.
+pub fn get_mcp_register_command() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("no parent directory for the running executable")?;
+    let cli = dir.join("termhub-msg");
+    Ok(format!("claude mcp add termhub-msg -- {} mcp", cli.display()))
+}
+
 pub fn create_session(
     db: &Db,
     name: Option<String>,

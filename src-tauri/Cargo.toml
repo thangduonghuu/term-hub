@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "TermHub keeps a persistent list of terminal sessions and opens each one in a real external terminal app (iTerm, Warp, Windows Terminal, etc.), built for running multiple AI coding agents (Claude Code, Codex, etc.) in parallel. Rename, persist, and reopen sessions, and track their token usage. Tauri + React, MIT licensed."
 authors = ["you"]
 edition = "2021"
+# Two binaries live here — the GUI (`termhub`, from `src/main.rs`) and the inter-session
+# messaging CLI (`termhub-msg`, from `src/bin/termhub-msg.rs`). `cargo run` / `tauri dev` need
+# to know which one is the app.
+default-run = "termhub"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

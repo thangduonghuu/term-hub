@@ -1,0 +1,153 @@
+/* Right-docked inter-session message log — its own webview (see lib.rs's `build_panel`). The
+   webview is always `LOG_PANEL_WIDTH` wide; Rust slides it so only `.msglog-rail` (width must
+   match lib.rs's `LOG_HANDLE_WIDTH`) shows while collapsed, the whole thing while open, and
+   nothing at all until the first message. Solid backgrounds — the webview is transparent. */
+
+.msglog {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: row;
+  color: #e6e6e6;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 12px;
+}
+
+.msglog-rail {
+  position: relative;
+  flex: 0 0 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 10px;
+  background: #202020;
+  border: none;
+  border-left: 1px solid #2e2e2e;
+  color: #cfcfcf;
+  cursor: pointer;
+}
+
+.msglog-rail:hover {
+  background: #2a2a2a;
+  color: #fff;
+}
+
+.msglog-rail-badge {
+  position: absolute;
+  top: 4px;
+  right: 3px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent-color, #d8a657);
+  color: #1a1a1a;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}
+
+.msglog-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: #1c1c1c;
+  border-left: 1px solid #333;
+}
+
+.msglog:not(.open) .msglog-panel {
+  display: none;
+}
+
+.msglog-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #9a9a9a;
+  border-bottom: 1px solid #333;
+}
+
+.msglog-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #9a9a9a;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.msglog-close:hover {
+  background: #2e2e2e;
+  color: #e6e6e6;
+}
+
+.msglog-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px 12px 12px;
+}
+
+.msglog-empty {
+  color: #7a7a7a;
+  line-height: 1.5;
+  padding-top: 8px;
+}
+
+.msglog-empty code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: #262626;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.msglog-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.msglog-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+
+.msglog-from {
+  color: var(--accent-color, #d8a657);
+  font-weight: 600;
+}
+
+.msglog-arrow {
+  color: #6e6e6e;
+}
+
+.msglog-to {
+  color: #cfcfcf;
+  font-weight: 600;
+}
+
+.msglog-time {
+  margin-left: auto;
+  color: #6e6e6e;
+  font-variant-numeric: tabular-nums;
+}
+
+.msglog-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.45;
+  color: #dcdcdc;
+}
