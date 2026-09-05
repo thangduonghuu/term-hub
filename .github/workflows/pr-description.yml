@@ -27,14 +27,14 @@ jobs:
           STAT_EOF="STAT_EOF_${GITHUB_RUN_ID}_${GITHUB_JOB}_$RANDOM"
           {
             echo "stat<<$STAT_EOF"
-            git diff --stat "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)pnpm-lock.yaml' ':(exclude)**/pnpm-lock.yaml'
+            git diff --stat "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)package-lock.json' ':(exclude)**/package-lock.json' ':(exclude)Cargo.lock' ':(exclude)**/Cargo.lock'
             echo "$STAT_EOF"
           } >> "$GITHUB_OUTPUT"
 
           PATCH_EOF="PATCH_EOF_${GITHUB_RUN_ID}_${GITHUB_JOB}_$RANDOM"
           {
             echo "patch<<$PATCH_EOF"
-            git diff "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)pnpm-lock.yaml' ':(exclude)**/pnpm-lock.yaml' | head -c 12000
+            git diff "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)package-lock.json' ':(exclude)**/package-lock.json' ':(exclude)Cargo.lock' ':(exclude)**/Cargo.lock' | head -c 12000
             echo ""
             echo "$PATCH_EOF"
           } >> "$GITHUB_OUTPUT"
