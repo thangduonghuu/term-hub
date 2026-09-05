@@ -11,12 +11,18 @@
 //! Commands: `whoami`, `list`, `send`, `broadcast`, `inbox` (with `peek` / `wait` /
 //! `timeout_secs`). `inbox` with `wait` polls `take_inbox` every 500 ms until a message lands
 //! or the timeout elapses — a thread-per-connection blocking read, no `AppEvent` involved.
-//! Still to come (Phase 3+): the `termhub-msg mcp` stdio server and a toast/idle-nudge push.
+//!
+//! Auto-delivery: with the `intersession_autodeliver` setting on, `send`/`broadcast` also fire
+//! `AppEvent::MessageInject` so `App` types the message straight into the target session's pty
+//! (for a Claude Code agent that's driven by keyboard input, not by polling `check_inbox`).
+//! Suppressed while the target is blocked in an `inbox --wait` call, so a `wait_for_message`
+//! agent never gets the same message both typed in and returned from the wait.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -85,6 +91,67 @@ pub fn spawn(state: ControlState) {
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Session ids currently parked in an `inbox --wait` call. Process-global (one control server
+/// per process) so it needs no plumbing through `ControlState` or its ~dozen test call sites.
+/// `maybe_inject` checks it to skip auto-delivery for a session that's actively reading its
+/// inbox — that reader will get the message the normal way.
+fn waiting_sessions() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Marks `id` as waiting for the lifetime of an `inbox --wait` loop, clearing it on drop so
+/// every early `return` (and a panic) still unregisters.
+struct WaitGuard(String);
+
+impl WaitGuard {
+    fn new(id: &str) -> Self {
+        if let Ok(mut set) = waiting_sessions().lock() {
+            set.insert(id.to_string());
+        }
+        Self(id.to_string())
+    }
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = waiting_sessions().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// When `intersession_autodeliver` is on and the target isn't mid-`wait`, fires
+/// `AppEvent::MessageInject` (so `App` types the message into the target's pty) and clears the
+/// target's unread rows — it's been delivered by typing, so the sidebar badge shouldn't also
+/// count it. Returns whether it injected; callers skip the arrival toast when it did.
+fn maybe_inject(
+    state: &ControlState,
+    to_id: &str,
+    from_name: Option<String>,
+    body: &str,
+) -> Result<bool, String> {
+    let on = state
+        .db
+        .get_setting("intersession_autodeliver")
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some("1");
+    if !on {
+        return Ok(false);
+    }
+    if waiting_sessions().lock().map(|s| s.contains(to_id)).unwrap_or(false) {
+        return Ok(false);
+    }
+    (state.notify)(AppEvent::MessageInject {
+        to_id: to_id.to_string(),
+        from_name,
+        body: body.to_string(),
+    });
+    state.db.take_inbox(to_id, false, now()).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn handle_conn(conn: UnixStream, state: &ControlState) -> std::io::Result<()> {
@@ -156,18 +223,24 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
                 .as_deref()
                 .and_then(|id| sessions.iter().find(|s| s.id == id))
                 .map(|s| s.name.clone());
-            // Feed the live message-log panel (`MessageLog.tsx`) and the recipient's toast.
+            // Feed the live message-log panel (`MessageLog.tsx`), then either type the message
+            // into the recipient's pty (auto-delivery) or pop its arrival toast.
             (state.notify)(AppEvent::MessageLogged {
+                from_id: req.session_id.clone(),
                 from_name: from_name.clone(),
+                to_id: Some(target.id.clone()),
                 to_name: target.name.clone(),
                 body: body.clone(),
                 ts,
             });
-            (state.notify)(AppEvent::MessageNudge {
-                to_id: target.id.clone(),
-                from_name,
-                preview: preview(&body),
-            });
+            let injected = maybe_inject(state, &target.id, from_name.clone(), &body)?;
+            if !injected {
+                (state.notify)(AppEvent::MessageNudge {
+                    to_id: target.id.clone(),
+                    from_name,
+                    preview: preview(&body),
+                });
+            }
             Ok(json!({ "message_id": mid, "recipient": target.id, "recipient_name": target.name }))
         }
         "broadcast" => {
@@ -193,17 +266,22 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
                 .and_then(|id| sessions.iter().find(|s| s.id == id))
                 .map(|s| s.name.clone());
             (state.notify)(AppEvent::MessageLogged {
+                from_id: me.map(str::to_string),
                 from_name: from_name.clone(),
+                to_id: None,
                 to_name: format!("everyone ({} sessions)", recipients.len()),
                 body: body.clone(),
                 ts,
             });
             for to_id in &recipients {
-                (state.notify)(AppEvent::MessageNudge {
-                    to_id: to_id.clone(),
-                    from_name: from_name.clone(),
-                    preview: preview(&body),
-                });
+                let injected = maybe_inject(state, to_id, from_name.clone(), &body)?;
+                if !injected {
+                    (state.notify)(AppEvent::MessageNudge {
+                        to_id: to_id.clone(),
+                        from_name: from_name.clone(),
+                        preview: preview(&body),
+                    });
+                }
             }
             Ok(json!({ "message_count": recipients.len(), "recipients": recipients }))
         }
@@ -216,7 +294,9 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
                 // Poll for a message up to `timeout_secs` (default 60, capped at 600). Each tick
                 // is a cheap `peek` read; the real (possibly consuming) read happens once, only
                 // after something's actually there — so a message landing mid-wait is taken
-                // exactly once.
+                // exactly once. The guard tells `maybe_inject` not to also type messages at a
+                // session that's actively reading here.
+                let _guard = WaitGuard::new(id);
                 let timeout =
                     req.args.get("timeout_secs").and_then(Value::as_u64).unwrap_or(60).min(600);
                 let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -308,6 +388,7 @@ mod tests {
                 name: name.into(),
                 cwd: "/tmp".into(),
                 shell: String::new(),
+                shell_args: Vec::new(),
                 created_at: 0,
             })
             .unwrap();
@@ -363,6 +444,83 @@ mod tests {
             }
             _ => panic!("expected AppEvent::MessageLogged"),
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn autodeliver_on_injects_instead_of_nudging() {
+        let (db, path) = test_db();
+        // Own target id ("id-x"): the shared `waiting` set is process-global, and other tests
+        // park "id-b" in an `inbox --wait` — which would suppress the inject we're asserting.
+        db.insert_session(&SessionMeta {
+            id: "id-x".into(),
+            name: "xander".into(),
+            cwd: "/tmp".into(),
+            shell: String::new(),
+            shell_args: Vec::new(),
+            created_at: 0,
+        })
+        .unwrap();
+        db.set_setting("intersession_autodeliver", "1").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = ControlState {
+            db: db.clone(),
+            sock_path: "/unused".into(),
+            notify: Box::new(move |ev| tx.send(ev).unwrap()),
+        };
+        dispatch(&req(Some("id-a"), "send", json!({ "to": "xander", "body": "do the thing" })), &state)
+            .unwrap();
+
+        let events: Vec<AppEvent> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(e, AppEvent::MessageLogged { .. })));
+        let injected = events.iter().find_map(|e| match e {
+            AppEvent::MessageInject { to_id, body, .. } => Some((to_id.clone(), body.clone())),
+            _ => None,
+        });
+        assert_eq!(injected, Some(("id-x".into(), "do the thing".into())));
+        assert!(!events.iter().any(|e| matches!(e, AppEvent::MessageNudge { .. })));
+
+        // typed in => consumed, so the sidebar badge doesn't also count it
+        let inbox = dispatch(&req(Some("id-x"), "inbox", json!({})), &state).unwrap();
+        assert!(inbox.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn autodeliver_skipped_while_target_is_waiting() {
+        let (db, path) = test_db();
+        // A distinct target id ("id-w") keeps this test's `waiting` entry from colliding with
+        // other tests that share the process-global set.
+        db.insert_session(&SessionMeta {
+            id: "id-w".into(),
+            name: "wendy".into(),
+            cwd: "/tmp".into(),
+            shell: String::new(),
+            shell_args: Vec::new(),
+            created_at: 0,
+        })
+        .unwrap();
+        db.set_setting("intersession_autodeliver", "1").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = ControlState {
+            db: db.clone(),
+            sock_path: "/unused".into(),
+            notify: Box::new(move |ev| tx.send(ev).unwrap()),
+        };
+
+        let guard = WaitGuard::new("id-w");
+        dispatch(&req(Some("id-a"), "send", json!({ "to": "wendy", "body": "later" })), &state)
+            .unwrap();
+        drop(guard);
+
+        let events: Vec<AppEvent> = rx.try_iter().collect();
+        assert!(!events.iter().any(|e| matches!(e, AppEvent::MessageInject { .. })));
+        assert!(events.iter().any(|e| matches!(e, AppEvent::MessageNudge { .. })));
+        // left unread for the waiting reader to take
+        let inbox = dispatch(&req(Some("id-w"), "inbox", json!({})), &state).unwrap();
+        assert_eq!(inbox[0]["body"], "later");
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -457,6 +615,7 @@ mod tests {
             name: "carol".into(),
             cwd: "/tmp".into(),
             shell: String::new(),
+            shell_args: Vec::new(),
             created_at: 0,
         })
         .unwrap();

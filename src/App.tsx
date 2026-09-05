@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { api, type SessionInfo } from "./lib/api";
+import { applyAccentColor } from "./lib/color";
 import { Sidebar } from "./components/Sidebar";
 import { UsageDashboard } from "./components/UsageDashboard";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { QuickOpen } from "./components/QuickOpen";
+import { SshConnect } from "./components/SshConnect";
 import "./App.css";
 
 // A session counts as "recently active" (shows the sidebar's activity dot) if it produced
@@ -22,6 +24,7 @@ function App() {
   const [showUsage, setShowUsage] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showQuickOpen, setShowQuickOpen] = useState(false);
+  const [showSshConnect, setShowSshConnect] = useState(false);
   const [recentlyActive, setRecentlyActive] = useState<Set<string>>(new Set());
   const [exitedIds, setExitedIds] = useState<Set<string>>(new Set());
   const [unreadBySession, setUnreadBySession] = useState<Record<string, number>>({});
@@ -39,7 +42,7 @@ function App() {
     // from whatever's saved in the db — `SettingsPanel` sets this same property live when the
     // user picks a different color in Settings > Appearance.
     api.getAccentColor().then((color) => {
-      if (color) document.documentElement.style.setProperty("--accent-color", color);
+      if (color) applyAccentColor(color);
     });
   }, []);
 
@@ -49,8 +52,8 @@ function App() {
   // has as much viewport to center itself in as the webview actually is, so widen the webview
   // to the full window while either is open, and narrow it back once both are closed.
   useEffect(() => {
-    api.setOverlayOpen(showUsage || showSettings || showQuickOpen);
-  }, [showUsage, showSettings, showQuickOpen]);
+    api.setOverlayOpen(showUsage || showSettings || showQuickOpen || showSshConnect);
+  }, [showUsage, showSettings, showQuickOpen, showSshConnect]);
 
   useEffect(() => {
     const poll = () => {
@@ -112,6 +115,15 @@ function App() {
   function handleQuickOpenSelect(path: string) {
     setShowQuickOpen(false);
     handleNewInFolder(path);
+  }
+
+  // "Connect to VPS" picker: the session (and its `ssh` pty) already exists by the time this
+  // fires — `SshConnect` awaited `api.connectSsh` itself so it could show its own loading state
+  // and surface a connect error inline instead of here.
+  function handleSshConnected(session: SessionInfo) {
+    setShowSshConnect(false);
+    setSessions((prev) => [...prev, session]);
+    setActiveId(session.id);
   }
 
   async function handleDuplicate(session: SessionInfo) {
@@ -202,6 +214,11 @@ function App() {
   // Dismiss any open overlay when the window loses focus (Cmd+Tab away, clicking another app,
   // etc.) or Escape is pressed — see `dismiss_overlays` in lib.rs, which fires this for both.
   // Left open, a modal would be stranded on screen behind whatever the user switched to.
+  //
+  // "Connect to VPS" deliberately opts out of this: filling in a credential routinely means
+  // switching to another app first (a cloud console to copy the IP, a password manager for the
+  // login) and coming back — auto-closing on that focus change would silently discard whatever
+  // had been typed. It only closes via its own Cancel button or a completed connect/save.
   useEffect(() => {
     function onDismiss() {
       setShowUsage(false);
@@ -284,8 +301,8 @@ function App() {
         onDuplicate={handleDuplicate}
         onResumeClaude={handleResumeClaude}
         onNewInFolder={handleNewInFolder}
-        onOpenFolder={handleOpenFolder}
         onOpenExternal={handleOpenExternal}
+        onOpenSsh={() => setShowSshConnect(true)}
         onOpenSettings={() => setShowSettings(true)}
         pendingRenameId={pendingRenameId}
         onPendingRenameHandled={() => setPendingRenameId(null)}
@@ -294,6 +311,9 @@ function App() {
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showQuickOpen && (
         <QuickOpen onSelect={handleQuickOpenSelect} onClose={() => setShowQuickOpen(false)} />
+      )}
+      {showSshConnect && (
+        <SshConnect onConnected={handleSshConnected} onClose={() => setShowSshConnect(false)} />
       )}
     </div>
   );

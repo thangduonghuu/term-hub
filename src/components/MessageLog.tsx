@@ -1,12 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { MessageSquare, X } from "lucide-react";
-import { api, type LogEntry } from "../lib/api";
+import { api } from "../lib/api";
+import { sessionColor, sessionTint } from "../lib/sessionColor";
 import "./MessageLog.css";
 
-// Shape of the `termhub:message` DOM event Rust pushes on every delivered message (see
-// `AppEvent::MessageLogged`) — keyed differently from `LogEntry` (`from`/`to`/`ts`).
+// One rendered line. `num` is the endpoint's `#N` when it's an open session (Rust resolves it
+// against the session list — see `AppEvent::MessageLogged`); `id` is kept for a since-closed
+// session so its old bubbles keep a stable hash colour; both null for an outside shell.
+interface Entry {
+  fromId: string | null;
+  fromNum: number | null;
+  fromName: string | null;
+  toId: string | null;
+  toNum: number | null;
+  toName: string | null;
+  body: string;
+  ts: number;
+}
+
+// The `termhub:message` DOM event Rust pushes on every delivered message.
 interface LiveMessage {
+  fromId: string | null;
+  fromNum: number | null;
   from: string | null;
+  toId: string | null;
+  toNum: number | null;
   to: string | null;
   body: string;
   ts: number;
@@ -16,7 +34,7 @@ interface LiveMessage {
 type PanelState = "hidden" | "collapsed" | "open";
 
 export function MessageLog() {
-  const [entries, setEntries] = useState<LogEntry[]>([]);
+  const [entries, setEntries] = useState<Entry[]>([]);
   // Starts "hidden"; Rust flips it to "collapsed" on the first message and toggles
   // "collapsed" <-> "open" from the rail / the panel's ×.
   const [panel, setPanel] = useState<PanelState>("hidden");
@@ -26,13 +44,38 @@ export function MessageLog() {
   const panelRef = useRef<PanelState>("hidden");
 
   useEffect(() => {
-    api.getMessageLog().then(setEntries).catch(() => {});
+    api
+      .getMessageLog()
+      .then((rows) =>
+        setEntries(
+          rows.map((m) => ({
+            fromId: m.from_id,
+            fromNum: null,
+            fromName: m.from_name,
+            toId: m.to_id,
+            toNum: null,
+            toName: m.to_name,
+            body: m.body,
+            ts: m.created_at,
+          })),
+        ),
+      )
+      .catch(() => {});
 
     function onMessage(e: Event) {
       const d = (e as CustomEvent<LiveMessage>).detail;
       setEntries((prev) => [
         ...prev,
-        { from_name: d.from, to_name: d.to, body: d.body, created_at: d.ts },
+        {
+          fromId: d.fromId,
+          fromNum: d.fromNum,
+          fromName: d.from,
+          toId: d.toId,
+          toNum: d.toNum,
+          toName: d.to,
+          body: d.body,
+          ts: d.ts,
+        },
       ]);
       if (panelRef.current !== "open") setUnseen((n) => n + 1);
     }
@@ -53,6 +96,29 @@ export function MessageLog() {
   useEffect(() => {
     if (panel === "open") endRef.current?.scrollIntoView({ block: "end" });
   }, [entries, panel]);
+
+  function endpoint(
+    id: string | null,
+    num: number | null,
+    name: string | null,
+    fallback: string,
+  ) {
+    if (num && num > 0) {
+      // `#N Name`, matching how the sidebar reads (the chip is the `#N`, the name follows).
+      return {
+        label: name ? `#${num} ${name}` : `#${num}`,
+        color: sessionColor(id ?? "", num),
+        tint: sessionTint(id ?? "", num),
+      };
+    }
+    // A closed session (id, no live #N) keeps its stable hash colour; an outside shell /
+    // broadcast has neither.
+    return {
+      label: name ?? fallback,
+      color: id ? sessionColor(id) : "#8a8a8a",
+      tint: id ? sessionTint(id) : "rgba(255,255,255,0.06)",
+    };
+  }
 
   return (
     <div className={`msglog ${panel}`}>
@@ -82,17 +148,41 @@ export function MessageLog() {
               (target a session by <code>#num</code>, name, or id).
             </div>
           ) : (
-            entries.map((m, i) => (
-              <div className="msglog-item" key={i}>
-                <div className="msglog-meta">
-                  <span className="msglog-from">{m.from_name ?? "outside"}</span>
-                  <span className="msglog-arrow">→</span>
-                  <span className="msglog-to">{m.to_name ?? "(closed)"}</span>
-                  <span className="msglog-time">{formatTime(m.created_at)}</span>
+            entries.map((m, i) => {
+              const from = endpoint(m.fromId, m.fromNum, m.fromName, "outside");
+              const to = endpoint(m.toId, m.toNum, m.toName, "everyone");
+              const prev = entries[i - 1];
+              // Group consecutive messages on the same #A → #B pair (Messenger-style): only the
+              // first in a run carries the header.
+              const grouped =
+                prev &&
+                prev.fromId === m.fromId &&
+                prev.toId === m.toId &&
+                prev.fromNum === m.fromNum &&
+                prev.toNum === m.toNum;
+              return (
+                <div className={`msglog-row ${grouped ? "grouped" : ""}`} key={i}>
+                  {!grouped && (
+                    <div className="msglog-meta">
+                      <span className="msglog-chip" style={{ color: from.color, background: from.tint }}>
+                        {from.label}
+                      </span>
+                      <span className="msglog-arrow">→</span>
+                      <span className="msglog-chip" style={{ color: to.color, background: to.tint }}>
+                        {to.label}
+                      </span>
+                      <span className="msglog-time">{formatTime(m.ts)}</span>
+                    </div>
+                  )}
+                  <div
+                    className="msglog-bubble"
+                    style={{ borderLeftColor: from.color, background: from.tint }}
+                  >
+                    {m.body}
+                  </div>
                 </div>
-                <div className="msglog-text">{m.body}</div>
-              </div>
-            ))
+              );
+            })
           )}
           <div ref={endRef} />
         </div>

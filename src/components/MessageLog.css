@@ -112,31 +112,33 @@
   border-radius: 3px;
 }
 
-.msglog-item {
-  padding: 8px 0;
-  border-bottom: 1px solid #2a2a2a;
+.msglog-row {
+  margin-top: 10px;
+}
+
+/* Consecutive messages on the same #A → #B pair sit tight under the one header. */
+.msglog-row.grouped {
+  margin-top: 3px;
 }
 
 .msglog-meta {
   display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-bottom: 3px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  margin-bottom: 4px;
   font-size: 11px;
 }
 
-.msglog-from {
-  color: var(--accent-color, #d8a657);
-  font-weight: 600;
+.msglog-chip {
+  padding: 1px 6px;
+  border-radius: 9px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 
 .msglog-arrow {
   color: #6e6e6e;
-}
-
-.msglog-to {
-  color: #cfcfcf;
-  font-weight: 600;
 }
 
 .msglog-time {
@@ -145,9 +147,13 @@
   font-variant-numeric: tabular-nums;
 }
 
-.msglog-text {
+/* Messenger-style bubble, tinted and left-barred in the sender's colour. */
+.msglog-bubble {
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.45;
-  color: #dcdcdc;
+  color: #ececec;
+  padding: 7px 10px;
+  border-left: 3px solid #666;
+  border-radius: 4px 12px 12px 4px;
 }

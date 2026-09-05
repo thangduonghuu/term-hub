@@ -301,7 +301,17 @@ pub enum AppEvent {
     // commands successfully touch the database — the *live* pty-backed session (Phase 3:
     // multi-session tiling) is owned entirely here in `App`, not reachable from the IPC
     // dispatch background threads, so it's created/destroyed/focused in response to these.
-    SpawnSession { id: String, cwd: String, shell: String },
+    // `ssh_password` is `Some` only for `ipc.rs`'s `connect_ssh` handler, when the credential's
+    // auth method is password-based — stashed into `App::pending_ssh_passwords` on spawn so the
+    // next `PtyOutput` for this session can type it in the moment `ssh`'s own prompt appears
+    // (see that field's doc comment). Every other spawn path leaves this `None`.
+    SpawnSession {
+        id: String,
+        cwd: String,
+        shell: String,
+        shell_args: Vec<String>,
+        ssh_password: Option<String>,
+    },
     CloseSession { id: String },
     FocusSession(String),
     // Sent by `ipc.rs`'s `send_to_session` command — the sidebar's per-session "Resume Claude"
@@ -326,11 +336,23 @@ pub enum AppEvent {
     ToggleMessageLog,
     // Sent by `control.rs` whenever an inter-session message is delivered — forwarded into the
     // log-panel webview as a `termhub:message` DOM event so the feed updates live.
-    MessageLogged { from_name: Option<String>, to_name: String, body: String, ts: i64 },
+    MessageLogged {
+        from_id: Option<String>,
+        from_name: Option<String>,
+        to_id: Option<String>,
+        to_name: String,
+        body: String,
+        ts: i64,
+    },
     // Sent by `control.rs` once per recipient of a delivered message — drives the sidebar's
     // arrival toast (`termhub:message-toast`). Separate from `MessageLogged` (one per send, for
     // the transcript panel) because it's per-target and carries the recipient's session id.
     MessageNudge { to_id: String, from_name: Option<String>, preview: String },
+    // Sent by `control.rs` instead of `MessageNudge` when `intersession_autodeliver` is on and
+    // the target isn't mid-`inbox --wait` — types the message straight into the target
+    // session's pty (bracketed paste + Enter) so a keyboard-driven agent there picks it up as a
+    // submitted prompt.
+    MessageInject { to_id: String, from_name: Option<String>, body: String },
     // Sent by `ipc.rs`'s `set_accent_color` command when the user picks a different accent
     // color in Settings — updates `App.accent_color` (see its doc comment) so the native
     // active-tile border repaints with it immediately, without needing the app restarted to
@@ -448,6 +470,20 @@ struct App {
     // active tile is always re-snapshotted fresh (never read from here) since only it can show
     // a blinking cursor/IME preedit, neither of which bumps `generation()`.
     frame_cache: HashMap<String, (u64, Frame)>,
+    // Session id -> a password-auth "Connect to VPS" credential's saved password, waiting to be
+    // typed in the moment `ssh`'s own prompt appears (see `AppEvent::PtyOutput`'s handling,
+    // which checks the newly-updated session's `cursor_line_text()` for it) — populated by
+    // `AppEvent::SpawnSession`'s `ssh_password`, removed the instant it's used (one-shot: a
+    // second, unrelated "password" appearing later in the same session, e.g. the remote shell's
+    // own `sudo`, must never get this typed into it too) or the session is closed unused.
+    pending_ssh_passwords: HashMap<String, String>,
+    // A prompt match just fired (see `AppEvent::PtyOutput`) but the actual pty write is
+    // deliberately deferred a few ticks past it rather than done inline on the same event —
+    // `ssh` prints the prompt text and *then* finishes switching the pty into its own no-echo
+    // read mode; writing the instant the text appears risks racing that setup in a way no real
+    // keystroke ever could (a human's reaction time trivially clears it, a same-tick
+    // instruction doesn't). `about_to_wait` below fires these once their deadline passes.
+    armed_ssh_passwords: Vec<(String, String, Instant)>,
     cursor_pos: (f64, f64),
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
     // it's committed) for `active_id`'s session — not sent to the pty, just overlaid at the
@@ -589,6 +625,8 @@ impl App {
             active_id: None,
             last_frames: Vec::new(),
             frame_cache: HashMap::new(),
+            pending_ssh_passwords: HashMap::new(),
+            armed_ssh_passwords: Vec::new(),
             cursor_pos: (0.0, 0.0),
             preedit: String::new(),
             #[cfg(target_os = "macos")]
@@ -641,8 +679,13 @@ impl App {
             return false;
         }
         if let Ok(meta) = self.db.get_session(&id) {
-            let _ =
-                self.proxy.send_event(AppEvent::SpawnSession { id, cwd: meta.cwd, shell: meta.shell });
+            let _ = self.proxy.send_event(AppEvent::SpawnSession {
+                id,
+                cwd: meta.cwd,
+                shell: meta.shell,
+                shell_args: meta.shell_args,
+                ssh_password: None,
+            });
         }
         true
     }
@@ -855,7 +898,14 @@ impl App {
     /// grid), then resizes every other already-open tile to fit the new total — shared by
     /// live session creation (`AppEvent::SpawnSession`) and the staggered startup reconnect
     /// (`pending_reconnects`). Returns whether the spawn succeeded.
-    fn spawn_session(&mut self, window: &Window, id: String, cwd: &str, shell: &str) -> bool {
+    fn spawn_session(
+        &mut self,
+        window: &Window,
+        id: String,
+        cwd: &str,
+        shell: &str,
+        shell_args: &[String],
+    ) -> bool {
         let scale = window.scale_factor();
         let rects = tile_rects(window, self.terms.len() + 1, self.log_inset());
         let &(_, _, w, h) = rects.last().unwrap_or(&(0.0, 0.0, 0.0, 0.0));
@@ -871,6 +921,7 @@ impl App {
             id.clone(),
             cwd,
             shell,
+            shell_args,
             &name,
             &self.sock_path,
             &token,
@@ -1018,7 +1069,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         if let Some(first) = metas.pop_front() {
-            self.spawn_session(&window, first.id, &first.cwd, &first.shell);
+            self.spawn_session(&window, first.id, &first.cwd, &first.shell, &first.shell_args);
         }
         self.pending_reconnects = metas;
         self.next_reconnect = Instant::now() + RECONNECT_STAGGER;
@@ -1057,6 +1108,29 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::PtyOutput(id) => {
+                // SSH auto-password: if this session is still waiting to have one typed in,
+                // check whether the line its cursor is now sitting on looks like `ssh`'s own
+                // password prompt (`"user@host's password:"`, or a retry's plain
+                // `"password:"`) — a substring match is deliberately loose rather than trying
+                // to parse the exact OpenSSH wording, which varies (first prompt vs. a retry
+                // after a wrong password) and isn't worth pinning down exactly. One-shot: acted
+                // on at most once per session, so a *different* later "password" prompt (the
+                // remote shell's own `sudo`, say) is never typed into.
+                if let Some(password) = self.pending_ssh_passwords.get(&id).cloned() {
+                    let matched = self
+                        .terms
+                        .iter()
+                        .find(|(tid, _)| *tid == id)
+                        .is_some_and(|(_, term)| term.cursor_line_text().to_lowercase().contains("password"));
+                    if matched {
+                        self.pending_ssh_passwords.remove(&id);
+                        self.armed_ssh_passwords.push((
+                            id.clone(),
+                            password,
+                            Instant::now() + Duration::from_millis(150),
+                        ));
+                    }
+                }
                 if let Ok(mut activity) = self.activity.lock() {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1243,9 +1317,11 @@ impl ApplicationHandler<AppEvent> for App {
                     view.set_shortcuts(bindings);
                 }
             }
-            AppEvent::SpawnSession { id, cwd, shell } => {
+            AppEvent::SpawnSession { id, cwd, shell, shell_args, ssh_password } => {
                 let Some(window) = self.window.clone() else { return };
                 self.terms.retain(|(tid, _)| *tid != id);
+                self.pending_ssh_passwords.remove(&id);
+                self.armed_ssh_passwords.retain(|(tid, _, _)| *tid != id);
                 // The respawned session starts its own generation counter back at 0 — drop any
                 // cached frame for this id so a coincidental generation match against the old
                 // (dead) session's last frame can never serve stale content for the new one.
@@ -1258,8 +1334,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // prompt rendered for the wrong width, which a later resize doesn't
                 // retroactively fix (confirmed: this was the cause of the garbled/overflowing
                 // first prompt seen when creating a session while others were already open).
-                if !self.spawn_session(&window, id.clone(), &cwd, &shell) {
+                if !self.spawn_session(&window, id.clone(), &cwd, &shell, &shell_args) {
                     return;
+                }
+                if let Some(password) = ssh_password {
+                    self.pending_ssh_passwords.insert(id.clone(), password);
                 }
                 // Respawning (whether from the sidebar's "new"/duplicate or reviving a dead
                 // tile — Phase 5) always means the tile is alive again.
@@ -1275,6 +1354,8 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::CloseSession { id } => {
                 self.terms.retain(|(tid, _)| *tid != id);
+                self.pending_ssh_passwords.remove(&id);
+                self.armed_ssh_passwords.retain(|(tid, _, _)| *tid != id);
                 if let Ok(mut exited) = self.exited.lock() {
                     exited.remove(&id);
                 }
@@ -1332,12 +1413,27 @@ impl ApplicationHandler<AppEvent> for App {
                 };
                 self.refresh_log_panel();
             }
-            AppEvent::MessageLogged { from_name, to_name, body, ts } => {
+            AppEvent::MessageLogged { from_id, from_name, to_id, to_name, body, ts } => {
                 if let Some(wv) = self.log_webview.borrow().as_ref() {
+                    // Resolve each endpoint to its `#N` (1-based creation order — the same
+                    // numbering the sidebar and `control.rs` use) here, on the main thread with
+                    // the db in hand: the log webview is push-only (`AppEvent::IpcResponse` only
+                    // ever targets the sidebar webview), so it can't fetch the session list
+                    // itself to map ids to numbers / bubble colours.
+                    let sessions = self.db.list_sessions().unwrap_or_default();
+                    let num_of = |id: &Option<String>| {
+                        id.as_ref()
+                            .and_then(|id| sessions.iter().position(|s| &s.id == id))
+                            .map(|i| i + 1)
+                    };
                     // `body` is arbitrary agent/user text — must be JSON-escaped, unlike the
                     // id/literal payloads the other `evaluate_script` calls here carry.
                     let detail = serde_json::json!({
+                        "fromId": from_id,
+                        "fromNum": num_of(&from_id),
                         "from": from_name,
+                        "toId": to_id,
+                        "toNum": num_of(&to_id),
                         "to": to_name,
                         "body": body,
                         "ts": ts,
@@ -1351,6 +1447,19 @@ impl ApplicationHandler<AppEvent> for App {
                 if self.log_panel == LogPanel::Hidden {
                     self.log_panel = LogPanel::Collapsed;
                     self.refresh_log_panel();
+                }
+            }
+            AppEvent::MessageInject { to_id, from_name, body } => {
+                if let Some((_, term)) = self.terms.iter_mut().find(|(tid, _)| *tid == to_id) {
+                    let who = from_name.as_deref().unwrap_or("an outside shell");
+                    // Bracketed paste (see `Terminal::paste`) so a multi-line body and any
+                    // pasted-path recognition behave; the trailing CR submits it in an agent
+                    // TUI like Claude Code.
+                    term.paste(&format!("[termhub-msg from {who}] {body}"));
+                    term.write("\r");
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             AppEvent::MessageNudge { to_id, from_name, preview } => {
@@ -2006,6 +2115,17 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        // Fire any SSH auto-password whose deferred delay (see `armed_ssh_passwords`'s doc
+        // comment) has elapsed — split out of the `retain` below since writing needs a mutable
+        // borrow of `self.terms`, which `retain`'s own closure can't also hold alongside it.
+        let (due, still_waiting): (Vec<_>, Vec<_>) =
+            self.armed_ssh_passwords.drain(..).partition(|(_, _, at)| now >= *at);
+        self.armed_ssh_passwords = still_waiting;
+        for (id, password, _) in due {
+            if let Some((_, term)) = self.terms.iter_mut().find(|(tid, _)| *tid == id) {
+                term.write(&format!("{password}\r"));
+            }
+        }
         if now >= self.next_blink {
             self.cursor_visible = !self.cursor_visible;
             self.next_blink = now + BLINK_INTERVAL;
@@ -2016,7 +2136,7 @@ impl ApplicationHandler<AppEvent> for App {
         if now >= self.next_reconnect {
             if let Some(meta) = self.pending_reconnects.pop_front() {
                 if let Some(window) = self.window.clone() {
-                    self.spawn_session(&window, meta.id, &meta.cwd, &meta.shell);
+                    self.spawn_session(&window, meta.id, &meta.cwd, &meta.shell, &meta.shell_args);
                     window.request_redraw();
                 }
                 self.next_reconnect = now + RECONNECT_STAGGER;
@@ -2059,6 +2179,9 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some((_, at, _)) = &self.press_pending {
             deadline = deadline.min(*at + LONG_PRESS_DELAY);
         }
+        if let Some((_, _, at)) = self.armed_ssh_passwords.iter().min_by_key(|(_, _, at)| *at) {
+            deadline = deadline.min(*at);
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
@@ -2080,7 +2203,7 @@ fn dev_server_url() -> &'static str {
     "http://localhost:1420"
 }
 
-fn app_data_dir() -> std::path::PathBuf {
+pub(crate) fn app_data_dir() -> std::path::PathBuf {
     // Matches the directory Tauri itself used (`app.path().app_data_dir()` resolves to the
     // same OS convention keyed by the app identifier from the old tauri.conf.json), so the
     // existing termhub.sqlite from before this refactor is found in place.

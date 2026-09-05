@@ -14,10 +14,14 @@ pub struct Message {
 }
 
 /// One row for the message-log panel (`MessageLog.tsx` via `get_message_log`) — both endpoints
-/// by display name, so it reads as a transcript regardless of read/unread state.
+/// by display name, so it reads as a transcript regardless of read/unread state. The session
+/// ids ride along too so the panel can map each endpoint to its `#N` and its per-session bubble
+/// colour; either is `None` when that side was an outside shell or a since-closed session.
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
+    pub from_id: Option<String>,
     pub from_name: Option<String>,
+    pub to_id: Option<String>,
     pub to_name: Option<String>,
     pub body: String,
     pub created_at: i64,

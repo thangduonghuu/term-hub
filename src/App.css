@@ -8,6 +8,14 @@
      just the initial-paint fallback for before that JS runs; `commands::DEFAULT_ACCENT_COLOR`
      in the Rust backend is the actual source of truth for the default. */
   --accent-color: #d8a657;
+  /* Text color for anything painted as a solid `--accent-color` fill (a primary button, a
+     badge) — `lib/color.ts`'s `applyAccentColor` computes this from the accent's actual
+     luminance and keeps both in sync, since a hardcoded text color only ever looks right
+     against whichever one accent it was tuned for (this default gold reads fine with near-black
+     text; a vivid, dark-toned pick like blue needs white instead). `#101010` here matches that
+     same default's own computed result, for the same pre-JS initial-paint-fallback reason as
+     `--accent-color` above. */
+  --accent-fg: #101010;
 }
 
 html,
@@ -254,17 +262,17 @@ body {
   white-space: nowrap;
 }
 
-/* `#N` handle for inter-session messaging (see `sessionNum` in Sidebar.tsx). */
+/* `#N` handle for inter-session messaging (see `sessionNum` in Sidebar.tsx). Colour +
+   background tint are set inline per session (see `sessionColor` / `sessionTint`), so it reads
+   as the same coloured chip the message-log bubbles use. */
 .session-num {
   flex-shrink: 0;
   min-width: 1.6em;
-  color: #6e6e6e;
+  padding: 0 5px;
+  border-radius: 8px;
+  text-align: center;
   font-variant-numeric: tabular-nums;
   font-size: 11px;
-}
-
-.session-item.active .session-num {
-  color: #a9b7c6;
 }
 
 .activity-dot {
@@ -288,6 +296,15 @@ body {
   vertical-align: middle;
 }
 
+/* Marks a session whose `shell` is `ssh` (see `Sidebar.tsx`) so one opened from "Connect to
+   VPS" is recognizable at a glance in the list. Fixed color rather than `var(--accent-color)`
+   — this label's meaning ("this is an SSH session") shouldn't shift with whatever accent the
+   user happens to have picked in Settings. */
+.session-ssh-label {
+  color: #5b9dd9;
+  font-weight: 600;
+}
+
 .rename-input {
   flex: 1;
   background: #101010;
@@ -308,7 +325,7 @@ body {
   padding: 1px 5px 1px 4px;
   border-radius: 8px;
   background: var(--accent-color);
-  color: #1a1a1a;
+  color: var(--accent-fg);
   font-size: 10px;
   font-weight: 700;
   line-height: 1.4;
@@ -1096,6 +1113,263 @@ body {
   color: #7a7a7a;
   font-size: 13px;
   text-align: center;
+}
+
+.ssh-connect-panel {
+  /* `.quickopen-panel`'s 560px is tuned for a folder-path list; the credential form's two-up
+     host/port row and label wrap more comfortably a bit wider. */
+  width: min(460px, 92vw);
+}
+
+/* Belt-and-suspenders: every clickable control in this picker gets a pointer cursor, regardless
+   of which specific rule below styles it — `<button>` (unlike `<a>`) defaults to an arrow
+   cursor in every browser unless told otherwise, which reads as "not actually clickable." */
+.ssh-connect-panel button:not(:disabled),
+.ssh-connect-panel select {
+  cursor: pointer;
+}
+
+.ssh-connect-panel button:disabled {
+  cursor: default;
+}
+
+.ssh-connect-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #2e2e2e;
+  color: #e6e6e6;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ssh-connect-error {
+  margin: 10px 14px 0;
+  padding: 8px 10px;
+  background: #3a1d1d;
+  border: 1px solid #f8514955;
+  border-radius: 6px;
+  color: #f85149;
+  font-size: 12px;
+}
+
+.ssh-connect-item .quickopen-name {
+  flex-shrink: 0;
+}
+
+.ssh-connect-spinner {
+  flex-shrink: 0;
+  animation: ssh-connect-spin 0.8s linear infinite;
+  color: var(--accent-color);
+}
+
+@keyframes ssh-connect-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ssh-connect-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  overflow-y: auto;
+  /* No `max-height` of its own — `.ssh-connect-panel`'s `max-height: 70vh` is the single cap
+     that should ever kick scrolling in. A flex child defaults to `min-height: auto`, which
+     floors it at its content's natural height and blocks it from shrinking below that even when
+     content is short — the actual cause of the panel always rendering tall regardless of how
+     little the form/list currently holds. Zeroing it here lets this element size to its real
+     content (short form = short popup) and only scroll once the *panel's* cap is hit. */
+  min-height: 0;
+}
+
+/* Grouped "Address / General / SSH port / Credentials" blocks, matching Termius's card-per-
+   section layout (see the reference screenshot this was built from) rather than one flat form. */
+.ssh-connect-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: #202020;
+  border: 1px solid #2e2e2e;
+  border-radius: 8px;
+}
+
+.ssh-connect-section-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #7a7a7a;
+  line-height: 1.2;
+}
+
+.ssh-connect-section input,
+.ssh-connect-section select,
+.ssh-connect-section textarea {
+  background: #171717;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #e6e6e6;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+.ssh-connect-section input:focus,
+.ssh-connect-section select:focus,
+.ssh-connect-section textarea:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.ssh-connect-port {
+  width: 84px;
+}
+
+.ssh-connect-auth-toggle {
+  display: flex;
+  gap: 6px;
+}
+
+.ssh-connect-auth-toggle button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: #171717;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #9a9a9a;
+  padding: 6px 10px;
+  font-size: 12px;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.ssh-connect-auth-toggle button:hover:not(.active) {
+  border-color: #4a4a4a;
+  color: #cfcfcf;
+}
+
+/* Tinted with the same `--accent-color` the primary buttons/focus rings/spinner already use
+   (via `color-mix`, so it tracks whatever accent the user picks in Settings) instead of a
+   hardcoded, unrelated navy — one accent language for the whole picker, not two competing ones. */
+.ssh-connect-auth-toggle button.active {
+  background: color-mix(in srgb, var(--accent-color) 20%, #171717);
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.ssh-connect-password-row {
+  display: flex;
+  gap: 6px;
+}
+
+.ssh-connect-password-row input {
+  flex: 1;
+}
+
+.ssh-connect-password-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #171717;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+  color: #9a9a9a;
+  padding: 0 10px;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.ssh-connect-password-row button:hover {
+  border-color: #4a4a4a;
+  color: #e6e6e6;
+}
+
+.ssh-connect-add-key-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  align-self: flex-start;
+  background: transparent;
+  border: none;
+  color: #9a9a9a;
+  font-size: 12px;
+  padding: 2px 0;
+  transition: color 0.12s ease;
+}
+
+.ssh-connect-add-key-btn:hover {
+  color: var(--accent-color);
+}
+
+.ssh-connect-key-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: #171717;
+  border: 1px solid #3a3a3a;
+  border-radius: 6px;
+}
+
+.ssh-connect-key-form textarea {
+  resize: vertical;
+  font-family: Menlo, Consolas, monospace;
+  font-size: 11px;
+  min-height: 60px;
+}
+
+.ssh-connect-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* The "Add new key" sub-form's own Cancel/Save row (same base look as `.ssh-connect-form-actions`
+   above via a shared className) gets a divider — it sits right under the "Browse for a key
+   file…" link, and without one the two rows visually run together despite being unrelated
+   actions (the browse-link fills the textarea; this row commits or discards the whole sub-form). */
+.ssh-connect-key-form-actions {
+  border-top: 1px solid #3a3a3a;
+  padding-top: 8px;
+}
+
+.ssh-connect-form-actions button {
+  background: var(--accent-color);
+  border: none;
+  border-radius: 4px;
+  color: var(--accent-fg);
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.12s ease, opacity 0.12s ease;
+}
+
+.ssh-connect-form-actions button:not(:disabled):hover {
+  filter: brightness(1.1);
+}
+
+.ssh-connect-form-actions button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.ssh-connect-form-actions .ssh-connect-cancel {
+  background: transparent;
+  border: 1px solid #3a3a3a;
+  color: #cfcfcf;
+  font-weight: 400;
+}
+
+.ssh-connect-form-actions .ssh-connect-cancel:hover {
+  background: #2e2e2e;
 }
 
 .claude-limits-value {

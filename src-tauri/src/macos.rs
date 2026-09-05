@@ -4,8 +4,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use objc2::rc::Retained;
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL, NSResponder, NSScreen, NSTextInputContext};
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSURL};
+use objc2::sel;
+use objc2_app_kit::{
+    NSApplication, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeFileURL, NSResponder,
+    NSScreen, NSTextInputContext,
+};
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::event_loop::EventLoopProxy;
 
@@ -40,6 +44,7 @@ pub fn install_input_view(
     let handle = window.window_handle().ok()?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return None };
     let mtm = MainThreadMarker::new()?;
+    install_edit_menu(mtm);
     unsafe {
         let ns_view = handle.ns_view.as_ptr().cast::<objc2_app_kit::NSView>();
         let ns_view: &objc2_app_kit::NSView = &*ns_view;
@@ -72,6 +77,68 @@ pub fn focus_input_view(view: &TerminalInputView) {
             }
         }
     }
+}
+
+/// Installs a minimal native Edit menu (Copy, Paste, Select All) as `NSApp.mainMenu`.
+///
+/// This app never calls `tauri::Builder` (see `ipc.rs`'s module doc — no `AppHandle` for a
+/// plugin to hang a menu off of) and winit doesn't install one on its own either, so before
+/// this, *nothing* on macOS was claiming Cmd+C/Cmd+V/Cmd+A at all. That's a real, confirmed gap,
+/// not just a cosmetic one: macOS resolves a Cmd-modified key as a menu *key equivalent*
+/// (`-performKeyEquivalent:`) before it ever becomes a normal `-keyDown:`, and a `WKWebView`'s
+/// own built-in copy/paste/select-all for a focused editable element is reached through exactly
+/// that path — unlike a plain character key, it has no "just deliver this to whatever's
+/// focused" fallback route. With no menu at all, that path had nothing to match against, so
+/// none of these silently did anything for any focused text field in the sidebar webview
+/// (Settings, "Connect to VPS") even though plain typing worked fine (typing isn't Cmd-modified,
+/// so it never touches this mechanism). `TerminalInputView::key_down`'s own manual Cmd+C/Cmd+V
+/// handling worked around the same gap for the terminal specifically — since that view isn't a
+/// real text-editing control, it has no built-in copy/paste/select-all to route to in the first
+/// place — but did nothing for the webview, which does.
+///
+/// `TerminalInputView` implements real `copy:`/`paste:` action methods (see
+/// `macos_input_view.rs`) precisely so that adding this menu doesn't regress the terminal's own
+/// copy/paste: once a menu exists, Cmd+C/Cmd+V (while bound to their defaults) resolve via the
+/// responder chain calling those methods directly, *before* `key_down` ever sees the event.
+/// Select All has no equivalent terminal concept (selection there is mouse-driven only, per the
+/// README) and isn't otherwise bound to anything, so it's deliberately *not* given a matching
+/// method there — invoking it while the terminal has focus is a harmless no-op (nothing in the
+/// responder chain answers `selectAll:`), same as today.
+pub fn install_edit_menu(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    let main_menu = NSMenu::new(mtm);
+
+    // A menu bar's first item is conventionally the application menu — left untitled/empty
+    // here since this app has no other use for a visible menu bar beyond making Cmd+C/Cmd+V
+    // resolvable at all; it still needs to exist for the menu bar to look/behave normally.
+    let app_menu_item = NSMenuItem::new(mtm);
+    main_menu.addItem(&app_menu_item);
+    app_menu_item.setSubmenu(Some(&NSMenu::new(mtm)));
+
+    let edit_menu_item = NSMenuItem::new(mtm);
+    main_menu.addItem(&edit_menu_item);
+    let edit_menu = NSMenu::new(mtm);
+    unsafe {
+        edit_menu.setTitle(&NSString::from_str("Edit"));
+        edit_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Copy"),
+            Some(sel!(copy:)),
+            &NSString::from_str("c"),
+        );
+        edit_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Paste"),
+            Some(sel!(paste:)),
+            &NSString::from_str("v"),
+        );
+        edit_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Select All"),
+            Some(sel!(selectAll:)),
+            &NSString::from_str("a"),
+        );
+    }
+    edit_menu_item.setSubmenu(Some(&edit_menu));
+
+    app.setMainMenu(Some(&main_menu));
 }
 
 /// Converts a rectangle in this app's own rendering coordinate space (`x`/`y_from_top`/`w`/`h`,

@@ -3,7 +3,10 @@ use uuid::Uuid;
 
 use crate::db::Db;
 use crate::external_terminal;
-use crate::session::{default_cwd, default_shell, SessionInfo, SessionMeta};
+use crate::session::{
+    default_cwd, default_shell, SessionInfo, SessionMeta, SshAuthMethod, SshCredential, SshKey,
+    SshKeySummary,
+};
 use crate::usage::UsageSummary;
 
 /// A single native keyboard shortcut: which modifiers must be held, plus a raw macOS virtual
@@ -157,6 +160,19 @@ pub fn set_message_toast_enabled(db: &Db, enabled: bool) -> Result<(), String> {
     db.set_setting("intersession_toast", if enabled { "1" } else { "0" }).map_err(|e| e.to_string())
 }
 
+/// Whether an inter-session message for a session in this window is typed straight into that
+/// session's terminal (Settings > Messaging) — for a keyboard-driven agent that doesn't poll
+/// `check_inbox`. Stored as `"1"` / `"0"`; absent means off (this drives the target's input, so
+/// it's opt-in, unlike the toast).
+pub fn get_message_autodeliver_enabled(db: &Db) -> Result<bool, String> {
+    Ok(db.get_setting("intersession_autodeliver").map_err(|e| e.to_string())?.as_deref() == Some("1"))
+}
+
+pub fn set_message_autodeliver_enabled(db: &Db, enabled: bool) -> Result<(), String> {
+    db.set_setting("intersession_autodeliver", if enabled { "1" } else { "0" })
+        .map_err(|e| e.to_string())
+}
+
 /// The `claude mcp add …` line for the Settings > Messaging copy-button — registers the
 /// `termhub-msg mcp` stdio server (see `bin/termhub-msg.rs`) with Claude Code. Uses the
 /// absolute path to the CLI, which ships next to the GUI binary, so it also works run from a
@@ -187,7 +203,7 @@ pub fn create_session(
     let name = name.unwrap_or_else(|| "Session".to_string());
     let created_at = unix_now();
 
-    let meta = SessionMeta { id, name, cwd, shell, created_at };
+    let meta = SessionMeta { id, name, cwd, shell, shell_args: Vec::new(), created_at };
     db.insert_session(&meta).map_err(|e| e.to_string())?;
     // Every opened folder counts toward the "Open Recent" MRU list, regardless of how the
     // session was created (new/duplicate/"new session here"/the Open Recent picker itself) —
@@ -195,6 +211,165 @@ pub fn create_session(
     db.touch_recent_folder(&meta.cwd, created_at).map_err(|e| e.to_string())?;
 
     Ok(SessionInfo { meta })
+}
+
+/// Native "open a file" dialog for importing a private key into the vault (`SshConnect.tsx`'s
+/// "Add new key" form) — reads and returns the file's *content*, not its path: the path is
+/// discarded the instant this returns, since the vault stores key bytes, not a filesystem
+/// reference (see `SshKey`'s doc comment). Same standalone-`rfd` reasoning as `pick_folder` (no
+/// `AppHandle` to hang a `tauri-plugin-dialog` off of here). `None` on cancel or a read failure
+/// (e.g. a binary/non-UTF8 file, which a private key file never legitimately is).
+pub fn read_key_file() -> Option<String> {
+    let path = rfd::FileDialog::new().pick_file()?;
+    std::fs::read_to_string(path).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_ssh_credential(
+    db: &Db,
+    label: String,
+    host: String,
+    port: u16,
+    username: String,
+    auth_method: SshAuthMethod,
+    password: Option<String>,
+    key_id: Option<String>,
+) -> Result<SshCredential, String> {
+    let password = password.filter(|s| !s.is_empty());
+    let key_id = key_id.filter(|s| !s.trim().is_empty());
+    match auth_method {
+        SshAuthMethod::Password if password.is_none() => {
+            return Err("password auth requires a password".to_string())
+        }
+        SshAuthMethod::Key if key_id.is_none() => {
+            return Err("key auth requires a saved key".to_string())
+        }
+        _ => {}
+    }
+    let cred = SshCredential {
+        id: Uuid::new_v4().to_string(),
+        label,
+        host,
+        port,
+        username,
+        auth_method,
+        password,
+        key_id,
+        created_at: unix_now(),
+    };
+    db.insert_ssh_credential(&cred).map_err(|e| e.to_string())?;
+    Ok(cred)
+}
+
+pub fn list_ssh_credentials(db: &Db) -> Result<Vec<SshCredential>, String> {
+    db.list_ssh_credentials().map_err(|e| e.to_string())
+}
+
+pub fn delete_ssh_credential(db: &Db, id: &str) -> Result<(), String> {
+    db.delete_ssh_credential(id).map_err(|e| e.to_string())
+}
+
+pub fn create_ssh_key(db: &Db, name: String, content: String) -> Result<SshKeySummary, String> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("key content is empty".to_string());
+    }
+    let key = SshKey {
+        id: Uuid::new_v4().to_string(),
+        name,
+        content: content.to_string(),
+        created_at: unix_now(),
+    };
+    db.insert_ssh_key(&key).map_err(|e| e.to_string())?;
+    write_key_file(&key.id, &key.content)?;
+    Ok(SshKeySummary { id: key.id, name: key.name, created_at: key.created_at })
+}
+
+pub fn list_ssh_keys(db: &Db) -> Result<Vec<SshKeySummary>, String> {
+    db.list_ssh_keys().map_err(|e| e.to_string())
+}
+
+pub fn delete_ssh_key(db: &Db, id: &str) -> Result<(), String> {
+    db.delete_ssh_key(id).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(key_file_path(id));
+    Ok(())
+}
+
+/// Where a vault key's content is materialized on disk purely so `ssh -i` has a file path to
+/// point at — `ssh` has no way to take a private key as inline bytes. Lives under the app's own
+/// data dir, entirely managed by TermHub: nothing in the UI ever shows the user this path or
+/// asks them to pick one (that's the whole point of the vault vs. the old per-credential
+/// identity-path field).
+fn key_file_path(key_id: &str) -> std::path::PathBuf {
+    crate::app_data_dir().join("ssh_keys").join(key_id)
+}
+
+/// Writes (or rewrites) a key's materialized file with `0600` permissions — `ssh` refuses a
+/// private key file that's group/world-readable. Called both when a key is first added and
+/// defensively before every connect (`connect_ssh_session`), so a file removed or corrupted
+/// out-of-band (e.g. the app data dir was manually cleared) self-heals from the db, which stays
+/// the source of truth.
+fn write_key_file(key_id: &str, content: &str) -> Result<(), String> {
+    let path = key_file_path(key_id);
+    let dir = path.parent().ok_or("no parent directory for the key file")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Builds and saves a new session that runs `ssh` straight into a saved credential instead of a
+/// local shell — reuses the exact same session-tiling machinery as `create_session` (sidebar
+/// entry, persistence, focus, close, reconnect-on-restart) so it opens as a tile just like any
+/// other session; only `shell`/`shell_args` differ. Deliberately doesn't call
+/// `touch_recent_folder`: every SSH session shares the same local `cwd` (`default_cwd()`, since
+/// `ssh` itself ignores it beyond where the local process starts), and that folder isn't a real
+/// project directory the "Open Recent" picker should start suggesting.
+///
+/// Password-auth credentials are spawned as a plain `ssh` with no special handling of their
+/// own — `password` isn't fed to `ssh` itself (see `SshCredential::password`'s doc comment), so
+/// the real login prompt still appears in the tile exactly like it would in any other terminal.
+/// It's typed in automatically once that prompt shows up, via the mechanism described below.
+///
+/// Returns the new session alongside the credential's saved password (only when its auth
+/// method is `Password`) — the caller (`ipc.rs`'s `connect_ssh`) stashes that into `App`'s
+/// `pending_ssh_passwords` so it can be typed in the instant `ssh`'s own prompt appears (see
+/// that field's doc comment in `lib.rs`). Never part of `SessionInfo` itself — that's what's
+/// serialized back to the frontend, and a saved password has no business reaching the webview.
+pub fn connect_ssh_session(
+    db: &Db,
+    credential_id: &str,
+) -> Result<(SessionInfo, Option<String>), String> {
+    let cred = db.get_ssh_credential(credential_id).map_err(|e| e.to_string())?;
+    let password = if cred.auth_method == SshAuthMethod::Password { cred.password.clone() } else { None };
+    let mut shell_args = Vec::new();
+    if cred.auth_method == SshAuthMethod::Key {
+        if let Some(key_id) = &cred.key_id {
+            let key = db.get_ssh_key(key_id).map_err(|e| e.to_string())?;
+            write_key_file(key_id, &key.content)?;
+            shell_args.push("-i".to_string());
+            shell_args.push(key_file_path(key_id).to_string_lossy().to_string());
+        }
+    }
+    shell_args.push("-p".to_string());
+    shell_args.push(cred.port.to_string());
+    shell_args.push(format!("{}@{}", cred.username, cred.host));
+
+    let meta = SessionMeta {
+        id: Uuid::new_v4().to_string(),
+        name: cred.label,
+        cwd: default_cwd(),
+        shell: "ssh".to_string(),
+        shell_args,
+        created_at: unix_now(),
+    };
+    db.insert_session(&meta).map_err(|e| e.to_string())?;
+    Ok((SessionInfo { meta }, password))
 }
 
 /// Folders previously opened as a session, most-recent first, for the "Open Recent" picker
@@ -311,6 +486,19 @@ pub fn mark_lumen_prompt_seen(db: &Db) -> Result<(), String> {
     db.set_setting(LUMEN_PROMPT_SEEN_SETTING, "1").map_err(|e| e.to_string())
 }
 
+/// Reads the system clipboard's text, for the "Connect to VPS" form's own Cmd+V handling
+/// (`SshConnect.tsx`) — the sidebar webview is embedded in a nonstandard way (a child `NSView`
+/// of the app's own window rather than a real Tauri-owned one — see `ipc.rs`'s module doc), and
+/// this app also has no menu bar (see `macos_input_view.rs`'s `key_down` doc comment on why
+/// Cmd+-combos need explicit handling at all here), so nothing can be assumed about whether a
+/// plain OS-level paste into a focused HTML input reaches it reliably in this setup. Routing
+/// through an explicit read here — same already-proven `arboard` crate `AppEvent::Copy`/`Paste`
+/// already use for the terminal's own clipboard handling — sidesteps that uncertainty entirely
+/// instead of depending on it. `None` if the clipboard is empty, unreadable, or holds no text.
+pub fn read_clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
 /// Opens a URL in the user's default browser — same plain-process-spawning approach as
 /// `external_terminal::open_external` (this app never calls `tauri::Builder`, so there's no
 /// `AppHandle` for `tauri-plugin-opener` to hang off of).
@@ -398,4 +586,35 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    // Verifies `read_clipboard_text` against the real macOS pasteboard rather than just
+    // round-tripping through `arboard`'s own setter — `pbcopy` is a separate, independent path
+    // onto the same pasteboard, so this actually exercises "can this app's clipboard-read
+    // command see what an external paste source put there," which is the exact thing
+    // `SshConnect.tsx`'s Cmd+V handling depends on.
+    #[test]
+    fn read_clipboard_text_reads_whats_on_the_pasteboard() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let marker = format!("termhub-clipboard-test-{}", std::process::id());
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("pbcopy should be available on macOS");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(marker.as_bytes())
+            .expect("write to pbcopy");
+        child.wait().expect("pbcopy should exit cleanly");
+
+        assert_eq!(read_clipboard_text().as_deref(), Some(marker.as_str()));
+    }
 }

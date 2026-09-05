@@ -257,6 +257,25 @@ declare_class!(
             }
         }
 
+        // Real `NSResponder` action methods (not just `key_down`'s manual keycode matching)
+        // for the two shortcuts that also correspond to a standard Edit-menu item — see
+        // `macos::install_edit_menu`'s doc comment for why this app needs one at all now.
+        // Once that menu exists, Cmd+C/Cmd+V (while bound to their defaults) resolve via
+        // `-performKeyEquivalent:`/the responder chain calling these directly, *before*
+        // `key_down` ever sees the event — without these, adding that menu would silently
+        // break the terminal's own copy/paste. `key_down`'s matching stays as-is (unchanged)
+        // for every other shortcut, and for copy/paste too if a user ever rebinds either to
+        // something that isn't Cmd+C/Cmd+V (no menu item to intercept those key equivalents).
+        #[method(copy:)]
+        fn edit_copy(&self, _sender: &AnyObject) {
+            let _ = self.ivars().proxy.send_event(AppEvent::Copy);
+        }
+
+        #[method(paste:)]
+        fn edit_paste(&self, _sender: &AnyObject) {
+            let _ = self.ivars().proxy.send_event(AppEvent::Paste);
+        }
+
         // Just enough of the classic (pre-10.10, string-keyed) NSAccessibility protocol —
         // still the one custom `NSView`s implement — to answer "where is the text caret on
         // screen". Confirmed as a real, concrete need, not speculative: a CLI tool's desktop
