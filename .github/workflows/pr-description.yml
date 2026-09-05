@@ -51,10 +51,17 @@ jobs:
 
           SYSTEM_PROMPT='You are an assistant that writes Pull Request descriptions for a software project.
           Based on the list of changed files (git diff --stat) and the provided diff content,
-          write a PR description in English, in Markdown format, including:
+          write a PR description in English, in Markdown format, structured like this:
           1. A short summary paragraph (2-3 sentences) about the purpose/content of the changes.
-          2. A "### Key Changes" section listing bullet points per file or related file group.
-          Return only the Markdown content of the description, with no greeting and no extra explanation.'
+          2. Grouped bullet-point sections, using only the ones that actually apply to this diff:
+             - "### Features" — new user-facing functionality being added.
+             - "### Bug Fixes" — real, pre-existing bugs found and fixed along the way.
+             - "### CI / Workflow" — changes to GitHub Actions, build scripts, or other tooling.
+             - "### Other Changes" — anything that does not fit the sections above.
+          Each bullet should describe one specific, meaningful change (what it does and why it
+          matters), not a flat per-file listing — group related files under the same bullet when
+          they serve one change. Return only the Markdown content of the description, with no
+          greeting and no extra explanation.'
 
           USER_PROMPT="List of changed files:
           ${DIFF_STAT}
