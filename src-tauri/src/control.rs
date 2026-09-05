@@ -388,6 +388,7 @@ mod tests {
                 name: name.into(),
                 cwd: "/tmp".into(),
                 shell: String::new(),
+                shell_args: Vec::new(),
                 created_at: 0,
             })
             .unwrap();
@@ -456,6 +457,7 @@ mod tests {
             name: "xander".into(),
             cwd: "/tmp".into(),
             shell: String::new(),
+            shell_args: Vec::new(),
             created_at: 0,
         })
         .unwrap();
@@ -495,6 +497,7 @@ mod tests {
             name: "wendy".into(),
             cwd: "/tmp".into(),
             shell: String::new(),
+            shell_args: Vec::new(),
             created_at: 0,
         })
         .unwrap();
@@ -612,6 +615,7 @@ mod tests {
             name: "carol".into(),
             cwd: "/tmp".into(),
             shell: String::new(),
+            shell_args: Vec::new(),
             created_at: 0,
         })
         .unwrap();

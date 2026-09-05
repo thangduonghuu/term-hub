@@ -63,6 +63,33 @@ export interface LogEntry {
   created_at: number;
 }
 
+export type SshAuthMethod = "password" | "key";
+
+// A saved VPS login for the "Connect to VPS" picker (`SshConnect.tsx`) — Termius-style.
+// Connecting via `password` auth still spawns a plain `ssh` showing a real login prompt in the
+// tile, same as any terminal — `password` gets typed into it automatically the moment that
+// prompt appears (see `commands::connect_ssh_session`'s doc comment), rather than being fed to
+// `ssh` directly.
+export interface SshCredential {
+  id: string;
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  auth_method: SshAuthMethod;
+  password: string | null;
+  key_id: string | null;
+  created_at: number;
+}
+
+// A saved private key in the vault — never carries the key's actual content over IPC (see
+// `SshKeySummary` on the Rust side), just enough to show/pick it in the "SSH Key" auth form.
+export interface SshKeySummary {
+  id: string;
+  name: string;
+  created_at: number;
+}
+
 export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   createSession: (name?: string, cwd?: string) =>
@@ -133,6 +160,10 @@ export const api = {
   hasSeenLumenPrompt: () => invoke<boolean>("has_seen_lumen_prompt"),
   markLumenPromptSeen: () => invoke<void>("mark_lumen_prompt_seen"),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
+  // Reads the system clipboard's text directly (see `commands::read_clipboard_text`'s doc
+  // comment) — used by `SshConnect.tsx`'s own Cmd+V handling rather than relying on a plain OS
+  // paste reaching a focused HTML input in this app's nonstandard embedded-webview setup.
+  readClipboardText: () => invoke<string | null>("read_clipboard_text"),
   getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
   hasAnthropicApiKey: () => invoke<boolean>("has_anthropic_api_key"),
   setAnthropicApiKey: (key: string) => invoke<void>("set_anthropic_api_key", { key }),
@@ -154,4 +185,27 @@ export const api = {
   setShortcut: (action: string, binding: KeyBinding) =>
     invoke<void>("set_shortcut", { action, binding }),
   resetShortcut: (action: string) => invoke<void>("reset_shortcut", { action }),
+  // "Connect to VPS" picker: saved SSH credentials/keys, and spawning a new session that runs
+  // `ssh` straight into one of them.
+  listSshCredentials: () => invoke<SshCredential[]>("list_ssh_credentials"),
+  createSshCredential: (cred: {
+    label: string;
+    host: string;
+    port: number;
+    username: string;
+    authMethod: SshAuthMethod;
+    password?: string;
+    keyId?: string;
+  }) => invoke<SshCredential>("create_ssh_credential", cred),
+  deleteSshCredential: (id: string) => invoke<void>("delete_ssh_credential", { id }),
+  connectSsh: (credentialId: string) => invoke<SessionInfo>("connect_ssh", { credentialId }),
+  // Vault of saved private keys — added once (pasted or imported from a file) and picked by
+  // name from then on, instead of re-browsing a filesystem path per credential.
+  listSshKeys: () => invoke<SshKeySummary[]>("list_ssh_keys"),
+  createSshKey: (name: string, content: string) =>
+    invoke<SshKeySummary>("create_ssh_key", { name, content }),
+  deleteSshKey: (id: string) => invoke<void>("delete_ssh_key", { id }),
+  // Native "open a file" dialog that reads the chosen file's content and returns it directly —
+  // the path itself is never surfaced or stored (see `commands::read_key_file`'s doc comment).
+  readKeyFile: () => invoke<string | null>("read_key_file"),
 };

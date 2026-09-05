@@ -2,13 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Copy,
   ExternalLink,
-  FolderOpen,
   FolderPlus,
   History,
   Mail,
   Mic,
   Pencil,
   Plus,
+  Server,
   Settings,
   X,
 } from "lucide-react";
@@ -35,8 +35,8 @@ interface Props {
   onDuplicate: (session: SessionInfo) => void;
   onResumeClaude: (session: SessionInfo) => void;
   onNewInFolder: (cwd: string) => void;
-  onOpenFolder: () => void;
   onOpenExternal: (session: SessionInfo) => void;
+  onOpenSsh: () => void;
   onOpenSettings: () => void;
   pendingRenameId: string | null;
   onPendingRenameHandled: () => void;
@@ -56,8 +56,8 @@ export function Sidebar({
   onDuplicate,
   onResumeClaude,
   onNewInFolder,
-  onOpenFolder,
   onOpenExternal,
+  onOpenSsh,
   onOpenSettings,
   pendingRenameId,
   onPendingRenameHandled,
@@ -172,8 +172,8 @@ export function Sidebar({
           <button className="usage-toggle-btn" onClick={onOpenSettings} title="Settings">
             <Settings size={15} />
           </button>
-          <button className="new-session-btn" onClick={onOpenFolder} title="Open folder… (Ctrl+R)">
-            <FolderOpen size={15} />
+          <button className="new-session-btn" onClick={onOpenSsh} title="Connect to VPS (SSH)">
+            <Server size={15} />
           </button>
           <button className="new-session-btn" onClick={onNew} title="New session">
             <Plus size={16} />

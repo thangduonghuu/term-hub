@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Copy, Keyboard, MessageSquare, Mic, Palette, RotateCcw, TerminalSquare, X } from "lucide-react";
 import { api, type KeyBinding } from "../lib/api";
+import { applyAccentColor } from "../lib/color";
 
 // Matches `commands::DEFAULT_ACCENT_COLOR` in the Rust backend — this is only the fallback
 // shown before `getAccentColor()` resolves and the value a "Reset to default" click sends,
@@ -242,7 +243,7 @@ export function SettingsPanel({ onClose }: Props) {
   // would just be friction.
   async function saveAccentColor(color: string) {
     setAccentColor(color);
-    document.documentElement.style.setProperty("--accent-color", color);
+    applyAccentColor(color);
     await api.setAccentColor(color);
     setAccentSaved(true);
     setTimeout(() => setAccentSaved(false), 1500);
