@@ -296,6 +296,15 @@ body {
   vertical-align: middle;
 }
 
+/* Marks a session whose `shell` is `ssh` (see `Sidebar.tsx`) so one opened from "Connect to
+   VPS" is recognizable at a glance in the list. Fixed color rather than `var(--accent-color)`
+   — this label's meaning ("this is an SSH session") shouldn't shift with whatever accent the
+   user happens to have picked in Settings. */
+.session-ssh-label {
+  color: #5b9dd9;
+  font-weight: 600;
+}
+
 .rename-input {
   flex: 1;
   background: #101010;

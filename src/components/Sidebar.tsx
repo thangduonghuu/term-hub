@@ -256,6 +256,9 @@ export function Sidebar({
                           )
                         )}
                         {session.name}
+                        {session.shell === "ssh" && (
+                          <span className="session-ssh-label"> (SSH)</span>
+                        )}
                       </span>
                     )}
                     {(unreadBySession[session.id] ?? 0) > 0 && (
