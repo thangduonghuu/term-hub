@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Copy, Keyboard, MessageSquare, Mic, Palette, RotateCcw, TerminalSquare, X } from "lucide-react";
 import { api, type KeyBinding } from "../lib/api";
+import { applyAccentColor } from "../lib/color";
 
 // Matches `commands::DEFAULT_ACCENT_COLOR` in the Rust backend — this is only the fallback
 // shown before `getAccentColor()` resolves and the value a "Reset to default" click sends,
@@ -96,6 +97,7 @@ export function SettingsPanel({ onClose }: Props) {
   const [mcpCmd, setMcpCmd] = useState("");
   const [mcpCopied, setMcpCopied] = useState(false);
   const [messageToast, setMessageToast] = useState(true);
+  const [messageAutodeliver, setMessageAutodeliver] = useState(false);
 
   useEffect(() => {
     api.getDefaultShell().then((s) => setShell(s ?? ""));
@@ -107,6 +109,7 @@ export function SettingsPanel({ onClose }: Props) {
     api.getAccentColor().then((c) => setAccentColor(c ?? DEFAULT_ACCENT_COLOR));
     api.getMcpRegisterCommand().then(setMcpCmd).catch(() => setMcpCmd(""));
     api.getMessageToastEnabled().then(setMessageToast).catch(() => {});
+    api.getMessageAutodeliverEnabled().then(setMessageAutodeliver).catch(() => {});
   }, []);
 
   // While "recording" (after clicking Change), capture the very next physical key press to
@@ -240,7 +243,7 @@ export function SettingsPanel({ onClose }: Props) {
   // would just be friction.
   async function saveAccentColor(color: string) {
     setAccentColor(color);
-    document.documentElement.style.setProperty("--accent-color", color);
+    applyAccentColor(color);
     await api.setAccentColor(color);
     setAccentSaved(true);
     setTimeout(() => setAccentSaved(false), 1500);
@@ -474,6 +477,20 @@ export function SettingsPanel({ onClose }: Props) {
                     }}
                   />
                   Pop a toast when a message arrives for a session in this window
+                </label>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={messageAutodeliver}
+                    onChange={(e) => {
+                      const on = e.currentTarget.checked;
+                      setMessageAutodeliver(on);
+                      api.setMessageAutodeliverEnabled(on);
+                    }}
+                  />
+                  Type an incoming message straight into the session's terminal — for a Claude
+                  Code agent that isn't watching its inbox. Skipped while a session is in{" "}
+                  <code>wait_for_message</code>.
                 </label>
               </div>
             )}

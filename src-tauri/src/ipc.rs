@@ -104,6 +104,7 @@ fn handle(
             let url: String = arg(&args, "url").ok_or("missing url")?;
             commands::open_url(&url).and_then(to_value)
         }
+        "read_clipboard_text" => to_value(commands::read_clipboard_text()),
         "list_sessions" => commands::list_sessions(db).and_then(to_value),
         "create_session" => {
             let name: Option<String> = arg(&args, "name");
@@ -113,6 +114,54 @@ fn handle(
                 id: info.meta.id.clone(),
                 cwd: info.meta.cwd.clone(),
                 shell: info.meta.shell.clone(),
+                shell_args: info.meta.shell_args.clone(),
+                ssh_password: None,
+            });
+            to_value(info)
+        }
+        // "Connect to VPS" picker (`SshConnect.tsx`): builds and spawns an `ssh`-backed session
+        // from a saved credential, same tiling path as `create_session` above.
+        "list_ssh_credentials" => commands::list_ssh_credentials(db).and_then(to_value),
+        "create_ssh_credential" => {
+            let label: String = arg(&args, "label").ok_or("missing label")?;
+            let host: String = arg(&args, "host").ok_or("missing host")?;
+            let port: u16 = arg(&args, "port").ok_or("missing port")?;
+            let username: String = arg(&args, "username").ok_or("missing username")?;
+            let auth_method_raw: String = arg(&args, "authMethod").ok_or("missing authMethod")?;
+            let auth_method = crate::session::SshAuthMethod::parse(&auth_method_raw)
+                .ok_or("invalid authMethod")?;
+            let password: Option<String> = arg(&args, "password");
+            let key_id: Option<String> = arg(&args, "keyId");
+            commands::create_ssh_credential(db, label, host, port, username, auth_method, password, key_id)
+                .and_then(to_value)
+        }
+        "delete_ssh_credential" => {
+            let id: String = arg(&args, "id").ok_or("missing id")?;
+            commands::delete_ssh_credential(db, &id).and_then(to_value)
+        }
+        // Vault of saved private keys (see `SshKey`'s doc comment) — `read_key_file` imports one
+        // from disk (returns its content, not the path); `create_ssh_key` saves pasted or
+        // imported content directly.
+        "read_key_file" => to_value(commands::read_key_file()),
+        "list_ssh_keys" => commands::list_ssh_keys(db).and_then(to_value),
+        "create_ssh_key" => {
+            let name: String = arg(&args, "name").ok_or("missing name")?;
+            let content: String = arg(&args, "content").ok_or("missing content")?;
+            commands::create_ssh_key(db, name, content).and_then(to_value)
+        }
+        "delete_ssh_key" => {
+            let id: String = arg(&args, "id").ok_or("missing id")?;
+            commands::delete_ssh_key(db, &id).and_then(to_value)
+        }
+        "connect_ssh" => {
+            let credential_id: String = arg(&args, "credentialId").ok_or("missing credentialId")?;
+            let (info, ssh_password) = commands::connect_ssh_session(db, &credential_id)?;
+            let _ = proxy.send_event(AppEvent::SpawnSession {
+                id: info.meta.id.clone(),
+                cwd: info.meta.cwd.clone(),
+                shell: info.meta.shell.clone(),
+                shell_args: info.meta.shell_args.clone(),
+                ssh_password,
             });
             to_value(info)
         }
@@ -160,6 +209,13 @@ fn handle(
         "set_message_toast_enabled" => {
             let enabled: bool = arg(&args, "enabled").ok_or("missing enabled")?;
             commands::set_message_toast_enabled(db, enabled).and_then(to_value)
+        }
+        "get_message_autodeliver_enabled" => {
+            commands::get_message_autodeliver_enabled(db).and_then(to_value)
+        }
+        "set_message_autodeliver_enabled" => {
+            let enabled: bool = arg(&args, "enabled").ok_or("missing enabled")?;
+            commands::set_message_autodeliver_enabled(db, enabled).and_then(to_value)
         }
         "get_active_session" => {
             let id = active.lock().map_err(|_| "active lock poisoned".to_string())?;

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::message::{LogEntry, Message};
-use crate::session::SessionMeta;
+use crate::session::{SessionMeta, SshAuthMethod, SshCredential, SshKey, SshKeySummary};
 use crate::usage::{AgentUsage, DayUsage, SessionUsage};
 
 pub struct Db(pub Mutex<Connection>);
@@ -58,8 +58,46 @@ impl Db {
             CREATE TABLE IF NOT EXISTS session_tokens (
                 session_id TEXT PRIMARY KEY,
                 token TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ssh_credentials (
+                id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                identity_path TEXT,
+                created_at INTEGER NOT NULL
+            );
+            -- A saved private key's actual bytes (`content`), not a filesystem path — see
+            -- `SshKey`'s doc comment. `connect_ssh_session` materializes a credential's chosen
+            -- key out to a file under the app data dir (see `key_file_path`) purely because
+            -- `ssh -i` needs one; this table is the source of truth.
+            CREATE TABLE IF NOT EXISTS ssh_keys (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
             );",
         )?;
+        // `sessions` predates `shell_args` (SSH-backed sessions — see `SessionMeta`'s doc
+        // comment) — `CREATE TABLE IF NOT EXISTS` above never adds a column to an
+        // already-existing table, so an existing install's db needs this migrated in
+        // separately. Errors (column already exists, from every run after the first) are
+        // expected and ignored rather than propagated.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN shell_args TEXT", []);
+        // `ssh_credentials` predates the password/key-vault auth model (it originally only had
+        // `identity_path`, a raw filesystem path) — same "existing db, add the column"
+        // reasoning as `shell_args` above. Any credential saved before this migration keeps its
+        // old `identity_path` (now unused/orphaned — SQLite can't cheaply drop a column) and
+        // reads back as `auth_method = 'key'` with no `key_id`, i.e. `ssh` falls back to its own
+        // default identity resolution rather than the old path; re-saving it picks a real vault
+        // key.
+        let _ = conn.execute(
+            "ALTER TABLE ssh_credentials ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'key'",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE ssh_credentials ADD COLUMN password TEXT", []);
+        let _ = conn.execute("ALTER TABLE ssh_credentials ADD COLUMN key_id TEXT", []);
         // Backfill from whatever sessions already exist (e.g. every session predating the
         // `recent_folders` table, or a session restored at startup — `App::new`'s reconnect
         // path reads `sessions` directly and never calls `create_session`, so it never touches
@@ -80,8 +118,15 @@ impl Db {
     pub fn insert_session(&self, meta: &SessionMeta) -> rusqlite::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id, name, cwd, shell, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![meta.id, meta.name, meta.cwd, meta.shell, meta.created_at],
+            "INSERT INTO sessions (id, name, cwd, shell, shell_args, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                meta.id,
+                meta.name,
+                meta.cwd,
+                meta.shell,
+                shell_args_json(&meta.shell_args),
+                meta.created_at
+            ],
         )?;
         Ok(())
     }
@@ -123,7 +168,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> rusqlite::Result<SessionMeta> {
         let conn = self.0.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, cwd, shell, created_at FROM sessions WHERE id = ?1",
+            "SELECT id, name, cwd, shell, shell_args, created_at FROM sessions WHERE id = ?1",
             params![id],
             |row| {
                 Ok(SessionMeta {
@@ -131,7 +176,8 @@ impl Db {
                     name: row.get(1)?,
                     cwd: row.get(2)?,
                     shell: row.get(3)?,
-                    created_at: row.get(4)?,
+                    shell_args: parse_shell_args(row.get(4)?),
+                    created_at: row.get(5)?,
                 })
             },
         )
@@ -139,18 +185,122 @@ impl Db {
 
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionMeta>> {
         let conn = self.0.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, cwd, shell, created_at FROM sessions ORDER BY created_at ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, cwd, shell, shell_args, created_at FROM sessions ORDER BY created_at ASC",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(SessionMeta {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 cwd: row.get(2)?,
                 shell: row.get(3)?,
-                created_at: row.get(4)?,
+                shell_args: parse_shell_args(row.get(4)?),
+                created_at: row.get(5)?,
             })
         })?;
         rows.collect()
+    }
+
+    pub fn insert_ssh_credential(&self, cred: &SshCredential) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ssh_credentials (id, label, host, port, username, auth_method, password, key_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                cred.id,
+                cred.label,
+                cred.host,
+                cred.port,
+                cred.username,
+                cred.auth_method.as_str(),
+                cred.password,
+                cred.key_id,
+                cred.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most-recently-added first, for the "Connect to VPS" picker.
+    pub fn list_ssh_credentials(&self) -> rusqlite::Result<Vec<SshCredential>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, host, port, username, auth_method, password, key_id, created_at
+             FROM ssh_credentials ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_ssh_credential)?;
+        rows.collect()
+    }
+
+    pub fn get_ssh_credential(&self, id: &str) -> rusqlite::Result<SshCredential> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT id, label, host, port, username, auth_method, password, key_id, created_at
+             FROM ssh_credentials WHERE id = ?1",
+            params![id],
+            row_to_ssh_credential,
+        )
+    }
+
+    pub fn delete_ssh_credential(&self, id: &str) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute("DELETE FROM ssh_credentials WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn insert_ssh_key(&self, key: &SshKey) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ssh_keys (id, name, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![key.id, key.name, key.content, key.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Everything but `content` — all the "SSH Key" auth picker in `SshConnect.tsx` ever needs
+    /// to show a list of saved keys. See `SshKeySummary`'s doc comment for why key material
+    /// itself never takes this path.
+    pub fn list_ssh_keys(&self) -> rusqlite::Result<Vec<SshKeySummary>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, name, created_at FROM ssh_keys ORDER BY created_at DESC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SshKeySummary { id: row.get(0)?, name: row.get(1)?, created_at: row.get(2)? })
+        })?;
+        rows.collect()
+    }
+
+    /// Full key including `content` — only ever called from `commands::connect_ssh_session`
+    /// (materializing the key file to spawn `ssh -i`) and `commands::delete_ssh_key`, never
+    /// exposed over IPC.
+    pub fn get_ssh_key(&self, id: &str) -> rusqlite::Result<SshKey> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, content, created_at FROM ssh_keys WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(SshKey {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    content: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )
+    }
+
+    pub fn delete_ssh_key(&self, id: &str) -> rusqlite::Result<()> {
+        let conn = self.0.lock().unwrap();
+        // Any credential pointing at this key falls back to `ssh`'s own default identity
+        // resolution rather than being left with a dangling `key_id` — same "clear the
+        // reference, don't cascade-delete the credential" approach as `delete_session`'s
+        // message cleanup.
+        conn.execute(
+            "UPDATE ssh_credentials SET key_id = NULL WHERE key_id = ?1",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM ssh_keys WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub fn get_file_offset(&self, path: &str) -> rusqlite::Result<u64> {
@@ -288,7 +438,7 @@ impl Db {
     pub fn recent_messages(&self, limit: i64) -> rusqlite::Result<Vec<LogEntry>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT sf.name, st.name, m.body, m.created_at
+            "SELECT m.from_session, sf.name, m.to_session, st.name, m.body, m.created_at
              FROM messages m
              LEFT JOIN sessions sf ON sf.id = m.from_session
              LEFT JOIN sessions st ON st.id = m.to_session
@@ -298,10 +448,12 @@ impl Db {
         let mut rows: Vec<LogEntry> = stmt
             .query_map(params![limit], |row| {
                 Ok(LogEntry {
-                    from_name: row.get(0)?,
-                    to_name: row.get(1)?,
-                    body: row.get(2)?,
-                    created_at: row.get(3)?,
+                    from_id: row.get(0)?,
+                    from_name: row.get(1)?,
+                    to_id: row.get(2)?,
+                    to_name: row.get(3)?,
+                    body: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -456,4 +608,38 @@ impl Db {
         conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
         Ok(())
     }
+}
+
+/// `sessions.shell_args` is stored as a JSON array string (`["-i", "...", "-p", "22", ...]`) —
+/// simplest fit for a variable-length argv in a single TEXT column, no join table needed for
+/// what's normally an empty list (every ordinary, non-SSH session).
+fn shell_args_json(args: &[String]) -> String {
+    serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Inverse of `shell_args_json`. `None`/unparsable (a pre-migration row, or the column simply
+/// never set) both fall back to an empty argv, same as an ordinary shell always had before this
+/// column existed.
+fn parse_shell_args(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Shared row-mapper for `list_ssh_credentials`/`get_ssh_credential`. An unrecognized
+/// `auth_method` value (shouldn't happen — only ever written via `SshAuthMethod::as_str`, but
+/// SQLite has no `CHECK` constraint on it here) falls back to `Key`, same graceful-degrade as a
+/// pre-migration row's missing `key_id` — worst case `ssh` is spawned with no `-i` and falls
+/// back to its own default identity resolution rather than this query erroring out.
+fn row_to_ssh_credential(row: &rusqlite::Row) -> rusqlite::Result<SshCredential> {
+    let auth_method: String = row.get(5)?;
+    Ok(SshCredential {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        host: row.get(2)?,
+        port: row.get(3)?,
+        username: row.get(4)?,
+        auth_method: SshAuthMethod::parse(&auth_method).unwrap_or(SshAuthMethod::Key),
+        password: row.get(6)?,
+        key_id: row.get(7)?,
+        created_at: row.get(8)?,
+    })
 }

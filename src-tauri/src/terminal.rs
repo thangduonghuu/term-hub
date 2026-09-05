@@ -247,6 +247,7 @@ impl TerminalSession {
         id: String,
         cwd: &str,
         shell: &str,
+        shell_args: &[String],
         name: &str,
         sock_path: &std::path::Path,
         token: &str,
@@ -332,8 +333,11 @@ impl TerminalSession {
         // session silently got `alacritty_terminal`'s own default ($SHELL/COMSPEC) no matter
         // what was actually stored for it. `shell` empty also falls back to that default,
         // rather than trying to spawn a literal empty program path.
-        let shell_opt =
-            if shell.trim().is_empty() { None } else { Some(tty::Shell::new(shell.to_string(), Vec::new())) };
+        let shell_opt = if shell.trim().is_empty() {
+            None
+        } else {
+            Some(tty::Shell::new(shell.to_string(), shell_args.to_vec()))
+        };
         let pty_options = tty::Options {
             shell: shell_opt,
             working_directory: Some(cwd.into()),
@@ -556,6 +560,23 @@ impl TerminalSession {
             return None;
         }
         Some((grid.cursor.point.column.0, grid.cursor.point.line.0))
+    }
+
+    /// Plain text of the terminal row the cursor is currently sitting on, trailing blanks
+    /// trimmed — e.g. `"root@203.0.113.10's password:"` right after `ssh` prints its password
+    /// prompt and waits at the end of it. Used by `lib.rs`'s SSH auto-password injection
+    /// (`pending_ssh_passwords`) to detect that prompt by substring match; deliberately just the
+    /// bare characters (no color/style), unlike `snapshot`'s `Frame` — nothing here is rendered.
+    pub fn cursor_line_text(&self) -> String {
+        let term = self.term.lock().unwrap();
+        let grid = term.grid();
+        let cols = grid.columns();
+        let cursor_line = grid.cursor.point.line.0;
+        let cells: Vec<_> = grid.display_iter().collect();
+        let Some(row) = cells.chunks(cols).nth(cursor_line.max(0) as usize) else {
+            return String::new();
+        };
+        row.iter().map(|cell| cell.c).collect::<String>().trim_end().to_string()
     }
 
     /// Builds the frame to render: plain-text grid with `preedit` (in-progress macOS IME
