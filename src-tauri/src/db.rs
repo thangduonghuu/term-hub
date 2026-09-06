@@ -98,6 +98,10 @@ impl Db {
         );
         let _ = conn.execute("ALTER TABLE ssh_credentials ADD COLUMN password TEXT", []);
         let _ = conn.execute("ALTER TABLE ssh_credentials ADD COLUMN key_id TEXT", []);
+        // `sessions` predates `ssh_credential_id` too — see `SessionMeta::ssh_credential_id`'s
+        // doc comment for why a restored SSH session needs this to reconnect the same way the
+        // original `connect_ssh` did.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN ssh_credential_id TEXT", []);
         // Backfill from whatever sessions already exist (e.g. every session predating the
         // `recent_folders` table, or a session restored at startup — `App::new`'s reconnect
         // path reads `sessions` directly and never calls `create_session`, so it never touches
@@ -118,13 +122,15 @@ impl Db {
     pub fn insert_session(&self, meta: &SessionMeta) -> rusqlite::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id, name, cwd, shell, shell_args, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sessions (id, name, cwd, shell, shell_args, ssh_credential_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 meta.id,
                 meta.name,
                 meta.cwd,
                 meta.shell,
                 shell_args_json(&meta.shell_args),
+                meta.ssh_credential_id,
                 meta.created_at
             ],
         )?;
@@ -168,7 +174,8 @@ impl Db {
     pub fn get_session(&self, id: &str) -> rusqlite::Result<SessionMeta> {
         let conn = self.0.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, cwd, shell, shell_args, created_at FROM sessions WHERE id = ?1",
+            "SELECT id, name, cwd, shell, shell_args, ssh_credential_id, created_at
+             FROM sessions WHERE id = ?1",
             params![id],
             |row| {
                 Ok(SessionMeta {
@@ -177,7 +184,8 @@ impl Db {
                     cwd: row.get(2)?,
                     shell: row.get(3)?,
                     shell_args: parse_shell_args(row.get(4)?),
-                    created_at: row.get(5)?,
+                    ssh_credential_id: row.get(5)?,
+                    created_at: row.get(6)?,
                 })
             },
         )
@@ -186,7 +194,8 @@ impl Db {
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionMeta>> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, cwd, shell, shell_args, created_at FROM sessions ORDER BY created_at ASC",
+            "SELECT id, name, cwd, shell, shell_args, ssh_credential_id, created_at
+             FROM sessions ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SessionMeta {
@@ -195,7 +204,8 @@ impl Db {
                 cwd: row.get(2)?,
                 shell: row.get(3)?,
                 shell_args: parse_shell_args(row.get(4)?),
-                created_at: row.get(5)?,
+                ssh_credential_id: row.get(5)?,
+                created_at: row.get(6)?,
             })
         })?;
         rows.collect()

@@ -389,6 +389,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 shell: String::new(),
                 shell_args: Vec::new(),
+                ssh_credential_id: None,
                 created_at: 0,
             })
             .unwrap();
@@ -458,6 +459,7 @@ mod tests {
             cwd: "/tmp".into(),
             shell: String::new(),
             shell_args: Vec::new(),
+            ssh_credential_id: None,
             created_at: 0,
         })
         .unwrap();
@@ -498,6 +500,7 @@ mod tests {
             cwd: "/tmp".into(),
             shell: String::new(),
             shell_args: Vec::new(),
+            ssh_credential_id: None,
             created_at: 0,
         })
         .unwrap();
@@ -616,6 +619,7 @@ mod tests {
             cwd: "/tmp".into(),
             shell: String::new(),
             shell_args: Vec::new(),
+            ssh_credential_id: None,
             created_at: 0,
         })
         .unwrap();
