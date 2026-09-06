@@ -11,6 +11,14 @@ pub struct SessionMeta {
     /// where `shell` is `"ssh"` and this carries `-i <identity>`/`-p <port>`/`user@host`.
     #[serde(default)]
     pub shell_args: Vec<String>,
+    /// Set for an SSH-backed session (`commands::connect_ssh_session`) — id of the
+    /// `SshCredential` it was opened from. `None` for an ordinary shell, and also for an SSH
+    /// session saved before this field existed or whose credential was since deleted. Used on
+    /// restart to re-run the credential's auto-login (re-type the saved password / re-materialize
+    /// the vault key) so a restored session reconnects exactly like the original connect did —
+    /// see `commands::ssh_reconnect_password`.
+    #[serde(default)]
+    pub ssh_credential_id: Option<String>,
     pub created_at: i64,
 }
 

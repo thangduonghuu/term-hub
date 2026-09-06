@@ -679,12 +679,13 @@ impl App {
             return false;
         }
         if let Ok(meta) = self.db.get_session(&id) {
+            let ssh_password = commands::ssh_reconnect_password(&self.db, &meta);
             let _ = self.proxy.send_event(AppEvent::SpawnSession {
                 id,
                 cwd: meta.cwd,
                 shell: meta.shell,
                 shell_args: meta.shell_args,
-                ssh_password: None,
+                ssh_password,
             });
         }
         true
@@ -1069,7 +1070,13 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         if let Some(first) = metas.pop_front() {
-            self.spawn_session(&window, first.id, &first.cwd, &first.shell, &first.shell_args);
+            let ssh_password = commands::ssh_reconnect_password(&self.db, &first);
+            let id = first.id.clone();
+            if self.spawn_session(&window, first.id, &first.cwd, &first.shell, &first.shell_args) {
+                if let Some(password) = ssh_password {
+                    self.pending_ssh_passwords.insert(id, password);
+                }
+            }
         }
         self.pending_reconnects = metas;
         self.next_reconnect = Instant::now() + RECONNECT_STAGGER;
@@ -2135,8 +2142,14 @@ impl ApplicationHandler<AppEvent> for App {
         }
         if now >= self.next_reconnect {
             if let Some(meta) = self.pending_reconnects.pop_front() {
+                let ssh_password = commands::ssh_reconnect_password(&self.db, &meta);
+                let id = meta.id.clone();
                 if let Some(window) = self.window.clone() {
-                    self.spawn_session(&window, meta.id, &meta.cwd, &meta.shell, &meta.shell_args);
+                    if self.spawn_session(&window, meta.id, &meta.cwd, &meta.shell, &meta.shell_args) {
+                        if let Some(password) = ssh_password {
+                            self.pending_ssh_passwords.insert(id, password);
+                        }
+                    }
                     window.request_redraw();
                 }
                 self.next_reconnect = now + RECONNECT_STAGGER;
