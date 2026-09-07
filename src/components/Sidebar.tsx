@@ -38,8 +38,6 @@ interface Props {
   onOpenExternal: (session: SessionInfo) => void;
   onOpenSsh: () => void;
   onOpenSettings: () => void;
-  pendingRenameId: string | null;
-  onPendingRenameHandled: () => void;
 }
 
 export function Sidebar({
@@ -59,37 +57,21 @@ export function Sidebar({
   onOpenExternal,
   onOpenSsh,
   onOpenSettings,
-  pendingRenameId,
-  onPendingRenameHandled,
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   const [query, setQuery] = useState("");
-  // Only the double-click rename path (`startRename`) should steal keyboard focus into the
-  // sidebar webview. The auto-opened field below must not — a newly created session should keep
-  // real keyboard focus on its native terminal tile (which Rust already focuses on spawn), not
-  // have this input's `autoFocus` yank it back into the sidebar.
-  const [autoFocusEdit, setAutoFocusEdit] = useState(false);
   // Right-click menu for a session row — replaces the old always-there hover buttons.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; session: SessionInfo } | null>(
     null,
   );
 
-  // New sessions open straight into an editable, blank name field instead of a
-  // generic default label — the user names it right away instead of double-clicking later.
-  useEffect(() => {
-    if (pendingRenameId && sessions.some((s) => s.id === pendingRenameId)) {
-      setEditingId(pendingRenameId);
-      setDraftName("");
-      setAutoFocusEdit(false);
-      onPendingRenameHandled();
-    }
-  }, [pendingRenameId, sessions, onPendingRenameHandled]);
-
+  // Rename is only ever entered by double-clicking a session's name (or the context-menu
+  // "Rename"). A newly created session just opens — it keeps its default label and real
+  // keyboard focus stays on its native terminal tile.
   function startRename(session: SessionInfo) {
     setEditingId(session.id);
     setDraftName(session.name);
-    setAutoFocusEdit(true);
   }
 
   function commitRename(id: string) {
@@ -224,7 +206,7 @@ export function Sidebar({
                     </span>
                     {editingId === session.id ? (
                       <input
-                        autoFocus={autoFocusEdit}
+                        autoFocus
                         className="rename-input"
                         placeholder={session.name}
                         value={draftName}
