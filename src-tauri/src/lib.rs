@@ -320,6 +320,17 @@ pub enum AppEvent {
     // `active_id`), this names its session explicitly since the sidebar can trigger it for any
     // session, not just the focused one.
     SendToSession { id: String, text: String },
+    // Sent by `control.rs`'s `run` command — types `payload` (a marker-wrapped one-liner) into
+    // the `to_id` session's pty and arms an output capture keyed on `nonce`, so a Claude Code
+    // agent (or the `termhub-msg run` CLI) in another session can run a command in this one and
+    // get its stdout + exit code back. `reply` is answered by the target's pty reader thread
+    // once the end marker lands (or the capture times out); `control.rs` blocks on it.
+    RunInSession {
+        to_id: String,
+        nonce: String,
+        payload: String,
+        reply: std::sync::mpsc::Sender<terminal::CaptureOutcome>,
+    },
     // Sent by a session's pty reader thread (terminal.rs) once its `read()` loop ends — the
     // shell process is gone. Phase 5: marks the tile dead in `App.exited` instead of leaving
     // its last frame frozen on screen with no visual difference from a live idle session.
@@ -1395,6 +1406,27 @@ impl ApplicationHandler<AppEvent> for App {
                     term.write(&text);
                     if let Some(w) = &self.window {
                         w.request_redraw();
+                    }
+                }
+            }
+            AppEvent::RunInSession { to_id, nonce, payload, reply } => {
+                match self.terms.iter_mut().find(|(tid, _)| *tid == to_id) {
+                    Some((_, term)) => {
+                        // `control.rs` caps `timeout_secs` at 600 and adds its own recv slack on
+                        // top, so 600s is the ceiling the reader thread needs to enforce.
+                        let deadline = Instant::now() + Duration::from_secs(600);
+                        term.begin_capture(&nonce, reply, deadline);
+                        // `write`, not `paste`: this goes to a bare shell prompt, so it must
+                        // land as typed keystrokes, not a bracketed paste.
+                        term.write(&payload);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    // Target session isn't live (closed between `list` and `run`) — let the
+                    // caller's `recv` unblock immediately instead of waiting out its timeout.
+                    None => {
+                        let _ = reply.send(terminal::CaptureOutcome::TimedOut);
                     }
                 }
             }
