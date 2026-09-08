@@ -173,6 +173,18 @@ pub fn set_message_autodeliver_enabled(db: &Db, enabled: bool) -> Result<(), Str
         .map_err(|e| e.to_string())
 }
 
+/// Whether an agent in another session may run shell commands in a session in this window via
+/// the `run_in_session` MCP tool / `termhub-msg run` (Settings > Messaging). Stored as
+/// `"1"` / `"0"`; absent means off — this executes arbitrary commands in the target, so it's
+/// opt-in. See `control.rs`'s `dispatch_run`.
+pub fn get_message_run_enabled(db: &Db) -> Result<bool, String> {
+    Ok(db.get_setting("intersession_run").map_err(|e| e.to_string())?.as_deref() == Some("1"))
+}
+
+pub fn set_message_run_enabled(db: &Db, enabled: bool) -> Result<(), String> {
+    db.set_setting("intersession_run", if enabled { "1" } else { "0" }).map_err(|e| e.to_string())
+}
+
 /// The `claude mcp add …` line for the Settings > Messaging copy-button — registers the
 /// `termhub-msg mcp` stdio server (see `bin/termhub-msg.rs`) with Claude Code. Uses the
 /// absolute path to the CLI, which ships next to the GUI binary, so it also works run from a

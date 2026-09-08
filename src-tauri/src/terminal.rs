@@ -11,7 +11,8 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, OnResize, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -34,6 +35,146 @@ use wgpu::util::DeviceExt;
 use winit::event_loop::EventLoopProxy;
 
 use crate::AppEvent;
+
+/// Result of a `begin_capture` run — sent back over the channel `control.rs`'s `run` command is
+/// blocked on. `Done` carries the shell's exit status and the text the command printed between
+/// the start and end markers; `Truncated` means the output blew past the size cap (tail kept);
+/// `TimedOut` means the end marker never showed up before the deadline (target wasn't at a
+/// shell prompt, or has no `base64`/`sh`).
+pub enum CaptureOutcome {
+    Done { exit_code: i32, output: String },
+    Truncated { output: String },
+    TimedOut,
+}
+
+/// One in-flight output capture, armed by `TerminalSession::begin_capture` and drained by the
+/// pty reader thread. Raw pty bytes are appended to `buf` until `end_marker` appears; the
+/// reader then extracts everything between `start_marker` and `end_marker`, ANSI-strips it,
+/// parses the exit code off the end marker, and answers `reply` exactly once.
+///
+/// Once the end marker is seen the capture doesn't answer immediately — it waits out
+/// `SETTLE` first (`settle_until`), so the target shell's post-command prompt redraw drains out
+/// of the pty before the *next* `run` types into it. The reported output is still sliced at the
+/// marker, so those trailing prompt bytes never leak into it.
+struct OutputCapture {
+    start_marker: Vec<u8>,
+    end_marker: Vec<u8>,
+    buf: Vec<u8>,
+    reply: mpsc::Sender<CaptureOutcome>,
+    deadline: Instant,
+    settle_until: Option<Instant>,
+}
+
+/// Hard cap on a single capture's buffer — a runaway command (`yes`, a huge log dump) shouldn't
+/// grow this without bound. On overflow the capture ends early with the tail of what was seen.
+const CAPTURE_BUF_CAP: usize = 2 * 1024 * 1024;
+
+/// How long to keep draining the pty after the end marker before answering, so a following
+/// `run` against the same session doesn't type into a shell that's still redrawing its prompt.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl OutputCapture {
+    /// Feeds newly-read pty bytes in. Returns `Some(outcome)` once the capture is complete (end
+    /// marker seen and settled, deadline passed, or buffer cap hit) — the caller then clears the
+    /// slot. Call with an empty slice to just re-check the timers when the pty is idle.
+    fn ingest(&mut self, bytes: &[u8]) -> Option<CaptureOutcome> {
+        self.buf.extend_from_slice(bytes);
+        if let Some(end) = find_subslice(&self.buf, &self.end_marker) {
+            // First sighting of the end marker — start the settle window, don't answer yet.
+            if self.settle_until.is_none() {
+                self.settle_until = Some(Instant::now() + SETTLE);
+            }
+            if Instant::now() < self.settle_until.unwrap() {
+                return None;
+            }
+            // Exit-code digits run from just past the end marker to the next newline.
+            let after = &self.buf[end + self.end_marker.len()..];
+            let digits: String = after
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .map(|&b| b as char)
+                .collect();
+            let exit_code = digits.parse().unwrap_or(-1);
+            let start = find_subslice(&self.buf, &self.start_marker)
+                .map(|i| i + self.start_marker.len())
+                .unwrap_or(0);
+            let body = self.buf.get(start..end).unwrap_or(&[]);
+            // The wrapper's own `printf`s add a newline right after the start marker and right
+            // before the end marker — peel one off each end so the output isn't padded.
+            let mut output = strip_ansi(body);
+            if output.starts_with('\n') {
+                output.remove(0);
+            }
+            if output.ends_with('\n') {
+                output.pop();
+            }
+            return Some(CaptureOutcome::Done { exit_code, output });
+        }
+        if self.buf.len() > CAPTURE_BUF_CAP {
+            let tail = &self.buf[self.buf.len() - CAPTURE_BUF_CAP..];
+            return Some(CaptureOutcome::Truncated { output: strip_ansi(tail) });
+        }
+        if Instant::now() > self.deadline {
+            return Some(CaptureOutcome::TimedOut);
+        }
+        None
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Strips terminal control bytes so captured command output reads as plain text: CSI
+/// (`ESC [ … final`), OSC (`ESC ] … BEL` / `ESC \`), two-byte `ESC x`, and stray C0 control
+/// codes other than tab/newline. `\r\n` collapses to `\n`; a lone `\r` is dropped (rather than
+/// letting it overwrite the line, which is meaningless once this is a flat string).
+fn strip_ansi(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    // CSI: params/intermediates until a final byte in 0x40..=0x7e.
+                    for p in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&p) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: runs until BEL or the ST string terminator (ESC \).
+                    while let Some(p) = chars.next() {
+                        if p == '\x07' {
+                            break;
+                        }
+                        if p == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other two-byte escape (charset select, keypad mode, …) — drop both bytes.
+                _ => {}
+            },
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(c),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Answers escape-sequence *queries* the terminal is expected to reply to over the pty —
 /// device attributes, cursor position reports, OSC color queries, etc. Discovered as a real,
@@ -239,6 +380,9 @@ pub struct TerminalSession {
     // changed since last frame, the same way `TextPipeline::render_all` already skips
     // re-shaping unchanged tiles. Doesn't need to be exact, just monotonic and cheap to read.
     generation: Arc<AtomicU64>,
+    // `Some` while a `begin_capture` run is in flight — the pty reader thread appends output
+    // here and answers the run's reply channel when the end marker lands. See `OutputCapture`.
+    capture: Arc<Mutex<Option<OutputCapture>>>,
 }
 
 impl TerminalSession {
@@ -371,9 +515,23 @@ impl TerminalSession {
         )));
 
         let generation = Arc::new(AtomicU64::new(0));
+        let capture: Arc<Mutex<Option<OutputCapture>>> = Arc::new(Mutex::new(None));
         let term_for_reader = term.clone();
         let generation_for_reader = generation.clone();
+        let capture_for_reader = capture.clone();
         std::thread::spawn(move || {
+            // Feeds the in-flight `begin_capture` (if any) new pty bytes, or just nudges its
+            // deadline when idle (`None` bytes) — a target that never runs the wrapper produces
+            // no output, so the timeout has to be checked even when nothing was read.
+            let pump_capture = |bytes: Option<&[u8]>| {
+                let mut slot = capture_for_reader.lock().unwrap();
+                if let Some(cap) = slot.as_mut() {
+                    if let Some(outcome) = cap.ingest(bytes.unwrap_or(&[])) {
+                        let _ = cap.reply.send(outcome);
+                        *slot = None;
+                    }
+                }
+            };
             let mut processor = Processor::<StdSyncHandler>::new();
             let mut buf = [0u8; 8192];
             loop {
@@ -383,6 +541,7 @@ impl TerminalSession {
                         let mut term = term_for_reader.lock().unwrap();
                         processor.advance(&mut *term, &buf[..n]);
                         drop(term);
+                        pump_capture(Some(&buf[..n]));
                         generation_for_reader.fetch_add(1, Ordering::Relaxed);
                         // Only wake the render loop when there's actually new output to
                         // show, instead of redrawing (and re-shaping the whole grid) on a
@@ -395,6 +554,7 @@ impl TerminalSession {
                     // polling event loop, which we bypass in favor of this simple thread) —
                     // no data ready yet isn't an error, just retry.
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        pump_capture(None);
                         std::thread::sleep(std::time::Duration::from_millis(2));
                     }
                     Err(_) => break,
@@ -407,7 +567,7 @@ impl TerminalSession {
             let _ = proxy.send_event(AppEvent::SessionExited(id));
         });
 
-        Ok(Self { term, pty_writer, _pty: pty, generation })
+        Ok(Self { term, pty_writer, _pty: pty, generation, capture })
     }
 
     pub fn write(&mut self, s: &str) {
@@ -419,6 +579,27 @@ impl TerminalSession {
         self.term.lock().unwrap().scroll_display(Scroll::Bottom);
         self.generation.fetch_add(1, Ordering::Relaxed);
         let _ = self.pty_writer.write_all(s.as_bytes());
+    }
+
+    /// Arms an output capture for `control.rs`'s `run` command: the pty reader thread collects
+    /// everything printed between `__THUB_<nonce>_S` and `__THUB_<nonce>_E<code>` and answers
+    /// `reply` once (or with `TimedOut` if the end marker never arrives before `deadline`). The
+    /// caller is expected to immediately `write` the wrapper one-liner that emits those markers.
+    /// A capture already in flight is replaced — its channel just goes unanswered.
+    pub fn begin_capture(
+        &self,
+        nonce: &str,
+        reply: mpsc::Sender<CaptureOutcome>,
+        deadline: Instant,
+    ) {
+        *self.capture.lock().unwrap() = Some(OutputCapture {
+            start_marker: format!("__THUB_{nonce}_S").into_bytes(),
+            end_marker: format!("__THUB_{nonce}_E").into_bytes(),
+            buf: Vec::new(),
+            reply,
+            deadline,
+            settle_until: None,
+        });
     }
 
     /// Like `write`, but for content that came from an OS paste (`AppEvent::Paste`) rather than
@@ -1817,5 +1998,99 @@ impl SelectionPipeline {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..vertices.len() as u32, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn capture(nonce: &str) -> (OutputCapture, mpsc::Receiver<CaptureOutcome>) {
+        let (tx, rx) = mpsc::channel();
+        let cap = OutputCapture {
+            start_marker: format!("__THUB_{nonce}_S").into_bytes(),
+            end_marker: format!("__THUB_{nonce}_E").into_bytes(),
+            buf: Vec::new(),
+            reply: tx,
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+            settle_until: None,
+        };
+        (cap, rx)
+    }
+
+    /// `ingest`, but skip the post-marker settle wait a real run does.
+    fn ingest_now(cap: &mut OutputCapture, bytes: &[u8]) -> Option<CaptureOutcome> {
+        let out = cap.ingest(bytes);
+        if out.is_none() && cap.settle_until.is_some() {
+            cap.settle_until = Some(Instant::now() - std::time::Duration::from_millis(1));
+            return cap.ingest(b"");
+        }
+        out
+    }
+
+    #[test]
+    fn strip_ansi_drops_escapes_and_normalizes_newlines() {
+        let raw = b"\x1b[32mgreen\x1b[0m\r\nline2\r\x1b]0;title\x07done";
+        assert_eq!(strip_ansi(raw), "green\nline2\ndone");
+    }
+
+    #[test]
+    fn ingest_extracts_body_and_exit_code_between_markers() {
+        let (mut cap, _rx) = capture("abc");
+        // Echo of the typed wrapper first (contains __THUB_abc but never __THUB_abc_S / _E),
+        // then the bracketed execution output.
+        let outcome = ingest_now(
+            &mut cap,
+            b"m=__THUB_abc; printf ...\r\n__THUB_abc_S\nhello\nworld\n__THUB_abc_E7\n",
+        );
+        match outcome {
+            Some(CaptureOutcome::Done { exit_code, output }) => {
+                assert_eq!(exit_code, 7);
+                assert_eq!(output, "hello\nworld");
+            }
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn ingest_waits_out_the_settle_window_before_answering() {
+        let (mut cap, _rx) = capture("s");
+        // Marker present, but the settle window hasn't elapsed — no answer yet.
+        assert!(cap.ingest(b"__THUB_s_S\nout\n__THUB_s_E0\n").is_none());
+        assert!(cap.settle_until.is_some());
+        // Prompt-redraw bytes arriving during settle are kept out of the output.
+        cap.settle_until = Some(Instant::now() - std::time::Duration::from_millis(1));
+        let outcome = cap.ingest(b"user@host:~$ ");
+        assert!(matches!(
+            outcome,
+            Some(CaptureOutcome::Done { exit_code: 0, ref output }) if output == "out"
+        ));
+    }
+
+    #[test]
+    fn ingest_handles_output_split_across_reads() {
+        let (mut cap, _rx) = capture("xy");
+        assert!(cap.ingest(b"__THUB_xy_S\npart1").is_none());
+        assert!(cap.ingest(b"part2\n").is_none());
+        let outcome = ingest_now(&mut cap, b"__THUB_xy_E0\n");
+        assert!(matches!(
+            outcome,
+            Some(CaptureOutcome::Done { exit_code: 0, ref output }) if output == "part1part2"
+        ));
+    }
+
+    #[test]
+    fn ingest_times_out_when_no_end_marker() {
+        let (tx, _rx) = mpsc::channel();
+        let mut cap = OutputCapture {
+            start_marker: b"__THUB_z_S".to_vec(),
+            end_marker: b"__THUB_z_E".to_vec(),
+            buf: Vec::new(),
+            reply: tx,
+            deadline: Instant::now() - std::time::Duration::from_secs(1),
+            settle_until: None,
+        };
+        assert!(matches!(cap.ingest(b"noise"), Some(CaptureOutcome::TimedOut)));
     }
 }

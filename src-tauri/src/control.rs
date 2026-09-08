@@ -22,15 +22,21 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::db::Db;
 use crate::session::SessionMeta;
+use crate::terminal::CaptureOutcome;
 use crate::AppEvent;
+
+/// Default / max seconds `run` waits for a command in another session to finish.
+const RUN_TIMEOUT_DEFAULT: u64 = 30;
+const RUN_TIMEOUT_MAX: u64 = 600;
 
 pub struct ControlState {
     pub db: Arc<Db>,
@@ -315,7 +321,102 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
             let msgs = db.take_inbox(id, peek, now()).map_err(|e| e.to_string())?;
             serde_json::to_value(msgs).map_err(|e| e.to_string())
         }
+        "run" => dispatch_run(req, state),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// `run` — type a command into another session's shell and return its stdout + exit code.
+///
+/// Opt-in (the `intersession_run` setting, off by default): the target session is assumed to be
+/// sitting at a POSIX shell prompt (local or `ssh`'d somewhere). The command is base64'd so any
+/// script — multi-line, quotes, `$` — survives being typed in as a single line, then wrapped so
+/// the shell brackets its output with `__THUB_<nonce>_S` / `__THUB_<nonce>_E<exit code>`
+/// markers. `App` (via `AppEvent::RunInSession`) types the wrapper in and arms the capture; the
+/// target's pty reader thread answers `reply` when the end marker lands. See
+/// `terminal::OutputCapture` and `docs/intersession-messaging-plan.md` (Phase 6).
+fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
+    let db = &state.db;
+    if db.get_setting("intersession_run").map_err(|e| e.to_string())?.as_deref() != Some("1") {
+        return Err(
+            "running commands in other sessions is off — turn on \"Let agents run commands in \
+             other sessions\" in Settings › Messaging"
+                .into(),
+        );
+    }
+    let to: String = field(&req.args, "to")?;
+    let command: String = field(&req.args, "command")?;
+    if command.trim().is_empty() {
+        return Err("empty command".into());
+    }
+    let timeout = req
+        .args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(RUN_TIMEOUT_DEFAULT)
+        .clamp(1, RUN_TIMEOUT_MAX);
+
+    let sessions = db.list_sessions().map_err(|e| e.to_string())?;
+    let target = resolve(&sessions, &to)?;
+    if Some(target.id.as_str()) == req.session_id.as_deref() {
+        return Err("that's this session — pick a different one".into());
+    }
+    let target_id = target.id.clone();
+    let target_name = target.name.clone();
+
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&command);
+    // Wrap the (base64'd) command so its output is bracketed by markers the reader thread can
+    // find. Notes:
+    // - `sh -c "$(… | base64 -d)"`, not `… | base64 -d | sh`: the latter makes `sh` read the
+    //   script from stdin, which then collides with anything in the script that also reads
+    //   stdin (`python - <<EOF`, `read`, an interactive prompt). `-c "$(…)"` leaves the child's
+    //   stdin as the terminal, and `"$(…)"` isn't re-parsed, so any quoting in the script is
+    //   safe.
+    // - The shell echoes this whole line back before running it, but the echo only contains the
+    //   literal `$__thub_m`; the expanded `__THUB_<nonce>_S` / `_E` markers show up only in
+    //   execution output, so the reader thread's substring search can't trip on the echo.
+    let payload = format!(
+        "__thub_m=__THUB_{nonce}; printf '%s_S\\n' \"$__thub_m\"; \
+         sh -c \"$(printf %s '{b64}' | base64 -d)\"; __thub_rc=$?; \
+         printf '%s_E%s\\n' \"$__thub_m\" \"$__thub_rc\"; unset __thub_m __thub_rc\r"
+    );
+
+    let from_name = req
+        .session_id
+        .as_deref()
+        .and_then(|id| sessions.iter().find(|s| s.id == id))
+        .map(|s| s.name.clone());
+    (state.notify)(AppEvent::MessageLogged {
+        from_id: req.session_id.clone(),
+        from_name,
+        to_id: Some(target_id.clone()),
+        to_name: target_name,
+        body: format!("$ {command}"),
+        ts: now(),
+    });
+
+    let (tx, rx) = mpsc::channel();
+    (state.notify)(AppEvent::RunInSession {
+        to_id: target_id,
+        nonce,
+        payload,
+        reply: tx,
+    });
+
+    // A few seconds past the in-shell deadline so a genuine timeout surfaces as the message
+    // below rather than a bare channel disconnect.
+    match rx.recv_timeout(Duration::from_secs(timeout + 5)) {
+        Ok(CaptureOutcome::Done { exit_code, output }) => {
+            Ok(json!({ "exit_code": exit_code, "output": output, "truncated": false }))
+        }
+        Ok(CaptureOutcome::Truncated { output }) => {
+            Ok(json!({ "exit_code": -1, "output": output, "truncated": true }))
+        }
+        Ok(CaptureOutcome::TimedOut) | Err(_) => Err(format!(
+            "no completion marker after {timeout}s — is \"{to}\" sitting at a shell prompt? \
+             (needs an interactive bash/zsh/sh with `base64` available)"
+        )),
     }
 }
 
@@ -678,6 +779,88 @@ mod tests {
         // a session with no token on record stays lenient (id-a was never given one)
         assert!(dispatch(&req(Some("id-a"), "whoami", json!({})), &state).is_ok());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_requires_the_opt_in_setting() {
+        let (db, path) = test_db();
+        let state =
+            ControlState { db, sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+        let err = dispatch(
+            &req(Some("id-a"), "run", json!({ "to": "bob", "command": "echo hi" })),
+            &state,
+        )
+        .unwrap_err();
+        assert!(err.contains("Settings"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_rejects_self_target() {
+        let (db, path) = test_db();
+        db.set_setting("intersession_run", "1").unwrap();
+        let state =
+            ControlState { db: db.clone(), sock_path: "/unused".into(), notify: Box::new(|_| {}) };
+        let err = dispatch(
+            &req(Some("id-a"), "run", json!({ "to": "alice", "command": "echo hi" })),
+            &state,
+        )
+        .unwrap_err();
+        assert!(err.contains("this session"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_returns_exit_code_and_output() {
+        let (db, path) = test_db();
+        db.set_setting("intersession_run", "1").unwrap();
+        // Stand in for `App` + the target's pty reader thread: answer any `RunInSession` reply
+        // channel the way a real capture would, and assert the wrapper is well-formed.
+        let state = ControlState {
+            db: db.clone(),
+            sock_path: "/unused".into(),
+            notify: Box::new(|ev| {
+                if let AppEvent::RunInSession { payload, nonce, reply, .. } = ev {
+                    assert!(payload.contains(&format!("__THUB_{nonce}")));
+                    assert!(payload.contains("sh -c \"$(printf %s '") && payload.contains("base64 -d)\""));
+                    assert!(payload.ends_with('\r'));
+                    reply
+                        .send(CaptureOutcome::Done { exit_code: 3, output: "hello\n".into() })
+                        .unwrap();
+                }
+            }),
+        };
+        let out = dispatch(
+            &req(Some("id-a"), "run", json!({ "to": "bob", "command": "exit 3" })),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(out["exit_code"], 3);
+        assert_eq!(out["output"], "hello\n");
+        assert_eq!(out["truncated"], false);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_times_out_when_no_marker_comes_back() {
+        let (db, path) = test_db();
+        db.set_setting("intersession_run", "1").unwrap();
+        let state = ControlState {
+            db: db.clone(),
+            sock_path: "/unused".into(),
+            notify: Box::new(|ev| {
+                if let AppEvent::RunInSession { reply, .. } = ev {
+                    reply.send(CaptureOutcome::TimedOut).unwrap();
+                }
+            }),
+        };
+        let err = dispatch(
+            &req(Some("id-a"), "run", json!({ "to": "bob", "command": "sleep 1", "timeout_secs": 1 })),
+            &state,
+        )
+        .unwrap_err();
+        assert!(err.contains("shell prompt"), "{err}");
         let _ = std::fs::remove_file(path);
     }
 

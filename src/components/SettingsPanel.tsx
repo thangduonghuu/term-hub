@@ -98,6 +98,7 @@ export function SettingsPanel({ onClose }: Props) {
   const [mcpCopied, setMcpCopied] = useState(false);
   const [messageToast, setMessageToast] = useState(true);
   const [messageAutodeliver, setMessageAutodeliver] = useState(false);
+  const [messageRun, setMessageRun] = useState(false);
 
   useEffect(() => {
     api.getDefaultShell().then((s) => setShell(s ?? ""));
@@ -110,6 +111,7 @@ export function SettingsPanel({ onClose }: Props) {
     api.getMcpRegisterCommand().then(setMcpCmd).catch(() => setMcpCmd(""));
     api.getMessageToastEnabled().then(setMessageToast).catch(() => {});
     api.getMessageAutodeliverEnabled().then(setMessageAutodeliver).catch(() => {});
+    api.getMessageRunEnabled().then(setMessageRun).catch(() => {});
   }, []);
 
   // While "recording" (after clicking Change), capture the very next physical key press to
@@ -491,6 +493,21 @@ export function SettingsPanel({ onClose }: Props) {
                   Type an incoming message straight into the session's terminal — for a Claude
                   Code agent that isn't watching its inbox. Skipped while a session is in{" "}
                   <code>wait_for_message</code>.
+                </label>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={messageRun}
+                    onChange={(e) => {
+                      const on = e.currentTarget.checked;
+                      setMessageRun(on);
+                      api.setMessageRunEnabled(on);
+                    }}
+                  />
+                  Let agents run commands in other sessions — the <code>run_in_session</code>{" "}
+                  tool / <code>termhub-msg run</code> type a command into another session and
+                  return its output. The target must be sitting at a shell prompt (a local shell
+                  or SSH).
                 </label>
               </div>
             )}
