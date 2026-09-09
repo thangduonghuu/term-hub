@@ -329,12 +329,14 @@ fn dispatch(req: &Req, state: &ControlState) -> Result<Value, String> {
 /// `run` — type a command into another session's shell and return its stdout + exit code.
 ///
 /// Opt-in (the `intersession_run` setting, off by default): the target session is assumed to be
-/// sitting at a POSIX shell prompt (local or `ssh`'d somewhere). The command is base64'd so any
-/// script — multi-line, quotes, `$` — survives being typed in as a single line, then wrapped so
-/// the shell brackets its output with `__THUB_<nonce>_S` / `__THUB_<nonce>_E<exit code>`
-/// markers. `App` (via `AppEvent::RunInSession`) types the wrapper in and arms the capture; the
-/// target's pty reader thread answers `reply` when the end marker lands. See
-/// `terminal::OutputCapture` and `docs/intersession-messaging-plan.md` (Phase 6).
+/// sitting at a POSIX shell prompt (local or `ssh`'d somewhere). A one-line command is typed in
+/// verbatim (as `sh -c '<command>'`) so the target's scrollback shows the real command; a
+/// multi-line script can't be one physical line, so it's base64'd, decoded in place, and its
+/// source printed for the same readability. Either way the shell brackets its output with
+/// `__THUB_<nonce>_S` / `__THUB_<nonce>_E<exit code>` markers. `App` (via
+/// `AppEvent::RunInSession`) types the wrapper in and arms the capture; the target's pty reader
+/// thread answers `reply` when the end marker lands. See `terminal::OutputCapture` and
+/// `docs/intersession-messaging-plan.md` (Phase 6).
 fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
     let db = &state.db;
     if db.get_setting("intersession_run").map_err(|e| e.to_string())?.as_deref() != Some("1") {
@@ -365,21 +367,35 @@ fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
     let target_name = target.name.clone();
 
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&command);
-    // Wrap the (base64'd) command so its output is bracketed by markers the reader thread can
-    // find. Notes:
-    // - `sh -c "$(… | base64 -d)"`, not `… | base64 -d | sh`: the latter makes `sh` read the
-    //   script from stdin, which then collides with anything in the script that also reads
-    //   stdin (`python - <<EOF`, `read`, an interactive prompt). `-c "$(…)"` leaves the child's
-    //   stdin as the terminal, and `"$(…)"` isn't re-parsed, so any quoting in the script is
-    //   safe.
-    // - The shell echoes this whole line back before running it, but the echo only contains the
-    //   literal `$__thub_m`; the expanded `__THUB_<nonce>_S` / `_E` markers show up only in
-    //   execution output, so the reader thread's substring search can't trip on the echo.
+    // Type the command into the target's shell bracketed by `__THUB_<nonce>_S` /
+    // `__THUB_<nonce>_E<exit code>` markers the reader thread keys off. How the command itself
+    // gets in depends on whether it's one physical line:
+    // - single line: inlined as `sh -c '<command>'` (only `'` needs escaping) so the target's
+    //   scrollback shows the actual command, not an opaque blob. `sh -c` keeps it isolated — a
+    //   trailing `#comment`, an unbalanced quote or a stray `&` can't leak into the wrapper.
+    // - multi-line: can't be typed as one line, so it's base64'd and decoded in place, then the
+    //   decoded source is printed (ahead of the start marker, so it stays out of the captured
+    //   output) to keep the scrollback readable.
+    // `sh -c "$(…)"` / `sh -c '…'`, never `… | sh`: piping makes `sh` read the script from
+    // stdin, which then fights anything in it that also reads stdin (`read`, `python - <<EOF`);
+    // `-c` leaves the child's stdin on the terminal. The shell echoes the typed line first, but
+    // that echo only carries the literal `$__thub_m` — the expanded markers show up only in
+    // execution output, so the reader thread's substring search can't trip on the echo.
+    let run_part = if command.contains('\n') || command.contains('\r') {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&command);
+        format!(
+            "__thub_src=$(printf %s '{b64}' | base64 -d); \
+             printf '%s\\n%s\\n%s\\n' '--- termhub-msg run ---' \"$__thub_src\" \
+             '-----------------------'; printf '%s_S\\n' \"$__thub_m\"; \
+             sh -c \"$__thub_src\"; __thub_rc=$?"
+        )
+    } else {
+        let escaped = command.replace('\'', "'\\''");
+        format!("printf '%s_S\\n' \"$__thub_m\"; sh -c '{escaped}'; __thub_rc=$?")
+    };
     let payload = format!(
-        "__thub_m=__THUB_{nonce}; printf '%s_S\\n' \"$__thub_m\"; \
-         sh -c \"$(printf %s '{b64}' | base64 -d)\"; __thub_rc=$?; \
-         printf '%s_E%s\\n' \"$__thub_m\" \"$__thub_rc\"; unset __thub_m __thub_rc\r"
+        "__thub_m=__THUB_{nonce}; {run_part}; \
+         printf '%s_E%s\\n' \"$__thub_m\" \"$__thub_rc\"; unset __thub_m __thub_rc __thub_src\r"
     );
 
     let from_name = req
@@ -827,7 +843,9 @@ mod tests {
             notify: Box::new(|ev| {
                 if let AppEvent::RunInSession { payload, nonce, reply, .. } = ev {
                     assert!(payload.contains(&format!("__THUB_{nonce}")));
-                    assert!(payload.contains("sh -c \"$(printf %s '") && payload.contains("base64 -d)\""));
+                    // Single-line command: typed in verbatim, no base64.
+                    assert!(payload.contains("sh -c 'exit 3'"), "{payload}");
+                    assert!(!payload.contains("base64"), "{payload}");
                     assert!(payload.ends_with('\r'));
                     reply
                         .send(CaptureOutcome::Done { exit_code: 3, output: "hello\n".into() })
@@ -843,6 +861,33 @@ mod tests {
         assert_eq!(out["exit_code"], 3);
         assert_eq!(out["output"], "hello\n");
         assert_eq!(out["truncated"], false);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_multiline_command_is_base64_wrapped_and_printed() {
+        let (db, path) = test_db();
+        db.set_setting("intersession_run", "1").unwrap();
+        let state = ControlState {
+            db: db.clone(),
+            sock_path: "/unused".into(),
+            notify: Box::new(|ev| {
+                if let AppEvent::RunInSession { payload, reply, .. } = ev {
+                    // Multi-line: base64'd for transport, source printed for readability.
+                    assert!(payload.contains("base64 -d"), "{payload}");
+                    assert!(payload.contains("--- termhub-msg run ---"), "{payload}");
+                    reply
+                        .send(CaptureOutcome::Done { exit_code: 0, output: String::new() })
+                        .unwrap();
+                }
+            }),
+        };
+        let out = dispatch(
+            &req(Some("id-a"), "run", json!({ "to": "bob", "command": "echo one\necho two" })),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(out["exit_code"], 0);
         let _ = std::fs::remove_file(path);
     }
 

@@ -491,7 +491,7 @@ usage:
                 },
                 {
                     "name": "run_in_session",
-                    "description": "Run a shell command or multi-line script in another session that is sitting at a POSIX shell prompt (local, or SSH'd into a remote host) and get back its combined stdout/stderr plus exit code. Opt-in: the user must enable \"Let agents run commands in other sessions\" in TermHub's Settings > Messaging, or this returns an error. The target must be an interactive bash/zsh/sh with `base64` on PATH — a session inside a REPL or TUI (python, vim, another agent) will time out instead.",
+                    "description": "Run a shell command or multi-line script in another session that is sitting at a POSIX shell prompt (local, or SSH'd into a remote host) and get back its combined stdout/stderr plus exit code. Opt-in: the user must enable \"Let agents run commands in other sessions\" in TermHub's Settings > Messaging, or this returns an error. The target must be an interactive bash/zsh/sh (multi-line scripts also need `base64` on PATH) — a session inside a REPL or TUI (python, vim, another agent) will time out instead.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
