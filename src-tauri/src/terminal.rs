@@ -2039,10 +2039,12 @@ mod capture_tests {
     fn ingest_extracts_body_and_exit_code_between_markers() {
         let (mut cap, _rx) = capture("abc");
         // Echo of the typed wrapper first (contains __THUB_abc but never __THUB_abc_S / _E),
-        // then the bracketed execution output.
+        // then the bracketed execution output. `control.rs` prints each marker with a trailing
+        // `\r\x1b[2K` (CR + erase-line) so it doesn't show on the target — `strip_ansi` drops
+        // those from the captured body.
         let outcome = ingest_now(
             &mut cap,
-            b"m=__THUB_abc; printf ...\r\n__THUB_abc_S\nhello\nworld\n__THUB_abc_E7\n",
+            b"m=__THUB_abc; printf ...\r\n__THUB_abc_S\r\x1b[2Khello\nworld\n__THUB_abc_E7\r\x1b[2K",
         );
         match outcome {
             Some(CaptureOutcome::Done { exit_code, output }) => {

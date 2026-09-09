@@ -495,6 +495,12 @@ struct App {
     // keystroke ever could (a human's reaction time trivially clears it, a same-tick
     // instruction doesn't). `about_to_wait` below fires these once their deadline passes.
     armed_ssh_passwords: Vec<(String, String, Instant)>,
+    // `run_in_session`'s two-phase type-in (see `AppEvent::RunInSession`): `stty -echo` is typed
+    // immediately, then ~150ms later — drained in `about_to_wait`, once the target's shell has
+    // actually turned echo off — the capture is armed and the wrapper typed, so the wrapper
+    // line itself is never echoed into the target's scrollback. Entries are
+    // (session id, capture nonce, wrapper payload, reply channel, fire-at instant).
+    armed_runs: Vec<(String, String, String, std::sync::mpsc::Sender<terminal::CaptureOutcome>, Instant)>,
     cursor_pos: (f64, f64),
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
     // it's committed) for `active_id`'s session — not sent to the pty, just overlaid at the
@@ -638,6 +644,7 @@ impl App {
             frame_cache: HashMap::new(),
             pending_ssh_passwords: HashMap::new(),
             armed_ssh_passwords: Vec::new(),
+            armed_runs: Vec::new(),
             cursor_pos: (0.0, 0.0),
             preedit: String::new(),
             #[cfg(target_os = "macos")]
@@ -1340,6 +1347,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.terms.retain(|(tid, _)| *tid != id);
                 self.pending_ssh_passwords.remove(&id);
                 self.armed_ssh_passwords.retain(|(tid, _, _)| *tid != id);
+                self.armed_runs.retain(|(tid, ..)| *tid != id);
                 // The respawned session starts its own generation counter back at 0 — drop any
                 // cached frame for this id so a coincidental generation match against the old
                 // (dead) session's last frame can never serve stale content for the new one.
@@ -1374,6 +1382,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.terms.retain(|(tid, _)| *tid != id);
                 self.pending_ssh_passwords.remove(&id);
                 self.armed_ssh_passwords.retain(|(tid, _, _)| *tid != id);
+                self.armed_runs.retain(|(tid, ..)| *tid != id);
                 if let Ok(mut exited) = self.exited.lock() {
                     exited.remove(&id);
                 }
@@ -1412,13 +1421,18 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::RunInSession { to_id, nonce, payload, reply } => {
                 match self.terms.iter_mut().find(|(tid, _)| *tid == to_id) {
                     Some((_, term)) => {
-                        // `control.rs` caps `timeout_secs` at 600 and adds its own recv slack on
-                        // top, so 600s is the ceiling the reader thread needs to enforce.
-                        let deadline = Instant::now() + Duration::from_secs(600);
-                        term.begin_capture(&nonce, reply, deadline);
-                        // `write`, not `paste`: this goes to a bare shell prompt, so it must
-                        // land as typed keystrokes, not a bracketed paste.
-                        term.write(&payload);
+                        // Phase 1: turn off input echo on its own line, so the wrapper typed in
+                        // phase 2 (below, from `about_to_wait` once this has taken effect) never
+                        // shows up in the target's scrollback. `2>/dev/null` keeps it quiet on a
+                        // shell where `stty` isn't a builtin / the fd isn't a tty.
+                        term.write("stty -echo 2>/dev/null\r");
+                        self.armed_runs.push((
+                            to_id,
+                            nonce,
+                            payload,
+                            reply,
+                            Instant::now() + Duration::from_millis(150),
+                        ));
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -2165,6 +2179,32 @@ impl ApplicationHandler<AppEvent> for App {
                 term.write(&format!("{password}\r"));
             }
         }
+        // Phase 2 of `run_in_session` (see `armed_runs`): the `stty -echo` typed in phase 1 has
+        // had its ~150ms to take effect, so arm the capture and type the wrapper now — it lands
+        // unechoed.
+        let (due_runs, waiting_runs): (Vec<_>, Vec<_>) =
+            self.armed_runs.drain(..).partition(|(_, _, _, _, at)| now >= *at);
+        self.armed_runs = waiting_runs;
+        for (id, nonce, payload, reply, _) in due_runs {
+            match self.terms.iter_mut().find(|(tid, _)| *tid == id) {
+                Some((_, term)) => {
+                    // `control.rs` caps `timeout_secs` at 600 and adds its own recv slack, so
+                    // 600s is the ceiling the reader thread needs to enforce.
+                    let deadline = now + Duration::from_secs(600);
+                    term.begin_capture(&nonce, reply, deadline);
+                    // `write`, not `paste`: this goes to a bare shell prompt, so it must land
+                    // as typed keystrokes, not a bracketed paste.
+                    term.write(&payload);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+                // Session closed during the 150ms window — unblock the caller's `recv`.
+                None => {
+                    let _ = reply.send(terminal::CaptureOutcome::TimedOut);
+                }
+            }
+        }
         if now >= self.next_blink {
             self.cursor_visible = !self.cursor_visible;
             self.next_blink = now + BLINK_INTERVAL;
@@ -2226,6 +2266,9 @@ impl ApplicationHandler<AppEvent> for App {
         }
         if let Some((_, _, at)) = self.armed_ssh_passwords.iter().min_by_key(|(_, _, at)| *at) {
             deadline = deadline.min(*at);
+        }
+        if let Some(at) = self.armed_runs.iter().map(|(_, _, _, _, at)| *at).min() {
+            deadline = deadline.min(at);
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }

@@ -367,35 +367,43 @@ fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
     let target_name = target.name.clone();
 
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    // Type the command into the target's shell bracketed by `__THUB_<nonce>_S` /
-    // `__THUB_<nonce>_E<exit code>` markers the reader thread keys off. How the command itself
-    // gets in depends on whether it's one physical line:
-    // - single line: inlined as `sh -c '<command>'` (only `'` needs escaping) so the target's
-    //   scrollback shows the actual command, not an opaque blob. `sh -c` keeps it isolated — a
-    //   trailing `#comment`, an unbalanced quote or a stray `&` can't leak into the wrapper.
-    // - multi-line: can't be typed as one line, so it's base64'd and decoded in place, then the
-    //   decoded source is printed (ahead of the start marker, so it stays out of the captured
-    //   output) to keep the scrollback readable.
-    // `sh -c "$(…)"` / `sh -c '…'`, never `… | sh`: piping makes `sh` read the script from
-    // stdin, which then fights anything in it that also reads stdin (`read`, `python - <<EOF`);
-    // `-c` leaves the child's stdin on the terminal. The shell echoes the typed line first, but
-    // that echo only carries the literal `$__thub_m` — the expanded markers show up only in
-    // execution output, so the reader thread's substring search can't trip on the echo.
-    let run_part = if command.contains('\n') || command.contains('\r') {
+    // Build the wrapper that runs the command in the target's shell bracketed by
+    // `__THUB_<nonce>_S` / `__THUB_<nonce>_E<exit code>` markers the reader thread keys off,
+    // while keeping the target's own scrollback clean:
+    // - `App` types `stty -echo` on its own line first, waits a beat, then types this wrapper —
+    //   so the wrapper line itself is never echoed. The wrapper's first act wipes `stty -echo`'s
+    //   echoed line (`\r` clear-line, up one, clear-line); it re-enables echo at the end.
+    // - each marker `printf`s a trailing `\r\033[2K` (CR + erase-line): the marker text is
+    //   overwritten in place so it never shows, but still lands in the byte stream for the
+    //   reader thread's substring search (`strip_ansi` drops the CR/CSI from captured output).
+    // - a dim `$ <command>` header (multi-line: the whole script, framed) prints *before* the
+    //   start marker, so the operator sees exactly what ran without it entering the capture.
+    // - one physical line: the command goes in verbatim as `sh -c '<command>'` (only `'`
+    //   escaped); multi-line: base64'd and decoded in place (`sh -c "$(…)"`, never `… | sh`,
+    //   which would make `sh` read the script off stdin and fight anything in it that also
+    //   reads stdin).
+    let (setup, header, run_cmd) = if command.contains('\n') || command.contains('\r') {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&command);
-        format!(
-            "__thub_src=$(printf %s '{b64}' | base64 -d); \
-             printf '%s\\n%s\\n%s\\n' '--- termhub-msg run ---' \"$__thub_src\" \
-             '-----------------------'; printf '%s_S\\n' \"$__thub_m\"; \
-             sh -c \"$__thub_src\"; __thub_rc=$?"
+        (
+            format!("__thub_src=$(printf %s '{b64}' | base64 -d); "),
+            "printf '\\033[2m--- running ---\\033[0m\\n%s\\n\\033[2m---------------\\033[0m\\n' \
+             \"$__thub_src\""
+                .to_string(),
+            "sh -c \"$__thub_src\"".to_string(),
         )
     } else {
-        let escaped = command.replace('\'', "'\\''");
-        format!("printf '%s_S\\n' \"$__thub_m\"; sh -c '{escaped}'; __thub_rc=$?")
+        let display = command.replace('\'', "'\\''");
+        (
+            String::new(),
+            format!("printf '\\033[2m$ %s\\033[0m\\n' '{display}'"),
+            format!("sh -c '{display}'"),
+        )
     };
     let payload = format!(
-        "__thub_m=__THUB_{nonce}; {run_part}; \
-         printf '%s_E%s\\n' \"$__thub_m\" \"$__thub_rc\"; unset __thub_m __thub_rc __thub_src\r"
+        "__thub_m=__THUB_{nonce}; {setup}printf '\\r\\033[2K\\033[1A\\033[2K'; {header}; \
+         printf '%s_S\\r\\033[2K' \"$__thub_m\"; {run_cmd}; __thub_rc=$?; \
+         printf '%s_E%s\\r\\033[2K' \"$__thub_m\" \"$__thub_rc\"; \
+         stty echo 2>/dev/null; unset __thub_m __thub_rc __thub_src\r"
     );
 
     let from_name = req
@@ -414,7 +422,7 @@ fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
 
     let (tx, rx) = mpsc::channel();
     (state.notify)(AppEvent::RunInSession {
-        to_id: target_id,
+        to_id: target_id.clone(),
         nonce,
         payload,
         reply: tx,
@@ -429,10 +437,19 @@ fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
         Ok(CaptureOutcome::Truncated { output }) => {
             Ok(json!({ "exit_code": -1, "output": output, "truncated": true }))
         }
-        Ok(CaptureOutcome::TimedOut) | Err(_) => Err(format!(
-            "no completion marker after {timeout}s — is \"{to}\" sitting at a shell prompt? \
-             (needs an interactive bash/zsh/sh with `base64` available)"
-        )),
+        Ok(CaptureOutcome::TimedOut) | Err(_) => {
+            // The wrapper never reached its own `stty echo` (target wasn't at a prompt, or the
+            // command is still hung) — queue a restore so the session isn't left with input
+            // echo off once the operator regains control.
+            (state.notify)(AppEvent::SendToSession {
+                id: target_id.clone(),
+                text: "stty echo 2>/dev/null\r".into(),
+            });
+            Err(format!(
+                "no completion marker after {timeout}s — is \"{to}\" sitting at a shell prompt? \
+                 (needs an interactive bash/zsh/sh with `base64` available)"
+            ))
+        }
     }
 }
 
@@ -846,6 +863,9 @@ mod tests {
                     // Single-line command: typed in verbatim, no base64.
                     assert!(payload.contains("sh -c 'exit 3'"), "{payload}");
                     assert!(!payload.contains("base64"), "{payload}");
+                    // Markers self-erase (CR + erase-line) so they don't show on the target.
+                    assert!(payload.contains("_S\\r\\033[2K"), "{payload}");
+                    assert!(payload.contains("stty echo"), "{payload}");
                     assert!(payload.ends_with('\r'));
                     reply
                         .send(CaptureOutcome::Done { exit_code: 3, output: "hello\n".into() })
@@ -875,7 +895,7 @@ mod tests {
                 if let AppEvent::RunInSession { payload, reply, .. } = ev {
                     // Multi-line: base64'd for transport, source printed for readability.
                     assert!(payload.contains("base64 -d"), "{payload}");
-                    assert!(payload.contains("--- termhub-msg run ---"), "{payload}");
+                    assert!(payload.contains("--- running ---"), "{payload}");
                     reply
                         .send(CaptureOutcome::Done { exit_code: 0, output: String::new() })
                         .unwrap();
