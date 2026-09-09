@@ -75,21 +75,26 @@ the same repo that Claude Code talks to as an MCP server.
 - **Phase 6 — run a command in another session — done.** A `run` control command types a
   wrapped command into a target session's pty and returns its combined stdout/stderr + exit
   code to the caller. A one-line command goes in verbatim as `sh -c '<command>'` (only `'`
-  escaped) so the target's scrollback shows the real command; a multi-line script is base64'd,
-  decoded in place, and its source printed ahead of the start marker (so it stays readable
-  without landing in the captured output). The wrapper brackets execution output with
+  escaped); a multi-line script is base64'd, decoded in place, and printed in full. Either way
+  a dim `$ <command>` header prints ahead of the start marker (so the operator sees what ran,
+  without it landing in the captured output). The wrapper brackets execution output with
   `__THUB_<nonce>_S` / `__THUB_<nonce>_E<code>` markers (expanded from a shell var, so the
-  shell's own echo of the typed line can't match them); `App` types it in via
-  `AppEvent::RunInSession` and arms an `OutputCapture` on the target's `TerminalSession`, whose
-  pty reader thread answers the `run` handler's `mpsc` reply once the end marker lands (or
-  `TimedOut` past the deadline, or `Truncated` past a 2 MiB cap). `strip_ansi` in `terminal.rs`
-  flattens the captured bytes. Assumes the target sits at an interactive POSIX shell prompt
-  (local or `ssh`); multi-line scripts also need `base64` on PATH — a REPL/TUI just times out,
-  harmlessly. **Opt-in:** the `intersession_run` setting (`get`/`set_message_run_enabled` IPC,
-  `api.ts`, `SettingsPanel.tsx` checkbox), off by default; every run is also written to the
-  message-log panel as `$ <command>`. Exposed as the `run_in_session` MCP tool and
-  `termhub-msg run <session> [--timeout N] <cmd…>` (which exits with the remote command's own
-  status). +5 `control.rs` tests, 18 total.
+  shell's own echo of the typed line can't match them), each `printf`'d with a trailing
+  `\r\033[2K` so the marker text is overwritten in place and never shows — `strip_ansi` drops
+  the CR/CSI from the captured bytes. To keep the wrapper line itself off the target's
+  scrollback, `App` types it in in two phases: `stty -echo` first, then ~150ms later (drained
+  from `about_to_wait` via `armed_runs`, once echo is actually off) the capture is armed and
+  the wrapper typed unechoed; the wrapper's first act wipes `stty -echo`'s own echoed line and
+  it re-enables echo at the end (with a `SendToSession` fallback restore on timeout).
+  `OutputCapture` on the target's `TerminalSession` answers the `run` handler's `mpsc` reply
+  once the end marker lands (or `TimedOut` past the deadline, or `Truncated` past a 2 MiB cap).
+  Assumes the target sits at an interactive POSIX shell prompt (local or `ssh`); multi-line
+  scripts also need `base64` on PATH — a REPL/TUI just times out, harmlessly. **Opt-in:** the
+  `intersession_run` setting (`get`/`set_message_run_enabled` IPC, `api.ts`,
+  `SettingsPanel.tsx` checkbox), off by default; every run is also written to the message-log
+  panel as `$ <command>`. Exposed as the `run_in_session` MCP tool and `termhub-msg run
+  <session> [--timeout N] <cmd…>` (which exits with the remote command's own status). +5
+  `control.rs` tests, 18 total.
 
 ---
 
