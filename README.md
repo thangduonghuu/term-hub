@@ -169,6 +169,7 @@ returns its combined output and exit code.
 
 - **Opt-in, off by default.** Enable it in **Settings › Messaging**.
 - The target must be at an interactive POSIX shell prompt; a REPL or TUI just times out.
+- The target's scrollback stays clean: input echo is suppressed while the wrapper is typed and its bookkeeping markers erase themselves, so all that's left is a dim `$ <command>` line (a one-liner verbatim, a multi-line script framed and printed in full) followed by the command's output. Multi-line scripts need `base64` on the target's `PATH`.
 
 ### In the app
 
