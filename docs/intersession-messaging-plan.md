@@ -72,6 +72,29 @@ the same repo that Claude Code talks to as an MCP server.
   13 total. **Verified live:** #2 → #1 `send` auto-typed into #1's terminal with #1's inbox
   left empty; #1 → #2 reply while #2 sat in `inbox --wait` was returned from the wait (not
   injected), and a following `inbox --peek` showed it already consumed.
+- **Phase 6 — run a command in another session — done.** A `run` control command types a
+  wrapped command into a target session's pty and returns its combined stdout/stderr + exit
+  code to the caller. A one-line command goes in verbatim as `sh -c '<command>'` (only `'`
+  escaped); a multi-line script is base64'd, decoded in place, and printed in full. Either way
+  a dim `$ <command>` header prints ahead of the start marker (so the operator sees what ran,
+  without it landing in the captured output). The wrapper brackets execution output with
+  `__THUB_<nonce>_S` / `__THUB_<nonce>_E<code>` markers (expanded from a shell var, so the
+  shell's own echo of the typed line can't match them), each `printf`'d with a trailing
+  `\r\033[2K` so the marker text is overwritten in place and never shows — `strip_ansi` drops
+  the CR/CSI from the captured bytes. To keep the wrapper line itself off the target's
+  scrollback, `App` types it in in two phases: `stty -echo` first, then ~150ms later (drained
+  from `about_to_wait` via `armed_runs`, once echo is actually off) the capture is armed and
+  the wrapper typed unechoed; the wrapper's first act wipes `stty -echo`'s own echoed line and
+  it re-enables echo at the end (with a `SendToSession` fallback restore on timeout).
+  `OutputCapture` on the target's `TerminalSession` answers the `run` handler's `mpsc` reply
+  once the end marker lands (or `TimedOut` past the deadline, or `Truncated` past a 2 MiB cap).
+  Assumes the target sits at an interactive POSIX shell prompt (local or `ssh`); multi-line
+  scripts also need `base64` on PATH — a REPL/TUI just times out, harmlessly. **Opt-in:** the
+  `intersession_run` setting (`get`/`set_message_run_enabled` IPC, `api.ts`,
+  `SettingsPanel.tsx` checkbox), off by default; every run is also written to the message-log
+  panel as `$ <command>`. Exposed as the `run_in_session` MCP tool and `termhub-msg run
+  <session> [--timeout N] <cmd…>` (which exits with the remote command's own status). +5
+  `control.rs` tests, 18 total.
 
 ---
 
@@ -165,7 +188,9 @@ framing beyond `\n`).
 ```
 
 **Commands:** `whoami`, `list`, `send {to, body}`, `broadcast {body}`,
-`inbox {peek?: bool, wait?: bool, timeout_secs?: number}`.
+`inbox {peek?: bool, wait?: bool, timeout_secs?: number}`,
+`run {to, command, timeout_secs?: number}` (Phase 6 — `data` is
+`{exit_code, output, truncated}`; gated on the `intersession_run` setting).
 
 - `to` resolves as: exact id → exact name (case-insensitive) → error listing candidates.
 - `inbox` with `wait: true`: control server polls `take_inbox(peek=true)` every 500 ms up to
@@ -188,6 +213,7 @@ Stdio JSON-RPC 2.0. Hand-rolled — the needed subset is `initialize`, `tools/li
 | `check_inbox` | `peek?` (bool) | `[{id, from_name, from_id, body, created_at}]`; marks read unless `peek` |
 | `wait_for_message` | `timeout_seconds?` | next message, or `{timed_out: true}` |
 | `broadcast_message` | `body` | `{message_id_count}` |
+| `run_in_session` (Phase 6) | `to`, `command`, `timeout_seconds?` | `{exit_code, output, truncated}` — runs `command` in a session sitting at a shell prompt |
 
 Each call → one socket round-trip. `session_id` is read once from `$TERMHUB_SESSION_ID` at startup.
 

@@ -5394,6 +5394,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
+ "base64 0.22.1",
  "block2 0.6.2",
  "bytemuck",
  "dirs",

@@ -20,7 +20,6 @@ const EXITED_POLL_MS = 1000;
 function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [pendingRenameId, setPendingRenameId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showQuickOpen, setShowQuickOpen] = useState(false);
@@ -95,14 +94,12 @@ function App() {
   async function handleNew() {
     const created = await api.createSession();
     setSessions((prev) => [...prev, created]);
-    setPendingRenameId(created.id);
     setActiveId(created.id);
   }
 
   async function handleNewInFolder(cwd: string) {
     const created = await api.createSession(undefined, cwd);
     setSessions((prev) => [...prev, created]);
-    setPendingRenameId(created.id);
     setActiveId(created.id);
   }
 
@@ -304,8 +301,6 @@ function App() {
         onOpenExternal={handleOpenExternal}
         onOpenSsh={() => setShowSshConnect(true)}
         onOpenSettings={() => setShowSettings(true)}
-        pendingRenameId={pendingRenameId}
-        onPendingRenameHandled={() => setPendingRenameId(null)}
       />
       {showUsage && <UsageDashboard onClose={() => setShowUsage(false)} />}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}

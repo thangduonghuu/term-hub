@@ -121,6 +121,11 @@ export const api = {
   getMessageAutodeliverEnabled: () => invoke<boolean>("get_message_autodeliver_enabled"),
   setMessageAutodeliverEnabled: (enabled: boolean) =>
     invoke<void>("set_message_autodeliver_enabled", { enabled }),
+  // Whether an agent in another session may run shell commands in a session in this window
+  // (the `run_in_session` MCP tool / `termhub-msg run`). Opt-in.
+  getMessageRunEnabled: () => invoke<boolean>("get_message_run_enabled"),
+  setMessageRunEnabled: (enabled: boolean) =>
+    invoke<void>("set_message_run_enabled", { enabled }),
   getDefaultCwd: () => invoke<string>("get_default_cwd"),
   // Native OS folder-browse dialog — null if the user cancels. Used by the "Browse…" row in the
   // Open Recent picker, for folders that aren't in the MRU list yet.

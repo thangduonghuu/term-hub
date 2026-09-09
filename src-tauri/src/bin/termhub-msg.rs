@@ -32,6 +32,9 @@ termhub-msg — message other TermHub sessions
 usage:
   termhub-msg list                          list open sessions (#num, name, id, unread)
   termhub-msg send <session> <text…>        send a message to a session (#num, name, or id)
+  termhub-msg run <session> [--timeout N] <cmd…>
+                                           run a shell command in a session that's at a
+                                           shell prompt; prints its output, exits with its code
   termhub-msg broadcast <text…>             send a message to every other open session
   termhub-msg inbox [--peek]                read (and clear) this session's messages
   termhub-msg inbox --wait [--timeout N]    block until a message arrives (N secs, default 60)
@@ -61,6 +64,34 @@ usage:
                     return 2;
                 }
                 json!({ "cmd": "broadcast", "args": { "body": args[1..].join(" ") } })
+            }
+            "run" => {
+                if args.len() < 3 {
+                    eprintln!("termhub-msg: run needs a target and a command\n\n{USAGE}");
+                    return 2;
+                }
+                // Optional `--timeout N` sits between the target and the command.
+                let mut idx = 2;
+                let mut timeout = None;
+                if args.get(idx).map(String::as_str) == Some("--timeout") {
+                    match args.get(idx + 1).and_then(|v| v.parse::<u64>().ok()) {
+                        Some(t) => timeout = Some(t),
+                        None => {
+                            eprintln!("termhub-msg: --timeout needs a number\n\n{USAGE}");
+                            return 2;
+                        }
+                    }
+                    idx += 2;
+                }
+                if idx >= args.len() {
+                    eprintln!("termhub-msg: run needs a command\n\n{USAGE}");
+                    return 2;
+                }
+                let mut run_args = json!({ "to": args[1], "command": args[idx..].join(" ") });
+                if let Some(t) = timeout {
+                    run_args["timeout_secs"] = json!(t);
+                }
+                json!({ "cmd": "run", "args": run_args })
             }
             "inbox" => {
                 let rest = &args[1..];
@@ -94,6 +125,10 @@ usage:
         match call(req) {
             Ok(data) => {
                 print_result(cmd, &data);
+                // `run` composes in scripts — exit with the remote command's own status.
+                if cmd == "run" {
+                    return data["exit_code"].as_i64().unwrap_or(0) as i32;
+                }
                 0
             }
             Err(e) => {
@@ -180,6 +215,13 @@ usage:
                     "broadcast to {} session(s)",
                     data["message_count"].as_i64().unwrap_or(0),
                 );
+            }
+            "run" => {
+                // The captured output already carries its own newlines — print it verbatim.
+                print!("{}", data["output"].as_str().unwrap_or(""));
+                if data["truncated"].as_bool() == Some(true) {
+                    eprintln!("termhub-msg: (output truncated at 2 MiB)");
+                }
             }
             "whoami" => {
                 println!(
@@ -315,6 +357,13 @@ usage:
                     }
                     json!({ "cmd": "inbox", "args": a })
                 }
+                "run_in_session" => {
+                    let mut a = json!({ "to": str_arg("to")?, "command": str_arg("command")? });
+                    if let Some(t) = args.get("timeout_seconds").and_then(Value::as_u64) {
+                        a["timeout_secs"] = json!(t);
+                    }
+                    json!({ "cmd": "run", "args": a })
+                }
                 other => return Err(format!("unknown tool: {other}")),
             };
             super::call(req)
@@ -359,7 +408,8 @@ usage:
                         "send_message",
                         "broadcast_message",
                         "check_inbox",
-                        "wait_for_message"
+                        "wait_for_message",
+                        "run_in_session"
                     ]
                 );
             }
@@ -437,6 +487,22 @@ usage:
                                 "description": "max seconds to wait (default 60, max 600)",
                             },
                         },
+                    },
+                },
+                {
+                    "name": "run_in_session",
+                    "description": "Run a shell command or multi-line script in another session that is sitting at a POSIX shell prompt (local, or SSH'd into a remote host) and get back its combined stdout/stderr plus exit code. Opt-in: the user must enable \"Let agents run commands in other sessions\" in TermHub's Settings > Messaging, or this returns an error. The target must be an interactive bash/zsh/sh (multi-line scripts also need `base64` on PATH) — a session inside a REPL or TUI (python, vim, another agent) will time out instead.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "to": str_prop("target session name or id"),
+                            "command": str_prop("shell command or script to run in the target session"),
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "description": "max seconds to wait for completion (default 30, max 600)",
+                            },
+                        },
+                        "required": ["to", "command"],
                     },
                 },
             ])

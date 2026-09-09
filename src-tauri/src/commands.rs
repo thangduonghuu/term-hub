@@ -173,6 +173,18 @@ pub fn set_message_autodeliver_enabled(db: &Db, enabled: bool) -> Result<(), Str
         .map_err(|e| e.to_string())
 }
 
+/// Whether an agent in another session may run shell commands in a session in this window via
+/// the `run_in_session` MCP tool / `termhub-msg run` (Settings > Messaging). Stored as
+/// `"1"` / `"0"`; absent means off — this executes arbitrary commands in the target, so it's
+/// opt-in. See `control.rs`'s `dispatch_run`.
+pub fn get_message_run_enabled(db: &Db) -> Result<bool, String> {
+    Ok(db.get_setting("intersession_run").map_err(|e| e.to_string())?.as_deref() == Some("1"))
+}
+
+pub fn set_message_run_enabled(db: &Db, enabled: bool) -> Result<(), String> {
+    db.set_setting("intersession_run", if enabled { "1" } else { "0" }).map_err(|e| e.to_string())
+}
+
 /// The `claude mcp add …` line for the Settings > Messaging copy-button — registers the
 /// `termhub-msg mcp` stdio server (see `bin/termhub-msg.rs`) with Claude Code. Uses the
 /// absolute path to the CLI, which ships next to the GUI binary, so it also works run from a
@@ -203,7 +215,8 @@ pub fn create_session(
     let name = name.unwrap_or_else(|| "Session".to_string());
     let created_at = unix_now();
 
-    let meta = SessionMeta { id, name, cwd, shell, shell_args: Vec::new(), created_at };
+    let meta =
+        SessionMeta { id, name, cwd, shell, shell_args: Vec::new(), ssh_credential_id: None, created_at };
     db.insert_session(&meta).map_err(|e| e.to_string())?;
     // Every opened folder counts toward the "Open Recent" MRU list, regardless of how the
     // session was created (new/duplicate/"new session here"/the Open Recent picker itself) —
@@ -366,10 +379,24 @@ pub fn connect_ssh_session(
         cwd: default_cwd(),
         shell: "ssh".to_string(),
         shell_args,
+        ssh_credential_id: Some(credential_id.to_string()),
         created_at: unix_now(),
     };
     db.insert_session(&meta).map_err(|e| e.to_string())?;
     Ok((SessionInfo { meta }, password))
+}
+
+/// The password to re-arm for a restored SSH session — same lookup `connect_ssh_session` itself
+/// does, just keyed off the session's own saved `ssh_credential_id` instead of a fresh pick from
+/// the "Connect to VPS" picker. Used on app-launch reconnect and on reviving a dead tile
+/// (`lib.rs`'s `respawn_active_if_exited`) so either one re-authenticates exactly like the
+/// original `connect_ssh` did, rather than landing back on an unanswered password prompt.
+/// `None` for an ordinary (non-SSH) session, a key-auth one (the key file `-i` already points at
+/// is baked into `shell_args` and needs no re-arming), or one whose credential was since deleted.
+pub fn ssh_reconnect_password(db: &Db, meta: &SessionMeta) -> Option<String> {
+    let credential_id = meta.ssh_credential_id.as_ref()?;
+    let cred = db.get_ssh_credential(credential_id).ok()?;
+    if cred.auth_method == SshAuthMethod::Password { cred.password } else { None }
 }
 
 /// Folders previously opened as a session, most-recent first, for the "Open Recent" picker
