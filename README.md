@@ -169,6 +169,7 @@ returns its combined output and exit code.
 
 - **Opt-in, off by default.** Enable it in **Settings › Messaging**.
 - The target must be at an interactive POSIX shell prompt; a REPL or TUI just times out.
+- A one-line command is typed in verbatim, so the target's scrollback shows the real command; a multi-line script is sent base64-encoded (needs `base64` on the target's `PATH`) with its source printed above the output.
 
 ### In the app
 
