@@ -501,6 +501,11 @@ struct App {
     // line itself is never echoed into the target's scrollback. Entries are
     // (session id, capture nonce, wrapper payload, reply channel, fire-at instant).
     armed_runs: Vec<(String, String, String, std::sync::mpsc::Sender<terminal::CaptureOutcome>, Instant)>,
+    // Session ids with a reconnect `SpawnSession` queued by `revive_dead_ssh_sessions` but not
+    // yet drained — keeps a second focus/click landing in the same event-loop pass from
+    // queueing a duplicate respawn, which would kill the just-revived pty and reconnect twice.
+    // Cleared in the `SpawnSession` handler.
+    reviving: HashSet<String>,
     cursor_pos: (f64, f64),
     // Live in-progress IME composition text (e.g. "ắ" while still typing Telex, before
     // it's committed) for `active_id`'s session — not sent to the pty, just overlaid at the
@@ -645,6 +650,7 @@ impl App {
             pending_ssh_passwords: HashMap::new(),
             armed_ssh_passwords: Vec::new(),
             armed_runs: Vec::new(),
+            reviving: HashSet::new(),
             cursor_pos: (0.0, 0.0),
             preedit: String::new(),
             #[cfg(target_os = "macos")]
@@ -707,6 +713,57 @@ impl App {
             });
         }
         true
+    }
+
+    /// Reconnects every dead SSH-backed tile in place (same id, same cwd). A dropped connection
+    /// — "broken pipe" — exits the remote shell, so the tile is marked dead in `App.exited` and
+    /// its last frame frozen; without this the operator has to click each dead VPS tile one by
+    /// one to bring it back. Called from the focus paths (window regaining focus, switching to
+    /// or clicking any session) so focusing anywhere revives them all at once.
+    ///
+    /// Only SSH sessions (those with a saved `ssh_credential_id`) — a local shell the user
+    /// `exit`ed must not respawn behind their back. `skip_active` is set by the click/focus
+    /// paths, where `respawn_active_if_exited` has already handled the focused tile (and revives
+    /// a dead local tile there too, matching the existing click-to-revive).
+    ///
+    /// Goes through `AppEvent::SpawnSession` (like `respawn_active_if_exited`), which sets
+    /// `active_id` to each tile it revives — so a trailing `FocusSession` restores whatever the
+    /// user actually had focused. `reviving` guards against a second call in the same event-loop
+    /// pass queueing the same respawn twice.
+    fn revive_dead_ssh_sessions(&mut self, skip_active: bool) {
+        let restore = self.active_id.clone();
+        let dead: Vec<String> = self
+            .terms
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| !(skip_active && Some(id) == restore.as_ref()))
+            .filter(|id| self.is_exited(id))
+            .filter(|id| !self.reviving.contains(id))
+            .filter(|id| {
+                self.db
+                    .get_session(id)
+                    .map(|m| m.ssh_credential_id.is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        for id in &dead {
+            let Ok(meta) = self.db.get_session(id) else { continue };
+            let ssh_password = commands::ssh_reconnect_password(&self.db, &meta);
+            self.reviving.insert(id.clone());
+            let _ = self.proxy.send_event(AppEvent::SpawnSession {
+                id: id.clone(),
+                cwd: meta.cwd,
+                shell: meta.shell,
+                shell_args: meta.shell_args,
+                ssh_password,
+            });
+        }
+        if let Some(id) = restore {
+            let _ = self.proxy.send_event(AppEvent::FocusSession(id));
+        }
     }
 
     fn active_term(&mut self) -> Option<&mut TerminalSession> {
@@ -1345,6 +1402,7 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::SpawnSession { id, cwd, shell, shell_args, ssh_password } => {
                 let Some(window) = self.window.clone() else { return };
                 self.terms.retain(|(tid, _)| *tid != id);
+                self.reviving.remove(&id);
                 self.pending_ssh_passwords.remove(&id);
                 self.armed_ssh_passwords.retain(|(tid, _, _)| *tid != id);
                 self.armed_runs.retain(|(tid, ..)| *tid != id);
@@ -1405,6 +1463,8 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(view) = &self.input_view {
                         macos::focus_input_view(view);
                     }
+                    // Focusing any session also reconnects every other dead VPS tile.
+                    self.revive_dead_ssh_sessions(true);
                     if let Some(w) = &self.window {
                         w.request_redraw();
                     }
@@ -1634,6 +1694,8 @@ impl ApplicationHandler<AppEvent> for App {
                         // selection above is discarded and the tile enters a drag-to-swap.
                         self.press_pending = Some((id, Instant::now(), self.cursor_pos));
                     }
+                    // Clicking any session also reconnects every other dead VPS tile.
+                    self.revive_dead_ssh_sessions(true);
                 }
                 window.request_redraw();
             }
@@ -2160,6 +2222,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // attention — and the webview's own key-window status — has moved elsewhere.
                 if !focused {
                     self.dismiss_overlays();
+                } else {
+                    // Coming back to the app reconnects every dead VPS tile whose SSH
+                    // connection dropped while it was in the background ("broken pipe"), so the
+                    // operator doesn't have to click each one. Focus stays where it was.
+                    self.revive_dead_ssh_sessions(false);
                 }
             }
             _ => {}
