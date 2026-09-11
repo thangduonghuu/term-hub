@@ -495,11 +495,12 @@ struct App {
     // keystroke ever could (a human's reaction time trivially clears it, a same-tick
     // instruction doesn't). `about_to_wait` below fires these once their deadline passes.
     armed_ssh_passwords: Vec<(String, String, Instant)>,
-    // `run_in_session`'s two-phase type-in (see `AppEvent::RunInSession`): `stty -echo` is typed
-    // immediately, then ~150ms later — drained in `about_to_wait`, once the target's shell has
-    // actually turned echo off — the capture is armed and the wrapper typed, so the wrapper
-    // line itself is never echoed into the target's scrollback. Entries are
-    // (session id, capture nonce, wrapper payload, reply channel, fire-at instant).
+    // `run_in_session`'s two-phase type-in (see `AppEvent::RunInSession`): a Ctrl-C + `stty
+    // -echo` is typed immediately (the Ctrl-C clears any dangling partial line / `>` prompt so
+    // the wrapper can't wedge the shell), then ~150ms later — drained in `about_to_wait`, once
+    // the target's shell has actually turned echo off — the capture is armed and the wrapper
+    // typed, so the wrapper line itself is never echoed into the target's scrollback. Entries
+    // are (session id, capture nonce, wrapper payload, reply channel, fire-at instant).
     armed_runs: Vec<(String, String, String, std::sync::mpsc::Sender<terminal::CaptureOutcome>, Instant)>,
     // Session ids with a reconnect `SpawnSession` queued by `revive_dead_ssh_sessions` but not
     // yet drained — keeps a second focus/click landing in the same event-loop pass from
@@ -1481,11 +1482,16 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::RunInSession { to_id, nonce, payload, reply } => {
                 match self.terms.iter_mut().find(|(tid, _)| *tid == to_id) {
                     Some((_, term)) => {
-                        // Phase 1: turn off input echo on its own line, so the wrapper typed in
-                        // phase 2 (below, from `about_to_wait` once this has taken effect) never
-                        // shows up in the target's scrollback. `2>/dev/null` keeps it quiet on a
-                        // shell where `stty` isn't a builtin / the fd isn't a tty.
-                        term.write("stty -echo 2>/dev/null\r");
+                        // Phase 1: a leading Ctrl-C first, so a partial line the operator left
+                        // half-typed — or a `>` continuation prompt — is discarded and the shell
+                        // is back at a fresh prompt; without it the wrapper would be appended to
+                        // that dangling input and the shell could wedge at `>` for good. At an
+                        // already-clean prompt the Ctrl-C is a no-op. Then turn off input echo on
+                        // its own line, so the wrapper typed in phase 2 (below, from
+                        // `about_to_wait` once this has taken effect) never shows up in the
+                        // target's scrollback. `2>/dev/null` keeps it quiet on a shell where
+                        // `stty` isn't a builtin / the fd isn't a tty.
+                        term.write("\x03stty -echo 2>/dev/null\r");
                         self.armed_runs.push((
                             to_id,
                             nonce,
