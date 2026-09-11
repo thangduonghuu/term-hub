@@ -129,6 +129,35 @@ impl Drop for WaitGuard {
     }
 }
 
+/// Session ids with a `run` command in flight right now. Process-global, same rationale as
+/// `waiting_sessions`. `dispatch_run` refuses a second `run` at a target that's still busy with
+/// the first: its wrapper would be typed into a shell that isn't reading, get line-buffered,
+/// and on flush collide mid-parse with whatever else is queued — which can leave the shell
+/// wedged at a `>` continuation prompt with no way back.
+fn running_targets() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Marks a target as having a `run` in flight, clearing it on drop (every early `return`,
+/// timeout, and panic included). `new` returns `None` if a run is already in flight there.
+struct RunGuard(String);
+
+impl RunGuard {
+    fn new(id: &str) -> Option<Self> {
+        let mut set = running_targets().lock().ok()?;
+        set.insert(id.to_string()).then(|| Self(id.to_string()))
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = running_targets().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
 /// When `intersession_autodeliver` is on and the target isn't mid-`wait`, fires
 /// `AppEvent::MessageInject` (so `App` types the message into the target's pty) and clears the
 /// target's unread rows — it's been delivered by typing, so the sidebar badge shouldn't also
@@ -366,6 +395,11 @@ fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
     let target_id = target.id.clone();
     let target_name = target.name.clone();
 
+    // One `run` at a time per target — see `running_targets`. Held (as `_run_guard`) until this
+    // function returns, i.e. until the command finishes or times out.
+    let _run_guard = RunGuard::new(&target_id)
+        .ok_or_else(|| format!("a command is already running in \"{to}\" — wait for it to finish"))?;
+
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     // Build the wrapper that runs the command in the target's shell bracketed by
     // `__THUB_<nonce>_S` / `__THUB_<nonce>_E<exit code>` markers the reader thread keys off,
@@ -438,12 +472,13 @@ fn dispatch_run(req: &Req, state: &ControlState) -> Result<Value, String> {
             Ok(json!({ "exit_code": -1, "output": output, "truncated": true }))
         }
         Ok(CaptureOutcome::TimedOut) | Err(_) => {
-            // The wrapper never reached its own `stty echo` (target wasn't at a prompt, or the
-            // command is still hung) — queue a restore so the session isn't left with input
-            // echo off once the operator regains control.
+            // The wrapper never reached its own `stty echo`: the target wasn't at a prompt, the
+            // command is still hung, or a partial line left the shell at a `>` continuation
+            // prompt. Send two Ctrl-Cs to break out of a hung command / continuation, then
+            // restore input echo so the session isn't left dead-looking once the operator is back.
             (state.notify)(AppEvent::SendToSession {
                 id: target_id.clone(),
-                text: "stty echo 2>/dev/null\r".into(),
+                text: "\x03\x03stty echo 2>/dev/null\r".into(),
             });
             Err(format!(
                 "no completion marker after {timeout}s — is \"{to}\" sitting at a shell prompt? \
@@ -930,6 +965,83 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("shell prompt"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_timeout_sends_an_interrupt_to_unwedge_the_target() {
+        let (db, path) = test_db();
+        db.set_setting("intersession_run", "1").unwrap();
+        let recovery = Arc::new(Mutex::new(String::new()));
+        let rec = recovery.clone();
+        let state = ControlState {
+            db: db.clone(),
+            sock_path: "/unused".into(),
+            notify: Box::new(move |ev| match ev {
+                AppEvent::RunInSession { reply, .. } => reply.send(CaptureOutcome::TimedOut).unwrap(),
+                AppEvent::SendToSession { text, .. } => rec.lock().unwrap().push_str(&text),
+                _ => {}
+            }),
+        };
+        let err = dispatch(
+            &req(Some("id-a"), "run", json!({ "to": "bob", "command": "sleep 1", "timeout_secs": 1 })),
+            &state,
+        )
+        .unwrap_err();
+        assert!(err.contains("shell prompt"), "{err}");
+        let got = recovery.lock().unwrap();
+        assert!(got.contains('\x03'), "expected a Ctrl-C in the recovery keystrokes, got {got:?}");
+        assert!(got.contains("stty echo"), "{got:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_rejects_a_second_run_while_one_is_in_flight() {
+        let (db, path) = test_db();
+        db.set_setting("intersession_run", "1").unwrap();
+        // A distinct target ("id-c") keeps this test's in-flight entry from colliding with the
+        // other `run` tests that share the process-global set.
+        db.insert_session(&SessionMeta {
+            id: "id-c".into(),
+            name: "carol".into(),
+            cwd: "/tmp".into(),
+            shell: String::new(),
+            shell_args: Vec::new(),
+            ssh_credential_id: None,
+            created_at: 0,
+        })
+        .unwrap();
+        // First run parks: the reply is answered only after a delay, so `dispatch_run` stays
+        // blocked holding carol's in-flight lock.
+        let state = ControlState {
+            db: db.clone(),
+            sock_path: "/unused".into(),
+            notify: Box::new(|ev| {
+                if let AppEvent::RunInSession { reply, .. } = ev {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        let _ = reply.send(CaptureOutcome::TimedOut);
+                    });
+                }
+            }),
+        };
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let _ = dispatch(
+                    &req(Some("id-a"), "run", json!({ "to": "carol", "command": "x", "timeout_secs": 1 })),
+                    &state,
+                );
+            });
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let err = dispatch(
+                &req(Some("id-a"), "run", json!({ "to": "carol", "command": "y" })),
+                &state,
+            )
+            .unwrap_err();
+            assert!(err.contains("already running"), "{err}");
+        });
+        // Once the first run returns, the lock is released and a new run is accepted.
+        assert!(RunGuard::new("id-c").is_some());
         let _ = std::fs::remove_file(path);
     }
 
