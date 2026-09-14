@@ -206,7 +206,10 @@ declare_class!(
                 // above.
                 let seq: Option<&'static str> = match event.keyCode() {
                     0x35 => Some("\x1b"),     // Escape
-                    0x75 => Some("\x1b[3~"),  // Forward Delete
+                    // Plain Forward Delete only — Option+Forward Delete is left to fall through
+                    // to `interpretKeyEvents:` below, where AppKit's key-binding table resolves
+                    // it to `deleteWordForward:` (handled in `doCommandBySelector:`) instead.
+                    0x75 if !alt => Some("\x1b[3~"),  // Forward Delete
                     0x73 => Some("\x1b[H"),   // Home
                     0x77 => Some("\x1b[F"),   // End
                     0x74 => Some("\x1b[5~"),  // Page Up
@@ -480,6 +483,32 @@ declare_class!(
                 Some("\x1b[A")
             } else if cmd == sel!(moveDown:) {
                 Some("\x1b[B")
+            // Option+Left/Right and Option+Backspace: AppKit's default key-binding table maps
+            // these to the word-motion/word-delete selectors below (same table plain arrows and
+            // deleteBackward: above come through). Translated to the emacs-style sequences
+            // bash/zsh's readline/ZLE bind to word motion by default (Meta+b/Meta+f/Meta+DEL) —
+            // the same bytes Terminal.app and iTerm2 send for these keys out of the box.
+            } else if cmd == sel!(moveWordLeft:) {
+                Some("\x1bb")
+            } else if cmd == sel!(moveWordRight:) {
+                Some("\x1bf")
+            } else if cmd == sel!(deleteWordBackward:) {
+                Some("\x1b\x7f")
+            // Option+Forward Delete: only reaches here because `key_down` above lets it fall
+            // through instead of resolving the keycode directly (see that match arm). Meta+d is
+            // readline/ZLE's own default binding for kill-word-forward, mirroring the Meta+b/
+            // Meta+f/Meta+DEL bindings used for the other word-motion cases above.
+            } else if cmd == sel!(deleteWordForward:) {
+                Some("\x1bd")
+            // Cmd+Left/Right: AppKit's key-binding table resolves these to the bidi-aware
+            // line-end selectors (not `moveToBeginningOfLine:`/`moveToEndOfLine:`, which are
+            // what Home/End keys map to instead — those are already handled by raw keycode in
+            // `key_down` and never reach here). Same Home/End sequences as those keys, matching
+            // Terminal.app/iTerm2's default of treating Cmd+Left/Right as line Home/End.
+            } else if cmd == sel!(moveToLeftEndOfLine:) {
+                Some("\x1b[H")
+            } else if cmd == sel!(moveToRightEndOfLine:) {
+                Some("\x1b[F")
             } else {
                 None
             };
